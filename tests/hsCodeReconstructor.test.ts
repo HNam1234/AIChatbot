@@ -78,7 +78,8 @@ describe("HSCodeReconstructor", () => {
           "0105.11.10 0105.12.10 0105.13.10 0105.14.10 0105.15.10",
           "0105.94.10 0105.99.10 0105.99.30",
           "BREEDING",
-          "Breeding body."
+          "Breeding body.",
+          "(Source: Test)"
         ].join("\n")
       )
     ];
@@ -99,7 +100,14 @@ describe("HSCodeReconstructor", () => {
     for (const [code, title] of expectedPairs) {
       expect(markdown).toContain(`## ${code} \u2014 ${title}`);
     }
-    expect(markdown).toContain("Breeding body.");
+    for (const [code] of expectedPairs.slice(1)) {
+      const section = markdownSection(markdown, code);
+      expect(section).toContain("Grouped HS code set:");
+      expect(section).toContain("Shared description:");
+      expect(section).toContain("Breeding body.");
+      expect(section).toContain("(Source: Test)");
+    }
+    expect(markdownSection(markdown, "0102.29.11")).not.toContain("Shared description:");
   });
 
   it("does not group distant HS code lines or steal the next section title", () => {
@@ -202,4 +210,11 @@ function tableBlock(id: string, pageNumber: number, order: number, y0: number, y
     bbox: { page: pageNumber, x0: 90, y0, x1: 520, y1 },
     metadata: { includeInMarkdown: false, reason: "pymupdf-find-tables" }
   };
+}
+
+function markdownSection(markdown: string, hsCode: string): string {
+  const start = markdown.indexOf(`## ${hsCode}`);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const next = markdown.slice(start + 1).search(/\n## \d{4}\.\d{2}\.\d{2}\b/);
+  return next === -1 ? markdown.slice(start) : markdown.slice(start, start + 1 + next);
 }

@@ -90,6 +90,40 @@ data/converted/<file>.milestone1.validation.json
 data/converted/<file>.sections.json
 ```
 
+## Markdown Reconstruction Notes
+
+Pipeline rebuilds Markdown from local layout blocks instead of trusting raw parser Markdown. The expected HS section format is:
+
+```md
+## 0102.29.11 — OXEN
+
+Body text...
+
+(Source: Indonesia)
+```
+
+Grouped HS codes that share one title are rendered as separate searchable H2 sections. Each grouped section includes the grouped code set and a duplicated shared-description block so retrieval works even when the query names an earlier code in the group:
+
+```md
+## 0105.11.10 — BREEDING
+
+Grouped HS code set: 0105.11.10, 0105.12.10, 0105.13.10, 0105.14.10, 0105.15.10, 0105.94.10, 0105.99.10, 0105.99.30.
+
+Shared description:
+
+For the purpose of the ASEAN subheadings under heading 01.05, the term “breeding” refers to live poultry of a kind presented for raising as a breeding animal.
+
+## 0105.12.10 — BREEDING
+
+Grouped HS code set: 0105.11.10, 0105.12.10, 0105.13.10, 0105.14.10, 0105.15.10, 0105.94.10, 0105.99.10, 0105.99.30.
+
+Shared description:
+
+For the purpose of the ASEAN subheadings under heading 01.05, the term “breeding” refers to live poultry of a kind presented for raising as a breeding animal.
+```
+
+Normal single-code sections do not receive `Shared description:` and remain unchanged.
+
 ## Run Parse + Image Export
 
 ```bash
@@ -147,6 +181,21 @@ data/converted/all.documents.json
 
 `all.sections.json` merges section records from every parsed document and is the planned Milestone 3 input for Q&A across all documents.
 
+Non-HS reference documents, such as `Introduction.pdf`, are classified as `non-hs-reference`. They can still be uploaded to PageIndex and validated for tree structure, but the validator does not require HS sections in `sections.json`.
+
+Recent validated batch command:
+
+```bash
+npm run parse -- data/uploads --batch --ocr-lang vie --docling-threads 4 --export-assets --upload-pageindex
+```
+
+Expected result:
+
+```text
+[Batch Summary]
+Documents: 16/16 passed
+```
+
 ## Start UI
 
 ```bash
@@ -185,7 +234,7 @@ UI job có hard timeout mặc định 10 phút (`UI_PIPELINE_TIMEOUT_MS=600000`)
 2. Run `npm run typecheck`.
 3. Run `npm test`.
 4. Run pipeline với `--export-assets --upload-pageindex`.
-5. Show Markdown headings đúng.
+5. Show Markdown headings đúng, including grouped HS sections with `Grouped HS code set` and `Shared description`.
 6. Show image links và PNG assets.
 7. Show validation markers.
 8. Show `tree.json`, `tree.validation.json`, `sections.json`.
@@ -220,8 +269,11 @@ Milestone sau: RAG / Agentic Q&A
 - `npm not recognized`: cài Node.js rồi mở terminal mới.
 - Venv chưa activate: chạy `.venv\Scripts\activate` trên Windows hoặc `source .venv/bin/activate` trên macOS/Linux.
 - PyMuPDF/Docling install error: kiểm tra Python 3.10+ và thử update `pip`.
+- Unicode errors on Windows Python stdout/stderr: pipeline sets `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1`; if running Python helpers manually, keep UTF-8 enabled.
 - `PAGEINDEX_API_KEY is missing`: tạo `.env` ở project root hoặc truyền `--pageindex-api-key`.
 - PageIndex polling timeout: tăng `PAGEINDEX_POLL_MAX_ATTEMPTS` hoặc kiểm tra dashboard PageIndex.
 - UI job chạy quá lâu: kiểm tra `data/tmp/*.ui-job-*.json`; job runner sẽ kill process sau `UI_PIPELINE_TIMEOUT_MS`.
 - Markdown image links không hiện trong cloud: asset path hiện là local; milestone sau có thể dùng Base64 hoặc static hosting.
 - Validation failed: xem debug ở `data/tmp/*.milestone1-failed.*` hoặc `data/tmp/*.pageindex-*.json`.
+- Marker 5 failures include `layoutHSCodeCount`, `pairedHSCodeCount`, `unpairedHsCodes`, and nearest text context for each unpaired code.
+- Marker 10 does not fail non-HS reference documents solely because they have zero HS sections.

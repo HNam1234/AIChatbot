@@ -182,17 +182,20 @@ function renderTextBlock(
       const group = collectHSCodeGroup(lineRef, hsLine, followingLines);
       const titleSelection = selectTitleForHSCodeGroup(group, state);
       const title = titleSelection.title;
+      const sharedDescriptionLines = selectSharedDescriptionLines(group, titleSelection);
 
-      for (const consumedLine of [...group.codeLines, ...titleSelection.selectedLines]) {
+      for (const consumedLine of [...group.codeLines, ...titleSelection.selectedLines, ...sharedDescriptionLines]) {
         markConsumedLine(consumedLine, block, skippedCurrentLineIndexes, state);
       }
 
       const groupReference = renderGroupReference(group.codes);
+      const sharedDescription = renderSharedDescription(sharedDescriptionLines);
       for (const code of group.codes) {
         parts.push(`## ${code}${title ? ` ${MARKDOWN_HEADING_DASH} ${title}` : ""}`);
         if (groupReference) {
           parts.push(groupReference);
         }
+        parts.push(...sharedDescription);
       }
       continue;
     }
@@ -225,6 +228,19 @@ function renderGroupReference(codes: string[]): string | undefined {
   }
 
   return `Grouped HS code set: ${codes.join(", ")}.`;
+}
+
+function renderSharedDescription(lines: TextLineRef[]): string[] {
+  if (lines.length === 0) {
+    return [];
+  }
+
+  const renderedLines = renderBodyLines(lines.map((line) => line.text));
+  if (renderedLines.length === 0) {
+    return [];
+  }
+
+  return ["Shared description:", ...renderedLines];
 }
 
 function renderImageBlock(block: ParsedBlock): string[] {
@@ -338,6 +354,43 @@ function selectTitleForHSCodeGroup(group: HSCodeGroup, state: RenderState): Titl
     title: cleanInlineText(selectedLines.map((line) => line.text).join(" ")),
     selectedLines
   };
+}
+
+function selectSharedDescriptionLines(group: HSCodeGroup, titleSelection: TitleSelection): TextLineRef[] {
+  if (group.codes.length <= 1) {
+    return [];
+  }
+
+  const selectedTitleKeys = new Set(titleSelection.selectedLines.map(textLineKey));
+  let startIndex = 0;
+  for (const [index, candidate] of group.titleCandidateLines.entries()) {
+    if (selectedTitleKeys.has(textLineKey(candidate))) {
+      startIndex = index + 1;
+    }
+  }
+
+  const sharedLines: TextLineRef[] = [];
+  for (let index = startIndex; index < group.titleCandidateLines.length; index += 1) {
+    const candidate = group.titleCandidateLines[index];
+    const cleaned = cleanInlineText(candidate.text);
+    if (!cleaned) {
+      continue;
+    }
+    if (parseHSCodeLine(cleaned) || /^CHAPTER\s+\d+/i.test(cleaned)) {
+      break;
+    }
+    if (selectedTitleKeys.has(textLineKey(candidate)) || isPageNumberLine(candidate)) {
+      continue;
+    }
+
+    sharedLines.push(candidate);
+  }
+
+  return sharedLines;
+}
+
+function textLineKey(line: TextLineRef): string {
+  return `${line.block.id}:${line.lineIndex}`;
 }
 
 function parseHSCodeLine(text: string): HSCodeLineParse | undefined {
@@ -600,6 +653,10 @@ function containsStructuralHeading(lines: string[]): boolean {
 function isPageNumberBlock(block: ParsedBlock): boolean {
   const text = block.text?.trim() ?? "";
   return /^\d{1,3}$/.test(text) && (block.bbox?.y0 ?? 0) >= 650;
+}
+
+function isPageNumberLine(line: TextLineRef): boolean {
+  return /^\d{1,3}$/.test(line.text.trim()) && line.y0 >= 650;
 }
 
 function sanitizeCaptionText(text: string): string {
