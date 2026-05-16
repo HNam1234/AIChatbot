@@ -8,71 +8,105 @@
   </head>
   <body>
     <main class="shell">
-      <header class="toolbar">
+      <header class="app-header">
         <div>
+          <span class="eyebrow">Local HSCode Workbench</span>
           <h1>HSCode PDF Pipeline</h1>
-          <p>Local parser demo with batch progress, PDF preview, and parse result mapping.</p>
+          <p>Parse PDFs, export real assets, validate sections, and inspect PageIndex tree outputs in one workspace.</p>
+        </div>
+        <div class="header-metrics" aria-label="Pipeline capabilities">
+          <span>Parser</span>
+          <span>Assets</span>
+          <span>Tree</span>
+          <span>Q&A</span>
         </div>
       </header>
 
-      <section class="panel settings">
-        <h2>API Settings</h2>
-        <div class="settings-grid">
-          <div>
-            <label>PageIndex API Key</label>
-            <div class="settings-row">
-              <input id="pageindex-key" name="temporaryPageIndexApiKey" type="password" autocomplete="off" placeholder="sk-..." />
-              <button id="toggle-pageindex-key" type="button" class="secondary">Show</button>
-            </div>
-            <label class="check"><input id="temporary-pageindex-key" type="checkbox" checked /> Use only for this run</label>
-            <div class="actions">
-              <button id="save-pageindex-key" type="button" class="secondary">Save PageIndex Key to .env</button>
-              <span id="pageindex-settings-status" class="muted">Loading...</span>
+      <section class="control-grid">
+        <section class="panel settings">
+          <div class="section-heading">
+            <div>
+              <span class="kicker">Keys</span>
+              <h2>API Settings</h2>
             </div>
           </div>
-
-          <div>
-            <label>Gemini API Key</label>
-            <div class="settings-row">
-              <input id="gemini-key" name="temporaryGeminiApiKey" type="password" autocomplete="off" placeholder="AIza..." />
-              <button id="toggle-gemini-key" type="button" class="secondary">Show</button>
+          <div class="settings-grid">
+            <div class="field-group">
+              <label for="pageindex-key">PageIndex API Key</label>
+              <div class="settings-row">
+                <input id="pageindex-key" name="temporaryPageIndexApiKey" type="password" autocomplete="off" placeholder="sk-..." />
+                <button id="toggle-pageindex-key" type="button" class="secondary compact">Show</button>
+              </div>
+              <label class="check"><input id="temporary-pageindex-key" type="checkbox" checked /> Use only for this run</label>
+              <div class="actions">
+                <button id="save-pageindex-key" type="button" class="secondary">Save PageIndex Key</button>
+                <span id="pageindex-settings-status" class="muted">Loading...</span>
+              </div>
             </div>
-            <label class="check"><input id="temporary-gemini-key" type="checkbox" checked /> Use only for this run</label>
-            <div class="actions">
-              <button id="save-gemini-key" type="button" class="secondary">Save Gemini Key to .env</button>
+
+            <div class="field-group">
+              <label>Gemini Round-Robin API Keys</label>
+              <div class="gemini-key-list">
+                <div class="key-slot">
+                  <span>Slot 1</span>
+                  <input id="gemini-key-1" data-gemini-key-input data-slot="GEMINI_KEY_1" name="temporaryGeminiApiKey1" type="password" autocomplete="off" placeholder="AIza..." />
+                  <button data-toggle-gemini-key data-target="gemini-key-1" type="button" class="secondary compact">Show</button>
+                  <button data-save-gemini-key data-target="gemini-key-1" data-slot="GEMINI_KEY_1" type="button" class="secondary compact">Save</button>
+                </div>
+                <div class="key-slot">
+                  <span>Slot 2</span>
+                  <input id="gemini-key-2" data-gemini-key-input data-slot="GEMINI_KEY_2" name="temporaryGeminiApiKey2" type="password" autocomplete="off" placeholder="AIza..." />
+                  <button data-toggle-gemini-key data-target="gemini-key-2" type="button" class="secondary compact">Show</button>
+                  <button data-save-gemini-key data-target="gemini-key-2" data-slot="GEMINI_KEY_2" type="button" class="secondary compact">Save</button>
+                </div>
+                <div class="key-slot">
+                  <span>Slot 3</span>
+                  <input id="gemini-key-3" data-gemini-key-input data-slot="GEMINI_KEY_3" name="temporaryGeminiApiKey3" type="password" autocomplete="off" placeholder="AIza..." />
+                  <button data-toggle-gemini-key data-target="gemini-key-3" type="button" class="secondary compact">Show</button>
+                  <button data-save-gemini-key data-target="gemini-key-3" data-slot="GEMINI_KEY_3" type="button" class="secondary compact">Save</button>
+                </div>
+              </div>
+              <label class="check"><input id="temporary-gemini-key" type="checkbox" checked /> Use typed keys only for this run</label>
               <span id="gemini-settings-status" class="muted">Loading...</span>
             </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section class="panel">
-        <form id="pipeline-form">
-          <div class="form-grid">
-            <label>
-              PDFs
-              <input id="pdf" name="files" type="file" accept="application/pdf,.pdf" multiple required />
-            </label>
-            <label>
-              OCR language
-              <input name="ocrLanguage" type="text" value="vie" />
-            </label>
-            <label>
-              Docling threads
-              <input name="doclingThreads" type="number" min="1" value="4" />
-            </label>
+        <section class="panel run-panel">
+          <div class="section-heading">
+            <div>
+              <span class="kicker">Run</span>
+              <h2>Pipeline Input</h2>
+            </div>
+            <button type="submit" form="pipeline-form" class="primary-action">Run Pipeline</button>
           </div>
+          <form id="pipeline-form">
+            <div class="form-grid">
+              <label class="file-picker">
+                <span>PDFs</span>
+                <input id="pdf" name="files" type="file" accept="application/pdf,.pdf" multiple required />
+              </label>
+              <label>
+                OCR language
+                <input name="ocrLanguage" type="text" value="vie" />
+              </label>
+              <label>
+                Docling threads
+                <input name="doclingThreads" type="number" min="1" value="4" />
+              </label>
+            </div>
 
-          <div class="checks">
-            <label><input name="exportAssets" type="checkbox" checked /> Export image assets</label>
-            <label><input id="upload-pageindex" name="uploadPageIndex" type="checkbox" /> Upload to PageIndex</label>
-            <label><input name="sequential" type="checkbox" checked disabled /> Run files sequentially</label>
-            <label><input name="failFast" type="checkbox" /> Stop on first failure</label>
-          </div>
-          <div id="pageindex-warning" class="warning hidden">Enter PageIndex API key in API Settings or create .env.</div>
-          <div id="selected-files" class="selected-files muted">No files selected.</div>
-          <button type="submit">Run Pipeline</button>
-        </form>
+            <div class="checks">
+              <label><input name="exportAssets" type="checkbox" checked /> Export image assets</label>
+              <label><input id="upload-pageindex" name="uploadPageIndex" type="checkbox" /> Upload to PageIndex</label>
+              <label><input id="reuse-pageindex-cache" name="reusePageIndexCache" type="checkbox" checked /> Reuse cached PageIndex tree</label>
+              <label><input name="sequential" type="checkbox" checked disabled /> Run files sequentially</label>
+              <label><input name="failFast" type="checkbox" /> Stop on first failure</label>
+            </div>
+            <div id="pageindex-warning" class="warning hidden">PageIndex key is only required when no cached tree exists or cache reuse is disabled.</div>
+            <div id="selected-files" class="selected-files muted">No files selected.</div>
+          </form>
+        </section>
       </section>
 
       <section class="panel status-card">
@@ -90,8 +124,11 @@
 
       <section class="workspace">
         <section class="panel pdf-panel">
-          <div class="panel-heading">
-            <h2>PDF Preview</h2>
+          <div class="section-heading">
+            <div>
+              <span class="kicker">Source</span>
+              <h2>PDF Preview</h2>
+            </div>
             <div class="page-controls">
               <button id="prev-page" type="button" class="secondary">Prev</button>
               <input id="page-number" type="number" min="1" value="1" />
@@ -103,6 +140,12 @@
         </section>
 
         <section class="panel result-panel">
+          <div class="section-heading results-heading">
+            <div>
+              <span class="kicker">Output</span>
+              <h2>Parsed Artifacts</h2>
+            </div>
+          </div>
           <div class="tabs" role="tablist">
             <button type="button" class="tab active" data-tab="markdown">Markdown</button>
             <button type="button" class="tab" data-tab="rendered">Rendered</button>
@@ -123,20 +166,45 @@
         </section>
       </section>
 
-      <section class="panel">
-        <h2>Batch Results</h2>
-        <div id="batch-table" class="table-wrap muted">No documents yet.</div>
+      <section class="bottom-grid">
+        <section class="panel">
+          <div class="section-heading">
+            <div>
+              <span class="kicker">Batch</span>
+              <h2>Document Results</h2>
+            </div>
+          </div>
+          <div id="batch-table" class="table-wrap muted">No documents yet.</div>
+        </section>
+
+        <section class="panel">
+          <div class="section-heading">
+            <div>
+              <span class="kicker">Runtime</span>
+              <h2>Logs</h2>
+            </div>
+          </div>
+          <pre id="logs" class="logs"></pre>
+        </section>
       </section>
 
       <section class="panel">
-        <h2>Logs</h2>
-        <pre id="logs" class="logs"></pre>
-      </section>
-
-      <section class="panel">
-        <h2>Q&A Placeholder</h2>
+        <div class="section-heading">
+          <div>
+            <span class="kicker">Milestone 3/4</span>
+            <h2>Agent Console</h2>
+          </div>
+        </div>
+        <div class="qa-scope">
+          <label class="check qa-all-docs"><input id="question-all-docs" type="checkbox" checked /> Ask across all cached PageIndex PDFs</label>
+          <label>
+            Manual doc_id override
+            <input id="question-doc-id" type="text" placeholder="Optional: paste one or more doc_id values separated by commas" />
+          </label>
+          <span id="question-doc-scope" class="muted">Loading indexed documents...</span>
+        </div>
         <div class="qa">
-          <input id="question" type="text" placeholder="Milestone 3 Q&A will use all.sections.json." />
+          <input id="question" type="text" placeholder="Ask about an indexed HSCode document." />
           <button id="ask" type="button">Ask</button>
         </div>
         <div id="answer" class="muted"></div>

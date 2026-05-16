@@ -23,33 +23,44 @@ const nextPageButton = document.querySelector("#next-page");
 const openPageLink = document.querySelector("#open-page");
 const askButton = document.querySelector("#ask");
 const questionInput = document.querySelector("#question");
+const questionAllDocsInput = document.querySelector("#question-all-docs");
+const questionDocIdInput = document.querySelector("#question-doc-id");
+const questionDocScopeEl = document.querySelector("#question-doc-scope");
 const answerEl = document.querySelector("#answer");
 const pageIndexKeyInput = document.querySelector("#pageindex-key");
-const geminiKeyInput = document.querySelector("#gemini-key");
+const geminiKeyInputs = [...document.querySelectorAll("[data-gemini-key-input]")];
 const temporaryPageIndexKeyInput = document.querySelector("#temporary-pageindex-key");
 const temporaryGeminiKeyInput = document.querySelector("#temporary-gemini-key");
 const uploadPageIndexInput = document.querySelector("#upload-pageindex");
+const reusePageIndexCacheInput = document.querySelector("#reuse-pageindex-cache");
 const pageIndexSettingsStatusEl = document.querySelector("#pageindex-settings-status");
 const geminiSettingsStatusEl = document.querySelector("#gemini-settings-status");
 const savePageIndexKeyButton = document.querySelector("#save-pageindex-key");
-const saveGeminiKeyButton = document.querySelector("#save-gemini-key");
 const togglePageIndexKeyButton = document.querySelector("#toggle-pageindex-key");
-const toggleGeminiKeyButton = document.querySelector("#toggle-gemini-key");
+const toggleGeminiKeyButtons = [...document.querySelectorAll("[data-toggle-gemini-key]")];
+const saveGeminiKeyButtons = [...document.querySelectorAll("[data-save-gemini-key]")];
 const pageIndexWarningEl = document.querySelector("#pageindex-warning");
 
 let activeJobId = null;
 let pollTimer = null;
 let selectedDocument = null;
+let selectedBundle = null;
+let indexedDocuments = [];
 let currentPdfUrl = "";
 let currentPage = 1;
 let settings = {
   hasPageIndexApiKey: false,
   maskedPageIndexApiKey: null,
   hasGeminiApiKey: false,
-  maskedGeminiApiKey: null
+  maskedGeminiApiKey: null,
+  legacyGeminiKeyConfigured: false,
+  maskedLegacyGeminiApiKey: null,
+  geminiKeySlots: [],
+  configuredGeminiKeyCount: 0
 };
 
 void loadSettings();
+void loadIndexedDocuments();
 
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => activateTab(tab.dataset.tab));
@@ -58,12 +69,20 @@ document.querySelectorAll(".tab").forEach((tab) => {
 fileInput.addEventListener("change", renderSelectedFiles);
 pageIndexKeyInput.addEventListener("input", updatePageIndexWarning);
 uploadPageIndexInput.addEventListener("change", updatePageIndexWarning);
+reusePageIndexCacheInput.addEventListener("change", updatePageIndexWarning);
+questionAllDocsInput.addEventListener("change", updateAgentScope);
+questionDocIdInput.addEventListener("input", updateAgentScope);
 prevPageButton.addEventListener("click", () => setPdfPage(Math.max(1, currentPage - 1)));
 nextPageButton.addEventListener("click", () => setPdfPage(currentPage + 1));
 pageNumberInput.addEventListener("change", () => setPdfPage(Number(pageNumberInput.value) || 1));
 
 togglePageIndexKeyButton.addEventListener("click", () => togglePasswordInput(pageIndexKeyInput, togglePageIndexKeyButton));
-toggleGeminiKeyButton.addEventListener("click", () => togglePasswordInput(geminiKeyInput, toggleGeminiKeyButton));
+toggleGeminiKeyButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    const input = document.querySelector(`#${button.dataset.target}`);
+    if (input) togglePasswordInput(input, button);
+  });
+});
 
 savePageIndexKeyButton.addEventListener("click", async () => {
   const apiKey = pageIndexKeyInput.value.trim();
@@ -80,18 +99,34 @@ savePageIndexKeyButton.addEventListener("click", async () => {
   updatePageIndexWarning();
 });
 
-saveGeminiKeyButton.addEventListener("click", async () => {
-  const apiKey = geminiKeyInput.value.trim();
-  if (!apiKey) {
-    geminiSettingsStatusEl.textContent = "Enter a Gemini API key first.";
-    return;
-  }
-  const payload = await saveApiKey("/api/settings/gemini-key", apiKey, geminiSettingsStatusEl);
-  if (!payload) return;
-  geminiKeyInput.value = "";
-  settings.hasGeminiApiKey = true;
-  settings.maskedGeminiApiKey = payload.maskedKey;
-  geminiSettingsStatusEl.textContent = `Gemini key configured: yes (${payload.maskedKey})`;
+saveGeminiKeyButtons.forEach((button) => {
+  button.addEventListener("click", async () => {
+    const input = document.querySelector(`#${button.dataset.target}`);
+    const apiKey = input?.value.trim() || "";
+    if (!apiKey) {
+      geminiSettingsStatusEl.textContent = `Enter a Gemini API key for ${button.dataset.slot}.`;
+      return;
+    }
+
+    const payload = await saveApiKey("/api/settings/gemini-key", apiKey, geminiSettingsStatusEl, {
+      slot: button.dataset.slot
+    });
+    if (!payload) return;
+
+    input.value = "";
+    settings.hasGeminiApiKey = true;
+    settings.maskedGeminiApiKey = payload.maskedKey;
+    const slot = (settings.geminiKeySlots || []).find((candidate) => candidate.name === payload.slotName);
+    if (slot) {
+      slot.configured = true;
+      slot.maskedKey = payload.maskedKey;
+    }
+    settings.configuredGeminiKeyCount = Math.max(
+      settings.configuredGeminiKeyCount || 0,
+      (settings.geminiKeySlots || []).filter((candidate) => candidate.configured).length
+    );
+    renderGeminiSettingsStatus();
+  });
 });
 
 form.addEventListener("submit", async (event) => {
@@ -99,23 +134,26 @@ form.addEventListener("submit", async (event) => {
   clearInterval(pollTimer);
   resetResult();
 
-  if (uploadPageIndexInput.checked && !settings.hasPageIndexApiKey && !pageIndexKeyInput.value.trim()) {
-    setTopStatus({ status: "failed", currentStep: "Missing PageIndex API key", progressPercent: 0 });
-    pageIndexWarningEl.classList.remove("hidden");
-    logsEl.textContent = "Enter PageIndex API key in API Settings or create .env.";
-    return;
-  }
-
   const body = new FormData(form);
   if (temporaryPageIndexKeyInput.checked && pageIndexKeyInput.value.trim()) {
     body.set("temporaryPageIndexApiKey", pageIndexKeyInput.value.trim());
   } else {
     body.delete("temporaryPageIndexApiKey");
   }
-  if (temporaryGeminiKeyInput.checked && geminiKeyInput.value.trim()) {
-    body.set("temporaryGeminiApiKey", geminiKeyInput.value.trim());
+  if (temporaryGeminiKeyInput.checked) {
+    geminiKeyInputs.forEach((input, index) => {
+      const keyName = `temporaryGeminiApiKey${index + 1}`;
+      if (input.value.trim()) {
+        body.set(keyName, input.value.trim());
+      } else {
+        body.delete(keyName);
+      }
+    });
   } else {
     body.delete("temporaryGeminiApiKey");
+    body.delete("temporaryGeminiApiKey1");
+    body.delete("temporaryGeminiApiKey2");
+    body.delete("temporaryGeminiApiKey3");
   }
 
   setTopStatus({ status: "queued", currentStep: "uploading", progressPercent: 0 });
@@ -135,13 +173,65 @@ form.addEventListener("submit", async (event) => {
 });
 
 askButton.addEventListener("click", async () => {
+  const question = questionInput.value.trim();
+  const manualDocIds = parseDocIds(questionDocIdInput.value);
+  const selectedDocIds = selectedBundle?.pageIndexDocId ? [selectedBundle.pageIndexDocId] : [];
+  const allCachedDocIds = indexedDocuments.map((document) => document.docId).filter(Boolean);
+  const docIds = questionAllDocsInput.checked
+    ? uniqueStrings([...allCachedDocIds, ...manualDocIds])
+    : uniqueStrings([...manualDocIds, ...selectedDocIds]);
+  if (!question) {
+    answerEl.className = "warning";
+    answerEl.textContent = "Enter a question first.";
+    return;
+  }
+  if (docIds.length === 0 && !questionAllDocsInput.checked) {
+    answerEl.className = "warning";
+    answerEl.textContent = "No PageIndex docs are available. Run Upload to PageIndex once, keep cached tree files, or paste doc_id manually.";
+    return;
+  }
+  answerEl.className = "muted";
+  answerEl.textContent = questionAllDocsInput.checked
+    ? `Searching cached tree JSON across ${indexedDocuments.length} PDF(s)...`
+    : `Asking PageIndex Chat across ${docIds.length} document(s)...`;
+  const body = {
+    question,
+    docIds,
+    scope: questionAllDocsInput.checked ? "all" : "selected"
+  };
+  if (temporaryPageIndexKeyInput.checked && pageIndexKeyInput.value.trim()) {
+    body.temporaryPageIndexApiKey = pageIndexKeyInput.value.trim();
+  }
   const response = await fetch("/api/ask", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ question: questionInput.value })
+    body: JSON.stringify(body)
   });
   const payload = await response.json();
-  answerEl.textContent = payload.answer;
+  if (!response.ok) {
+    answerEl.className = "warning";
+    answerEl.textContent = payload.error || "Could not get answer.";
+    return;
+  }
+  answerEl.className = "";
+  const marker = payload.validation?.markers?.[0];
+  const answerScope = payload.mode === "cached-tree"
+    ? `Scope: cached tree JSON (${(payload.documents || []).length} source PDF(s))`
+    : `Scope: ${(payload.docIds || docIds).length} PageIndex document(s)`;
+  answerEl.innerHTML = `
+    <div class="answer-box">
+      <div>${escapeHtml(payload.answer || "")}</div>
+      <p>${escapeHtml(answerScope)}</p>
+      ${marker ? `<p>${escapeHtml(marker.message || "")}</p>` : ""}
+    </div>
+  `;
+});
+
+questionInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    askButton.click();
+  }
 });
 
 async function pollStatus() {
@@ -172,6 +262,7 @@ async function loadResult() {
     return;
   }
   renderBatchOutputs(payload.outputs?.documentOutputs || []);
+  await loadIndexedDocuments();
   const firstDocument = payload.selectedDocument || payload.outputs?.selectedDocument;
   if (firstDocument) {
     await loadDocument(firstDocument);
@@ -187,6 +278,8 @@ async function loadDocument(documentName) {
 }
 
 function renderDocument(bundle) {
+  selectedBundle = bundle;
+  updateAgentScope(bundle);
   currentPdfUrl = bundle.uploadUrl || `/api/uploads/${encodeURIComponent(bundle.document)}`;
   setPdfPage(1);
   markdownEl.classList.remove("muted");
@@ -201,7 +294,7 @@ function renderDocument(bundle) {
 
 function setTopStatus(job) {
   const percent = Math.max(0, Math.min(100, Math.round(job.progressPercent || 0)));
-  jobStatusEl.textContent = job.status || "Idle";
+  jobStatusEl.innerHTML = statusChip(job.status || "Idle");
   currentFileEl.textContent = job.currentFile || "n/a";
   currentStepEl.textContent = job.currentStep || "n/a";
   elapsedEl.textContent = formatElapsed(job.elapsedMs || 0);
@@ -221,7 +314,7 @@ function renderSelectedFiles(status = "waiting") {
     <div class="file-row">
       <span>${escapeHtml(file.name)}</span>
       <span>${formatBytes(file.size)}</span>
-      <span class="pill">${status}</span>
+      ${statusChip(status)}
     </div>
   `).join("");
 }
@@ -246,6 +339,13 @@ function renderBatchStatus(files) {
 
 function renderBatchOutputs(outputs) {
   if (outputs.length === 0) return;
+  mergeIndexedDocuments(outputs
+    .filter((output) => output.pageIndexDocId)
+    .map((output) => ({
+      document: output.document,
+      docId: output.pageIndexDocId,
+      treePath: output.paths?.tree || ""
+    })));
   batchTableEl.classList.remove("muted");
   batchTableEl.innerHTML = batchTableMarkup(outputs.map((output) => ({
     document: output.document,
@@ -282,11 +382,11 @@ function batchTableMarkup(rows, live) {
               <strong>${escapeHtml(row.document)}</strong>
               <div class="mini-progress"><span style="width:${Number(row.progressPercent || 0)}%"></span></div>
             </td>
-            <td>${escapeHtml(row.parse || row.status)}</td>
-            <td>${escapeHtml(row.assets)}</td>
-            <td>${escapeHtml(row.sections)}</td>
-            <td>${escapeHtml(row.pageIndex)}</td>
-            <td>${escapeHtml(row.treeValidation)}</td>
+            <td>${statusChip(row.parse || row.status)}</td>
+            <td>${plainOrChip(row.assets)}</td>
+            <td>${plainOrChip(row.sections)}</td>
+            <td>${plainOrChip(row.pageIndex)}</td>
+            <td>${plainOrChip(row.treeValidation)}</td>
             <td>${escapeHtml(row.hsSectionCount)}</td>
             <td>${escapeHtml(row.imageCount)}</td>
             <td class="error-cell">${escapeHtml(row.error)}</td>
@@ -430,16 +530,59 @@ function activateTab(tabName) {
 function resetResult() {
   logsEl.textContent = "";
   markdownEl.textContent = "No Markdown yet.";
+  markdownEl.className = "markdown muted";
   renderedEl.textContent = "No rendered preview yet.";
+  renderedEl.className = "rendered muted";
   sectionsEl.textContent = "No sections yet.";
+  sectionsEl.className = "table-wrap muted";
   sectionDetailEl.textContent = "Select a section to inspect page mapping.";
+  sectionDetailEl.className = "section-detail muted";
   treeEl.textContent = "No tree JSON yet.";
+  treeEl.className = "tree muted";
   markersEl.textContent = "No markers yet.";
+  markersEl.className = "markers muted";
   imagesEl.textContent = "No images yet.";
+  imagesEl.className = "images muted";
   batchTableEl.textContent = "No documents yet.";
+  batchTableEl.className = "table-wrap muted";
   pdfFrame.removeAttribute("src");
   currentPdfUrl = "";
   selectedDocument = null;
+  selectedBundle = null;
+  updateAgentScope(null);
+}
+
+function updateAgentScope(bundle) {
+  if (Array.isArray(bundle)) {
+    indexedDocuments = bundle;
+  }
+
+  const manualDocIds = parseDocIds(questionDocIdInput.value);
+  if (questionAllDocsInput.checked) {
+    const docIdCount = uniqueStrings([...indexedDocuments.map((document) => document.docId).filter(Boolean), ...manualDocIds]).length;
+    questionDocScopeEl.textContent = indexedDocuments.length > 0
+      ? `Scope: all cached tree PDFs (${indexedDocuments.length}); PageIndex doc_id values: ${docIdCount}.`
+      : "Scope: all cached tree PDFs, but no cached tree JSON was found.";
+    return;
+  }
+
+  const selectedDocId = selectedBundle?.pageIndexDocId;
+  if (manualDocIds.length > 0) {
+    questionDocScopeEl.textContent = `Scope: manual doc_id list (${manualDocIds.length}).`;
+    return;
+  }
+
+  if (selectedDocId) {
+    questionDocScopeEl.textContent = `Scope: selected document ${selectedBundle.document} (${selectedDocId}).`;
+    return;
+  }
+
+  if (selectedBundle?.document) {
+    questionDocScopeEl.textContent = `Selected: ${selectedBundle.document}, but no PageIndex doc_id is available.`;
+    return;
+  }
+
+  questionDocScopeEl.textContent = "Scope: selected document only, but no document is selected.";
 }
 
 function renderMarkdown(markdown) {
@@ -475,11 +618,11 @@ function formatBytes(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-async function saveApiKey(endpoint, apiKey, statusElement) {
+async function saveApiKey(endpoint, apiKey, statusElement, extraPayload = {}) {
   const response = await fetch(endpoint, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ apiKey })
+    body: JSON.stringify({ apiKey, ...extraPayload })
   });
   const payload = await response.json();
   if (!response.ok) {
@@ -502,14 +645,59 @@ async function loadSettings() {
     ? `PageIndex key configured: yes (${payload.maskedPageIndexApiKey})`
     : "PageIndex key configured: no";
   geminiSettingsStatusEl.textContent = payload.hasGeminiApiKey
-    ? `Gemini key configured: yes (${payload.maskedGeminiApiKey})`
-    : "Gemini key configured: no";
+    ? `Gemini keys configured: ${payload.configuredGeminiKeyCount || 1} (${payload.maskedGeminiApiKey})`
+    : "Gemini keys configured: no";
+  renderGeminiSettingsStatus();
   updatePageIndexWarning();
+}
+
+async function loadIndexedDocuments() {
+  const response = await fetch("/api/pageindex-documents");
+  const payload = await response.json();
+  if (!response.ok) {
+    indexedDocuments = [];
+    updateAgentScope();
+    return;
+  }
+
+  indexedDocuments = payload.documents || [];
+  updateAgentScope();
+}
+
+function mergeIndexedDocuments(documents) {
+  const byDocId = new Map(indexedDocuments.map((document) => [document.docId, document]));
+  for (const document of documents) {
+    if (document.docId) {
+      byDocId.set(document.docId, document);
+    }
+  }
+  indexedDocuments = [...byDocId.values()].sort((left, right) => String(left.document).localeCompare(String(right.document)));
+  updateAgentScope();
+}
+
+function renderGeminiSettingsStatus() {
+  const slots = settings.geminiKeySlots || [];
+  if (slots.length === 0) {
+    geminiSettingsStatusEl.textContent = settings.hasGeminiApiKey
+      ? `Gemini keys configured: ${settings.configuredGeminiKeyCount || 1} (${settings.maskedGeminiApiKey})`
+      : "Gemini keys configured: no";
+    return;
+  }
+
+  const summary = slots
+    .map((slot) => `${slot.name.replace("GEMINI_KEY_", "#")}: ${slot.configured ? slot.maskedKey : "empty"}`)
+    .join(" | ");
+  const legacy = settings.legacyGeminiKeyConfigured ? ` | legacy: ${settings.maskedLegacyGeminiApiKey}` : "";
+  geminiSettingsStatusEl.textContent = `Gemini slots: ${summary}${legacy}`;
 }
 
 function updatePageIndexWarning() {
   const hasTemporaryKey = pageIndexKeyInput.value.trim().length > 0;
-  const shouldWarn = uploadPageIndexInput.checked && !settings.hasPageIndexApiKey && !hasTemporaryKey;
+  const shouldWarn =
+    uploadPageIndexInput.checked &&
+    !settings.hasPageIndexApiKey &&
+    !hasTemporaryKey &&
+    !reusePageIndexCacheInput.checked;
   pageIndexWarningEl.classList.toggle("hidden", !shouldWarn);
 }
 
@@ -519,10 +707,36 @@ function togglePasswordInput(input, button) {
   button.textContent = isPassword ? "Hide" : "Show";
 }
 
+function statusChip(value) {
+  const text = String(value || "n/a");
+  const normalized = text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "idle";
+  return `<span class="status-chip ${escapeHtml(normalized)}">${escapeHtml(text)}</span>`;
+}
+
+function plainOrChip(value) {
+  const text = String(value ?? "");
+  if (!text) return "";
+  if (/^(passed|failed|completed|queued|running|waiting|yes|none|skipped)$/i.test(text)) {
+    return statusChip(text);
+  }
+  return escapeHtml(text);
+}
+
+function parseDocIds(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values)];
+}
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+.replaceAll('"', "&quot;");
 }

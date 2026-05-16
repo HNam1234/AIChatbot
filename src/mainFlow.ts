@@ -1,6 +1,9 @@
 import { readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { runAgenticQuery } from "./agent/hsCodeAgent";
+import { askChatQuestion, startChatSession } from "./cli/repl";
 import { resolvePageIndexSettings } from "./config/env";
+import { resolveGeminiApiKeys } from "./config/gemini";
 import { ArtifactFilter } from "./orchestrator/artifactFilter";
 import { HSCodeReconstructor } from "./orchestrator/hsCodeReconstructor";
 import { ImageAssetExporter } from "./orchestrator/imageAssetExporter";
@@ -116,29 +119,59 @@ export async function executePipeline(pdfPath: string, options: PipelineOptions 
   let treeValidation: PipelineResult["treeValidation"];
   let pageIndexDocId: string | undefined;
   if (options.uploadPageIndex) {
-    const pageIndexSettings = resolvePageIndexSettings({
-      apiKey: options.pageIndexApiKey,
-      baseUrl: options.pageIndexBaseUrl,
-      pollIntervalMs: options.pageIndexPollIntervalMs,
-      pollMaxAttempts: options.pageIndexPollMaxAttempts
-    });
+    let treeBuild = options.forcePageIndexUpload ? undefined : await TreeBuilder.loadCached(outputPath, treeOutputPath);
 
-    logStep(options, "pageindex upload started");
-    logStep(options, "pageindex polling started");
-    const treeBuild = await TreeBuilder.buildAndWait(outputPath, {
-      apiKey: pageIndexSettings.pageIndexApiKey,
-      outputPath: treeOutputPath,
-      baseUrl: pageIndexSettings.pageIndexBaseUrl,
-      pollIntervalMs: pageIndexSettings.pageIndexPollIntervalMs,
-      pollMaxAttempts: pageIndexSettings.pageIndexPollMaxAttempts,
-      timeoutMs: options.pageIndexTimeoutMs
-    });
+    if (treeBuild) {
+      logStep(options, "pageindex cache hit");
+      logStep(options, "pageindex upload skipped (cached tree)");
+      logStep(options, "pageindex polling skipped (cached tree)");
+    } else {
+      if (options.forcePageIndexUpload) {
+        logStep(options, "pageindex cache bypassed");
+      } else {
+        logStep(options, "pageindex cache miss");
+      }
+
+      const pageIndexSettings = resolvePageIndexSettings({
+        apiKey: options.pageIndexApiKey,
+        baseUrl: options.pageIndexBaseUrl,
+        pollIntervalMs: options.pageIndexPollIntervalMs,
+        pollMaxAttempts: options.pageIndexPollMaxAttempts
+      });
+
+      logStep(options, "pageindex upload started");
+      logStep(options, "pageindex polling started");
+      treeBuild = await TreeBuilder.buildAndWait(outputPath, {
+        apiKey: pageIndexSettings.pageIndexApiKey,
+        outputPath: treeOutputPath,
+        baseUrl: pageIndexSettings.pageIndexBaseUrl,
+        pollIntervalMs: pageIndexSettings.pageIndexPollIntervalMs,
+        pollMaxAttempts: pageIndexSettings.pageIndexPollMaxAttempts,
+        timeoutMs: options.pageIndexTimeoutMs
+      });
+    }
     pageIndexDocId = treeBuild.docId;
     logStep(options, "tree validation started");
     treeValidation = TreeValidator.validate(markdown, treeBuild.treeData, {
       docId: treeBuild.docId,
       sectionMap
     });
+    if (treeBuild.fromCache) {
+      treeValidation.warnings = [
+        ...(treeValidation.warnings ?? []),
+        `Reused cached PageIndex tree: ${treeOutputPath}`,
+        ...(treeBuild.cacheWarnings ?? [])
+      ];
+      treeValidation.markers[0] = {
+        ...treeValidation.markers[0],
+        details: {
+          ...(treeValidation.markers[0]?.details ?? {}),
+          pageIndexCacheHit: true,
+          pageIndexCachePath: treeOutputPath,
+          pageIndexCacheWarnings: treeBuild.cacheWarnings ?? []
+        }
+      };
+    }
     await writeJson(treeValidationReportPath, treeValidation);
     logStep(options, "tree validation done");
     if (!treeValidation.passed) {
@@ -291,6 +324,9 @@ function parseCliArgs(argv: string[]): CliArgs {
       case "--upload-pageindex":
         options.uploadPageIndex = true;
         break;
+      case "--force-pageindex-upload":
+        options.forcePageIndexUpload = true;
+        break;
       case "--batch":
         batch = true;
         break;
@@ -354,6 +390,7 @@ Options:
   --assets-dir <path>           Asset output directory, default data/converted/assets
   --batch                       Process every PDF in the input directory sequentially
   --upload-pageindex            Upload Markdown to PageIndex and write <file>.tree.json
+  --force-pageindex-upload      Ignore existing <file>.tree.json cache and upload again
   --pageindex-api-key <key>     PageIndex API key, defaults to PAGEINDEX_API_KEY or .env
   --pageindex-base-url <url>    PageIndex API base URL
   --pageindex-poll-interval-ms <number> Poll interval for async PageIndex responses
@@ -364,7 +401,20 @@ Options:
 if (require.main === module) {
   void (async () => {
     try {
-      const { pdfPath, batch, help, options } = parseCliArgs(process.argv.slice(2));
+      const argv = process.argv.slice(2);
+      const mode = readMode(argv);
+
+      if (mode === "chat") {
+        await executeChatCli(argv);
+        return;
+      }
+
+      if (mode === "agent") {
+        await executeAgentCli(argv);
+        return;
+      }
+
+      const { pdfPath, batch, help, options } = parseCliArgs(argv);
       if (help) {
         printUsage();
         return;
@@ -391,6 +441,309 @@ if (require.main === module) {
       process.exitCode = 1;
     }
   })();
+}
+
+type CliMode = "chat" | "agent";
+
+interface ChatModeArgs {
+  help: boolean;
+  docId?: string | string[];
+  question?: string;
+  pageIndexApiKey?: string;
+  pageIndexBaseUrl?: string;
+  temperature?: number;
+  enableCitations: boolean;
+}
+
+interface AgentModeArgs {
+  help: boolean;
+  docId?: string;
+  docName?: string;
+  query?: string;
+  pages?: string;
+  folderId?: string;
+  pageIndexApiKey?: string;
+  pageIndexMcpUrl?: string;
+  mcpToolName?: string;
+  geminiApiKeys: string[];
+  geminiModel?: string;
+  maxContextChars?: number;
+  maxAnswerWords?: number;
+}
+
+function readMode(argv: string[]): CliMode | undefined {
+  const modeIndex = argv.indexOf("--mode");
+  if (modeIndex >= 0) {
+    const mode = argv[modeIndex + 1];
+    if (mode === "chat" || mode === "agent") {
+      return mode;
+    }
+  }
+
+  const first = argv[0];
+  if (first === "chat" || first === "agent") {
+    return first;
+  }
+
+  return undefined;
+}
+
+async function executeChatCli(argv: string[]): Promise<void> {
+  const args = parseChatModeArgs(argv);
+  if (args.help) {
+    printChatUsage();
+    return;
+  }
+
+  const pageIndexSettings = resolvePageIndexSettings({
+    apiKey: args.pageIndexApiKey,
+    baseUrl: args.pageIndexBaseUrl
+  });
+  const options = {
+    apiKey: pageIndexSettings.pageIndexApiKey,
+    baseUrl: pageIndexSettings.pageIndexBaseUrl,
+    docId: args.docId,
+    temperature: args.temperature,
+    enableCitations: args.enableCitations
+  };
+
+  if (args.question) {
+    await askChatQuestion(args.question, options);
+    return;
+  }
+
+  await startChatSession(options);
+}
+
+async function executeAgentCli(argv: string[]): Promise<void> {
+  const args = parseAgentModeArgs(argv);
+  if (args.help) {
+    printAgentUsage();
+    return;
+  }
+
+  if (!args.query) {
+    printAgentUsage();
+    throw new Error("--query is required for --mode agent.");
+  }
+
+  const pageIndexSettings = resolvePageIndexSettings({
+    apiKey: args.pageIndexApiKey
+  });
+  const geminiApiKeys = resolveGeminiApiKeys(args.geminiApiKeys);
+  const result = await runAgenticQuery({
+    pageIndexApiKey: pageIndexSettings.pageIndexApiKey,
+    pageIndexMcpUrl: args.pageIndexMcpUrl,
+    docId: args.docId,
+    docName: args.docName,
+    query: args.query,
+    pages: args.pages,
+    folderId: args.folderId,
+    mcpToolName: args.mcpToolName,
+    geminiApiKeys,
+    geminiModel: args.geminiModel,
+    maxContextChars: args.maxContextChars,
+    maxAnswerWords: args.maxAnswerWords
+  });
+
+  console.log("[Agent Retrieval]");
+  console.log(`Tool: ${result.retrieval.toolName}`);
+  console.log(`Context: ${result.context.length}/${result.retrieval.originalLength} chars`);
+  console.log(`Truncated: ${result.retrieval.truncated ? "yes" : "no"}`);
+  for (const marker of result.markers) {
+    console.log(marker.message);
+  }
+  console.log("\n[Agent Answer]");
+  console.log(result.answer);
+}
+
+function parseChatModeArgs(argv: string[]): ChatModeArgs {
+  const args: ChatModeArgs = {
+    help: false,
+    enableCitations: true
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    const next = () => {
+      index += 1;
+      if (index >= argv.length) {
+        throw new Error(`Missing value for ${arg}`);
+      }
+      return argv[index];
+    };
+
+    switch (arg) {
+      case "chat":
+      case "--mode":
+        if (arg === "--mode") {
+          next();
+        }
+        break;
+      case "--doc-id":
+        args.docId = splitList(next());
+        break;
+      case "--query":
+      case "--question":
+        args.question = next();
+        break;
+      case "--pageindex-api-key":
+        args.pageIndexApiKey = next();
+        break;
+      case "--pageindex-base-url":
+        args.pageIndexBaseUrl = next();
+        break;
+      case "--temperature":
+        args.temperature = readNumericOption(arg, next());
+        break;
+      case "--no-citations":
+        args.enableCitations = false;
+        break;
+      case "--help":
+      case "-h":
+        args.help = true;
+        return args;
+      default:
+        if (arg.startsWith("-")) {
+          throw new Error(`Unknown chat option: ${arg}`);
+        }
+        args.question = arg;
+        break;
+    }
+  }
+
+  return args;
+}
+
+function parseAgentModeArgs(argv: string[]): AgentModeArgs {
+  const args: AgentModeArgs = {
+    help: false,
+    geminiApiKeys: []
+  };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    const next = () => {
+      index += 1;
+      if (index >= argv.length) {
+        throw new Error(`Missing value for ${arg}`);
+      }
+      return argv[index];
+    };
+
+    switch (arg) {
+      case "agent":
+      case "--mode":
+        if (arg === "--mode") {
+          next();
+        }
+        break;
+      case "--doc-id":
+        args.docId = next();
+        break;
+      case "--doc-name":
+        args.docName = next();
+        break;
+      case "--query":
+      case "--question":
+        args.query = next();
+        break;
+      case "--pages":
+        args.pages = next();
+        break;
+      case "--folder-id":
+        args.folderId = next();
+        break;
+      case "--pageindex-api-key":
+        args.pageIndexApiKey = next();
+        break;
+      case "--pageindex-mcp-url":
+      case "--mcp-url":
+        args.pageIndexMcpUrl = next();
+        break;
+      case "--mcp-tool":
+        args.mcpToolName = next();
+        break;
+      case "--gemini-api-key":
+        args.geminiApiKeys.push(next());
+        break;
+      case "--gemini-model":
+        args.geminiModel = next();
+        break;
+      case "--max-context-chars":
+        args.maxContextChars = readNumericOption(arg, next());
+        break;
+      case "--max-answer-words":
+        args.maxAnswerWords = readNumericOption(arg, next());
+        break;
+      case "--help":
+      case "-h":
+        args.help = true;
+        return args;
+      default:
+        if (arg.startsWith("-")) {
+          throw new Error(`Unknown agent option: ${arg}`);
+        }
+        args.query = arg;
+        break;
+    }
+  }
+
+  args.pageIndexMcpUrl = args.pageIndexMcpUrl ?? process.env.PAGEINDEX_MCP_URL;
+
+  return args;
+}
+
+function printChatUsage(): void {
+  console.log(`Usage:
+  npm run chat -- --doc-id <doc_id> --query "question"
+  npm run chat -- --doc-id <doc_id>
+
+Options:
+  --doc-id <id[,id]>            Optional PageIndex document scope
+  --query, --question <text>    Ask one question and exit
+  --pageindex-api-key <key>     PageIndex API key, defaults to PAGEINDEX_API_KEY or .env
+  --pageindex-base-url <url>    PageIndex API base URL
+  --temperature <number>        Chat API temperature, default 0.1
+  --no-citations                Disable citation requirement and request flag`);
+}
+
+function printAgentUsage(): void {
+  console.log(`Usage:
+  npm run agent -- --doc-name <name> --query "question"
+  npm run agent -- --doc-id <id> --query "question"
+
+Options:
+  --doc-name <name>             PageIndex document name for MCP tools that require docName
+  --doc-id <id>                 PageIndex document id or fallback document reference
+  --query, --question <text>    User question
+  --pages <spec>                Optional page spec for page-content tools
+  --folder-id <id>              Optional PageIndex folder scope
+  --pageindex-api-key <key>     PageIndex API key, defaults to PAGEINDEX_API_KEY or .env
+  --mcp-url <url>               MCP endpoint, default PAGEINDEX_MCP_URL or PageIndex cloud MCP
+  --mcp-tool <name>             Force a specific MCP tool name
+  --gemini-api-key <key>        Gemini key override; can be repeated
+  --gemini-model <name>         Gemini model, default gemini-2.5-flash
+  --max-context-chars <number>  Marker 12 context budget, default 1500
+  --max-answer-words <number>   Marker 13 answer budget, default 120`);
+}
+
+function splitList(value: string): string | string[] {
+  const parts = value
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  return parts.length <= 1 ? parts[0] ?? value : parts;
+}
+
+function readNumericOption(name: string, value: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`${name} must be a number.`);
+  }
+
+  return parsed;
 }
 
 interface BatchDocumentSummary {

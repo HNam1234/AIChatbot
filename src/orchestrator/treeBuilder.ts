@@ -1,4 +1,5 @@
-import { writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { PageIndexClient, type PageIndexJson } from "../api/pageindexClient";
 import { ensureDirectory } from "../utils/paths";
@@ -17,12 +18,50 @@ export interface TreeBuildResult {
   treeData: unknown;
   rawResponse: PageIndexJson;
   outputPath?: string;
+  fromCache?: boolean;
+  cacheWarnings?: string[];
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 5000;
 const DEFAULT_POLL_MAX_ATTEMPTS = 60;
 
 export class TreeBuilder {
+  public static async loadCached(markdownPath: string, outputPath: string): Promise<TreeBuildResult | undefined> {
+    const cachedText = await readFile(outputPath, "utf8").catch(() => undefined);
+    if (!cachedText) {
+      return undefined;
+    }
+
+    const cachedPayload = parseJsonObject(cachedText);
+    if (!cachedPayload) {
+      return undefined;
+    }
+
+    const cacheWarnings: string[] = [];
+    const cachedHash = stringValue(objectValue(cachedPayload.cache)?.sourceMarkdownSha256);
+    if (cachedHash) {
+      const currentHash = await sha256File(markdownPath).catch(() => undefined);
+      if (currentHash && cachedHash !== currentHash) {
+        cacheWarnings.push("cached-tree-markdown-hash-differs");
+      }
+    }
+
+    const rawResponse = objectValue(cachedPayload.rawResponse) ?? cachedPayload;
+    const treeData = extractTreeData(cachedPayload) ?? extractTreeData(rawResponse);
+    if (treeData === undefined) {
+      return undefined;
+    }
+
+    return {
+      docId: extractDocId(cachedPayload) ?? extractDocId(rawResponse),
+      treeData,
+      rawResponse,
+      outputPath,
+      fromCache: true,
+      cacheWarnings
+    };
+  }
+
   public static async buildAndWait(markdownPath: string, options: TreeBuilderOptions): Promise<TreeBuildResult> {
     const client = new PageIndexClient(options.apiKey, { baseUrl: options.baseUrl });
     const uploadResponse = await client.uploadMarkdown(markdownPath);
@@ -34,9 +73,10 @@ export class TreeBuilder {
         docId: immediateDocId,
         treeData: immediateTree,
         rawResponse: uploadResponse,
-        outputPath: options.outputPath
+        outputPath: options.outputPath,
+        fromCache: false
       };
-      await writeTreeIfRequested(result, options.outputPath);
+      await writeTreeIfRequested(result, options.outputPath, markdownPath);
       return result;
     }
 
@@ -66,9 +106,10 @@ export class TreeBuilder {
           docId,
           treeData,
           rawResponse: statusResponse,
-          outputPath: options.outputPath
+          outputPath: options.outputPath,
+          fromCache: false
         };
-        await writeTreeIfRequested(result, options.outputPath);
+        await writeTreeIfRequested(result, options.outputPath, markdownPath);
         return result;
       }
 
@@ -107,7 +148,7 @@ function isTreePayload(value: unknown): boolean {
   return Array.isArray(value) || (typeof value === "object" && value !== null);
 }
 
-async function writeTreeIfRequested(result: TreeBuildResult, outputPath?: string): Promise<void> {
+async function writeTreeIfRequested(result: TreeBuildResult, outputPath: string | undefined, markdownPath: string): Promise<void> {
   if (!outputPath) {
     return;
   }
@@ -116,7 +157,12 @@ async function writeTreeIfRequested(result: TreeBuildResult, outputPath?: string
   await writeFile(outputPath, `${JSON.stringify({
     docId: result.docId,
     tree: result.treeData,
-    rawResponse: result.rawResponse
+    rawResponse: result.rawResponse,
+    cache: {
+      generatedAt: new Date().toISOString(),
+      sourceMarkdown: path.relative(process.cwd(), path.resolve(markdownPath)).replace(/\\/g, "/"),
+      sourceMarkdownSha256: await sha256File(markdownPath)
+    }
   }, null, 2)}\n`, "utf8");
 }
 
@@ -141,4 +187,27 @@ function timeoutToAttempts(timeoutMs: number | undefined, pollIntervalMs: number
 
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sha256File(filePath: string): Promise<string> {
+  const buffer = await readFile(filePath);
+  return createHash("sha256").update(buffer).digest("hex");
+}
+
+function parseJsonObject(text: string): PageIndexJson | undefined {
+  try {
+    return objectValue(JSON.parse(text));
+  } catch {
+    return undefined;
+  }
+}
+
+function objectValue(value: unknown): PageIndexJson | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as PageIndexJson)
+    : undefined;
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
 }

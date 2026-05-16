@@ -8,6 +8,7 @@ export interface PipelineProcessOptions {
   doclingThreads: number;
   exportAssets: boolean;
   uploadPageIndex: boolean;
+  forcePageIndexUpload?: boolean;
   pageIndexApiKey?: string;
   geminiApiKey?: string;
   timeoutMs: number;
@@ -97,6 +98,9 @@ function buildParseArgs(options: PipelineProcessOptions): string[] {
   if (options.uploadPageIndex) {
     args.push("--upload-pageindex");
   }
+  if (options.forcePageIndexUpload) {
+    args.push("--force-pageindex-upload");
+  }
 
   return args;
 }
@@ -139,6 +143,15 @@ function inferStep(line: string): string | undefined {
   }
   if (normalized.includes("pageindex upload started")) {
     return "pageindex upload started";
+  }
+  if (normalized.includes("pageindex cache hit")) {
+    return "pageindex cache hit";
+  }
+  if (normalized.includes("pageindex cache miss")) {
+    return "pageindex cache miss";
+  }
+  if (normalized.includes("pageindex cache bypassed")) {
+    return "pageindex cache bypassed";
   }
   if (normalized.includes("pageindex polling started")) {
     return "pageindex polling started";

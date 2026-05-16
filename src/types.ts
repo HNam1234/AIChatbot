@@ -149,6 +149,7 @@ export interface PipelineOptions extends ToolRuntimeOptions {
   exportAssets?: boolean;
   assetsDir?: string;
   uploadPageIndex?: boolean;
+  forcePageIndexUpload?: boolean;
   pageIndexApiKey?: string;
   pageIndexBaseUrl?: string;
   pageIndexPollIntervalMs?: number;

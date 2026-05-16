@@ -1,12 +1,14 @@
 ﻿# Local PDF Parser + PageIndex Tree Pipeline
 
-Pipeline TypeScript parse PDF HS Code thành Markdown chuẩn, export ảnh nội dung, upload Markdown lên PageIndex để sinh Tree Index, rồi dùng cho RAG/Q&A ở milestone sau.
+Pipeline TypeScript parse PDF HS Code thành Markdown chuẩn, export ảnh nội dung, upload Markdown lên PageIndex để sinh Tree Index, rồi dùng cho Agentic Q&A qua PageIndex Chat API hoặc MCP + Gemini.
 
 ## Milestones
 
 - [Milestone 1: Local PDF Parser](docs/milestones/milestone-1.md)
 - [Milestone 1.1: Image Asset Export](docs/milestones/milestone-1-1.md)
 - [Milestone 2: PageIndex Tree Generation](docs/milestones/milestone-2.md)
+- [Milestone 3: Agentic Q&A and Reasoning Retrieval](docs/milestones/milestone-3.md)
+- [Milestone 4: Custom Agentic Retrieval via MCP with Round-Robin Keys](docs/milestones/milestone-4.md)
 
 ## Prerequisites
 
@@ -44,7 +46,11 @@ Tạo `.env` từ `.env.example`:
 ```text
 PAGEINDEX_API_KEY=your_key_here
 GEMINI_API_KEY=your_gemini_key_here
+GEMINI_KEY_1=your_first_gemini_key
+GEMINI_KEY_2=your_second_gemini_key
+GEMINI_KEY_3=your_third_gemini_key
 PAGEINDEX_API_BASE_URL=https://api.pageindex.ai
+PAGEINDEX_MCP_URL=https://api.pageindex.ai/mcp
 PAGEINDEX_POLL_INTERVAL_MS=5000
 PAGEINDEX_POLL_MAX_ATTEMPTS=60
 UI_PIPELINE_TIMEOUT_MS=600000
@@ -64,7 +70,7 @@ npm run dev
 Mở `http://localhost:3000`, nhập key vào panel `API Settings`.
 
 - PageIndex key: dùng cho `--upload-pageindex`.
-- Gemini key: dành cho Milestone 3 Q&A/LLM sau này.
+- Gemini keys: UI hỗ trợ 3 slot `GEMINI_KEY_1`, `GEMINI_KEY_2`, `GEMINI_KEY_3` cho Milestone 4 Round-Robin failover; `GEMINI_API_KEY` vẫn là fallback legacy.
 - Temporary key mode: tick `Use ... key only for this run`; key chỉ được truyền cho job hiện tại qua environment, không lưu disk.
 - Save key mode: bấm `Save ... Key to .env`; backend chỉ set/replace key tương ứng và giữ các biến `.env` khác.
 - UI/API chỉ hiện masked key dạng `********...abcd`; raw key không được trả về, không log ra terminal, không ghi job logs, không lưu localStorage.
@@ -80,6 +86,8 @@ Full single-document workflow with image export and PageIndex tree generation:
 ```bash
 npm run parse -- data/uploads/Chapter12.pdf --ocr-lang vie --docling-threads 4 --export-assets --upload-pageindex
 ```
+
+`--upload-pageindex` reuses `data/converted/<file>.tree.json` when it already contains a cached `docId` and tree payload. Use `--force-pageindex-upload` only when you intentionally want to regenerate the PageIndex tree.
 
 Output:
 
@@ -157,11 +165,78 @@ data/converted/<file>.tree.json
 data/converted/<file>.tree.validation.json
 ```
 
+PageIndex tree cache behavior:
+
+- First run uploads Markdown, polls PageIndex, and writes `<file>.tree.json` with `docId`, tree payload, raw response, and Markdown hash metadata.
+- Later runs with `--upload-pageindex` reuse that local tree cache and skip PageIndex upload/polling whenever the cache has a `docId` and tree payload. If the Markdown hash differs, the validator records a warning but still reuses the cached PageIndex doc instead of regenerating it.
+- Older cache files without hash metadata are still reused if they contain `docId` and `tree`, so existing PageIndex work is not wasted.
+- To rebuild intentionally, pass `--force-pageindex-upload`.
+
 Nếu thiếu key, CLI báo:
 
 ```text
 PAGEINDEX_API_KEY is missing. Create .env at project root or pass --pageindex-api-key.
 ```
+
+## Milestone 3: Agentic Q&A Plan
+
+Milestone 3 will add chat over indexed PageIndex documents. The planned flow is:
+
+```text
+User question
+ ↓
+PageIndex Chat API with doc_id
+ ↓
+Agentic retrieval over Tree Index
+ ↓
+Answer with inline citations
+ ↓
+Marker 11 citation integrity validation
+```
+
+Implementation: [Milestone 3: Agentic Q&A and Reasoning Retrieval](docs/milestones/milestone-3.md).
+
+Run one question:
+
+```bash
+npm run chat -- --doc-id "doc_id_from_milestone_2" --query "Find the HS Code for round cabbage"
+```
+
+Start an interactive session:
+
+```bash
+npm run chat -- --doc-id "doc_id_from_milestone_2"
+```
+
+Milestone 3 is intentionally vectorless: it reuses PageIndex Chat API and inline citations instead of building a separate local vector database. In the UI, Agent Console defaults to all cached PageIndex docs found in `data/converted/*.tree.json`, so one question can search across every PDF that has already been uploaded once.
+
+## Milestone 4: MCP Round-Robin Agent Plan
+
+Milestone 4 will add a custom low-token agent that uses PageIndex MCP tools for targeted retrieval and a Gemini Round-Robin client for final answer synthesis across multiple configured keys.
+
+```text
+User question
+ ↓
+PageIndex MCP tree/search tool
+ ↓
+Targeted context under token budget
+ ↓
+Gemini Round-Robin synthesis with key failover
+ ↓
+Marker 12 context-size gate
+ ↓
+Marker 13 answer-size guard
+```
+
+Implementation: [Milestone 4: Custom Agentic Retrieval via MCP with Round-Robin Keys](docs/milestones/milestone-4.md).
+
+Run:
+
+```bash
+npm run agent -- --doc-name "Chapter12.milestone1.md" --query "Find the HS Code for round cabbage"
+```
+
+Milestone 4 keeps the previous parser and PageIndex tree outputs read-only. Its cost controls are targeted extraction, strict context-size validation, key rotation/failover, and bounded answer validation.
 
 ## Run Multi-PDF Batch
 
@@ -214,8 +289,8 @@ http://localhost:3000
 2. Chọn OCR language, mặc định `vie`.
 3. Chọn Docling threads, mặc định `4`.
 4. Tick `Export image assets` nếu cần ảnh.
-5. Tick `Upload to PageIndex` nếu cần tree.
-6. Optional: tick `Stop on first failure`; files run sequentially by default.
+5. Tick `Upload to PageIndex` nếu cần tree/doc_id; `Reuse cached PageIndex tree` mặc định bật để không generate lại nếu đã có `<file>.tree.json`.
+6. Optional: bỏ tick `Reuse cached PageIndex tree` nếu muốn force regenerate, hoặc tick `Stop on first failure`; files run sequentially by default.
 7. Bấm `Run Pipeline`.
 8. Watch the top progress bar, current file, current step, elapsed time, per-file mini progress, and live logs.
 
@@ -251,7 +326,9 @@ Milestone 1.1: Local image assets
  ↓
 Milestone 2: PageIndex Tree JSON + Section Map
  ↓
-Milestone sau: RAG / Agentic Q&A
+Milestone 3: Agentic Q&A + Inline Citation Validation
+ ↓
+Milestone 4: MCP Agent + Round-Robin LLM Keys
 ```
 
 ## Công Nghệ Chính
@@ -261,6 +338,8 @@ Milestone sau: RAG / Agentic Q&A
 - **PyMuPDF4LLM**: parse nhanh trang text đơn giản.
 - **Docling**: parse trang có bảng, ảnh, scan hoặc layout khó.
 - **PageIndex API**: sinh Tree Index từ Markdown sạch.
+- **PageIndex Chat API**: Milestone 3 agentic retrieval và inline citations.
+- **PageIndex MCP + Gemini Flash**: planned Milestone 4 custom agentic retrieval with Round-Robin key failover and token budget gates.
 - **Express + static HTML/JS/CSS**: UI demo local.
 - **Vitest**: regression tests.
 
@@ -271,9 +350,11 @@ Milestone sau: RAG / Agentic Q&A
 - PyMuPDF/Docling install error: kiểm tra Python 3.10+ và thử update `pip`.
 - Unicode errors on Windows Python stdout/stderr: pipeline sets `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1`; if running Python helpers manually, keep UTF-8 enabled.
 - `PAGEINDEX_API_KEY is missing`: tạo `.env` ở project root hoặc truyền `--pageindex-api-key`.
+- PageIndex bị generate lại: giữ `data/converted/<file>.tree.json` và không dùng `--force-pageindex-upload`; UI phải bật `Reuse cached PageIndex tree`.
 - PageIndex polling timeout: tăng `PAGEINDEX_POLL_MAX_ATTEMPTS` hoặc kiểm tra dashboard PageIndex.
 - UI job chạy quá lâu: kiểm tra `data/tmp/*.ui-job-*.json`; job runner sẽ kill process sau `UI_PIPELINE_TIMEOUT_MS`.
 - Markdown image links không hiện trong cloud: asset path hiện là local; milestone sau có thể dùng Base64 hoặc static hosting.
 - Validation failed: xem debug ở `data/tmp/*.milestone1-failed.*` hoặc `data/tmp/*.pageindex-*.json`.
 - Marker 5 failures include `layoutHSCodeCount`, `pairedHSCodeCount`, `unpairedHsCodes`, and nearest text context for each unpaired code.
 - Marker 10 does not fail non-HS reference documents solely because they have zero HS sections.
+- Marker 12 and Marker 13 are planned Milestone 4 gates for targeted context size and bounded answer length.

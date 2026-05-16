@@ -1,0 +1,184 @@
+import { GoogleGenAI, type GenerateContentConfig } from "@google/genai";
+
+export interface GeminiRoundRobinOptions {
+  apiKeys?: string[];
+  model?: string;
+  temperature?: number;
+  maxOutputTokens?: number;
+  generator?: GeminiTextGenerator;
+}
+
+export interface GeminiSynthesisOptions {
+  language?: string;
+  temperature?: number;
+  maxOutputTokens?: number;
+}
+
+export interface GeminiTextGenerator {
+  generateText(options: {
+    apiKey: string;
+    model: string;
+    prompt: string;
+    config: GenerateContentConfig;
+  }): Promise<string>;
+}
+
+export class GoogleGenAITextGenerator implements GeminiTextGenerator {
+  public async generateText(options: {
+    apiKey: string;
+    model: string;
+    prompt: string;
+    config: GenerateContentConfig;
+  }): Promise<string> {
+    const ai = new GoogleGenAI({ apiKey: options.apiKey });
+    const response = await ai.models.generateContent({
+      model: options.model,
+      contents: options.prompt,
+      config: options.config
+    });
+
+    return (response.text ?? "").trim();
+  }
+}
+
+export class GeminiRoundRobinClient {
+  private readonly apiKeys: string[];
+  private readonly model: string;
+  private readonly temperature: number;
+  private readonly maxOutputTokens: number;
+  private readonly generator: GeminiTextGenerator;
+  private currentIndex = 0;
+
+  public constructor(options: GeminiRoundRobinOptions = {}) {
+    this.apiKeys = dedupeApiKeys(
+      options.apiKeys ?? [
+        process.env.GEMINI_KEY_1,
+        process.env.GEMINI_KEY_2,
+        process.env.GEMINI_KEY_3,
+        process.env.GEMINI_API_KEY
+      ]
+    );
+
+    if (this.apiKeys.length === 0) {
+      throw new Error("No Gemini API keys found. Set GEMINI_KEY_1..3 or GEMINI_API_KEY.");
+    }
+
+    this.model = options.model ?? "gemini-2.5-flash";
+    this.temperature = options.temperature ?? 0.2;
+    this.maxOutputTokens = options.maxOutputTokens ?? 512;
+    this.generator = options.generator ?? new GoogleGenAITextGenerator();
+  }
+
+  public get keyCount(): number {
+    return this.apiKeys.length;
+  }
+
+  public async synthesizeAnswer(context: string, query: string, options: GeminiSynthesisOptions = {}): Promise<string> {
+    const prompt = buildHsCodePrompt(context, query, options.language ?? "Vietnamese");
+    const config: GenerateContentConfig = {
+      temperature: options.temperature ?? this.temperature,
+      maxOutputTokens: options.maxOutputTokens ?? this.maxOutputTokens
+    };
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= this.apiKeys.length; attempt += 1) {
+      const { apiKey, slot } = this.getNextKey();
+
+      try {
+        const answer = await this.generator.generateText({
+          apiKey,
+          model: this.model,
+          prompt,
+          config
+        });
+        if (!answer) {
+          throw new Error("Gemini returned an empty answer.");
+        }
+        return answer;
+      } catch (error) {
+        lastError = error;
+        if (!isRetryableGeminiError(error)) {
+          throw error;
+        }
+
+        console.warn(`[Round-Robin] Gemini key slot ${slot} hit a retryable error; trying next key.`);
+      }
+    }
+
+    throw new Error(`All configured Gemini key slots failed. Last error: ${formatError(lastError)}`);
+  }
+
+  private getNextKey(): { apiKey: string; slot: number } {
+    const slot = this.currentIndex + 1;
+    const apiKey = this.apiKeys[this.currentIndex];
+    this.currentIndex = (this.currentIndex + 1) % this.apiKeys.length;
+    return { apiKey, slot };
+  }
+}
+
+export function buildHsCodePrompt(context: string, query: string, language: string): string {
+  return [
+    "You are a customs classification specialist for HS Code lookup.",
+    "Use only the provided context. Do not invent HS Codes that are not supported by the context.",
+    `Answer in ${language} unless the user explicitly asks for another language.`,
+    "Return the most relevant HS Code, product/title, and 1-2 short reasons based on the context.",
+    "If the context is insufficient, say that the document context is insufficient.",
+    "",
+    "Context:",
+    context,
+    "",
+    `Question: ${query}`
+  ].join("\n");
+}
+
+export function isRetryableGeminiError(error: unknown): boolean {
+  const status = getErrorStatus(error);
+  if (status === 429 || (typeof status === "number" && status >= 500 && status < 600)) {
+    return true;
+  }
+
+  const message = formatError(error).toLowerCase();
+  return (
+    message.includes("quota") ||
+    message.includes("rate limit") ||
+    message.includes("too many requests") ||
+    message.includes("resource exhausted") ||
+    message.includes("temporarily unavailable")
+  );
+}
+
+function dedupeApiKeys(values: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const keys: string[] = [];
+
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      keys.push(trimmed);
+    }
+  }
+
+  return keys;
+}
+
+function getErrorStatus(error: unknown): number | undefined {
+  const candidate = error as { status?: unknown; response?: { status?: unknown }; code?: unknown };
+  if (typeof candidate.status === "number") {
+    return candidate.status;
+  }
+
+  if (typeof candidate.response?.status === "number") {
+    return candidate.response.status;
+  }
+
+  if (typeof candidate.code === "number") {
+    return candidate.code;
+  }
+
+  return undefined;
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

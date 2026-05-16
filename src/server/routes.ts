@@ -4,11 +4,15 @@ import express from "express";
 import multer from "multer";
 import {
   getApiSettingsStatus,
+  isGeminiKeySlotName,
   loadEnvConfig,
   maskSecret,
+  resolvePageIndexSettings,
   saveGeminiApiKeyToEnv,
+  saveGeminiKeySlotToEnv,
   savePageIndexApiKeyToEnv
 } from "../config/env";
+import { PageIndexClient } from "../api/pageindexClient";
 import {
   defaultBlocksPath,
   defaultOutputPath,
@@ -20,8 +24,13 @@ import {
 } from "../utils/paths";
 import { JobStore } from "./jobStore";
 import { runPipelineProcess } from "./pipelineProcessRunner";
+import { QAValidator } from "../validators/qaValidator";
+import { GeminiRoundRobinClient } from "../agent/geminiClient";
+import { resolveGeminiApiKeys } from "../config/gemini";
+import { TokenValidator } from "../validators/tokenValidator";
 
 const uploadsDir = path.resolve(process.cwd(), "data", "uploads");
+const convertedDir = path.resolve(process.cwd(), "data", "converted");
 const assetsRoot = path.resolve(process.cwd(), "data", "converted", "assets");
 const tmpDir = path.resolve(process.cwd(), "data", "tmp");
 
@@ -71,13 +80,25 @@ export function createApiRouter(): express.Router {
   router.post("/settings/gemini-key", async (req, res) => {
     try {
       const apiKey = stringValue(req.body.apiKey);
+      const slot = stringValue(req.body.slot);
       if (!apiKey) {
         res.status(400).json({ error: "Gemini API key is required." });
         return;
       }
 
+      if (slot) {
+        if (!isGeminiKeySlotName(slot)) {
+          res.status(400).json({ error: "Invalid Gemini key slot." });
+          return;
+        }
+
+        const result = await saveGeminiKeySlotToEnv(slot, apiKey);
+        res.json({ ok: true, maskedKey: result.maskedKey, slotName: result.slotName });
+        return;
+      }
+
       const result = await saveGeminiApiKeyToEnv(apiKey);
-      res.json({ ok: true, maskedKey: result.maskedKey });
+      res.json({ ok: true, maskedKey: result.maskedKey, slotName: "GEMINI_API_KEY" });
     } catch (error) {
       res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
     }
@@ -103,9 +124,18 @@ export function createApiRouter(): express.Router {
       doclingThreads: numberValue(req.body.doclingThreads) ?? 4,
       exportAssets: booleanValue(req.body.exportAssets),
       uploadPageIndex: booleanValue(req.body.uploadPageIndex),
+      forcePageIndexUpload:
+        booleanValue(req.body.forcePageIndexUpload) ||
+        (req.body.reusePageIndexCache !== undefined && !booleanValue(req.body.reusePageIndexCache)),
       failFast: booleanValue(req.body.failFast),
       pageIndexApiKey: stringValue(req.body.temporaryPageIndexApiKey) ?? stringValue(req.body.pageIndexApiKey),
-      geminiApiKey: stringValue(req.body.temporaryGeminiApiKey) ?? stringValue(req.body.geminiApiKey)
+      geminiApiKey: firstStringValue(
+        req.body.temporaryGeminiApiKey1,
+        req.body.temporaryGeminiApiKey2,
+        req.body.temporaryGeminiApiKey3,
+        req.body.temporaryGeminiApiKey,
+        req.body.geminiApiKey
+      )
     };
 
     void runJob(job.id, inputFiles, options);
@@ -161,6 +191,14 @@ export function createApiRouter(): express.Router {
     res.json(await buildDocumentBundle(file.inputFile, true, status, file.error));
   });
 
+  router.get("/pageindex-documents", async (_req, res) => {
+    try {
+      res.json({ documents: await listCachedTreeDocuments() });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
   router.get("/uploads/:filename", (req, res) => {
     const fileName = req.params.filename;
     if (fileName !== path.basename(fileName) || path.extname(fileName).toLowerCase() !== ".pdf") {
@@ -181,8 +219,67 @@ export function createApiRouter(): express.Router {
     });
   });
 
-  router.post("/ask", (_req, res) => {
-    res.json({ answer: "Milestone 3 not implemented yet." });
+  router.post("/ask", async (req, res) => {
+    try {
+      const question = stringValue(req.body.question);
+      const requestedDocIds = uniqueStrings([
+        ...stringListValue(req.body.docIds),
+        ...splitDocIds(stringValue(req.body.docId))
+      ]);
+      const cachedDocIds =
+        stringValue(req.body.scope) === "all"
+          ? (await listCachedTreeDocuments())
+              .map((document) => document.docId)
+              .filter((docId): docId is string => Boolean(docId))
+          : [];
+      const docIds = uniqueStrings([...requestedDocIds, ...cachedDocIds]);
+      if (!question) {
+        res.status(400).json({ error: "Question is required." });
+        return;
+      }
+      if (stringValue(req.body.scope) === "all") {
+        const cachedAnswer = await answerFromCachedTrees(question);
+        res.json(cachedAnswer);
+        return;
+      }
+
+      if (docIds.length === 0) {
+        res.status(400).json({ error: "No PageIndex doc_id found. Use all cached tree scope or paste doc_id manually." });
+        return;
+      }
+
+      const settings = resolvePageIndexSettings({
+        apiKey: stringValue(req.body.temporaryPageIndexApiKey) ?? stringValue(req.body.pageIndexApiKey),
+        baseUrl: stringValue(req.body.pageIndexBaseUrl)
+      });
+      const client = new PageIndexClient(settings.pageIndexApiKey, {
+        baseUrl: settings.pageIndexBaseUrl
+      });
+      const chat = await client.chatCompletion({
+        docId: docIds.length === 1 ? docIds[0] : docIds,
+        temperature: 0.1,
+        enableCitations: true,
+        messages: [
+          {
+            role: "system",
+            content: "Answer HSCode questions using all selected PageIndex documents and include inline citations."
+          },
+          {
+            role: "user",
+            content: question
+          }
+        ]
+      });
+      const validation = QAValidator.validateResponse(chat.answer);
+
+      res.json({
+        answer: chat.answer,
+        docIds,
+        validation
+      });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
   });
 
   return router;
@@ -196,6 +293,7 @@ async function runJob(
     doclingThreads: number;
     exportAssets: boolean;
     uploadPageIndex: boolean;
+    forcePageIndexUpload?: boolean;
     failFast: boolean;
     pageIndexApiKey?: string;
     geminiApiKey?: string;
@@ -291,6 +389,7 @@ async function buildDocumentBundle(
     message: marker.message,
     details: marker.details
   })) ?? [];
+  const pageIndexCacheHit = Boolean(treeValidation?.markers.some((marker) => marker.details?.pageIndexCacheHit === true));
 
   return {
     document: path.basename(inputFile),
@@ -312,8 +411,16 @@ async function buildDocumentBundle(
           warnings: treeValidation.warnings ?? []
         }
       : undefined,
-    pageIndex: uploadPageIndex ? (treeValidation?.passed ? "completed" : treeJson ? "validation failed" : "failed") : "skipped",
-    pageIndexDocId: treeJson?.docId,
+    pageIndex: uploadPageIndex
+      ? pageIndexCacheHit
+        ? "cached"
+        : treeValidation?.passed
+          ? "completed"
+          : treeJson
+            ? "validation failed"
+            : "failed"
+      : "skipped",
+    pageIndexDocId: treeJson?.docId ?? (treeJson as { doc_id?: string } | undefined)?.doc_id,
     uploadUrl: `/api/uploads/${encodeURIComponent(path.basename(inputFile))}`,
     paths: {
       input: relativePath(inputFile),
@@ -343,6 +450,8 @@ async function buildBatchOutputs(documentOutputs: Record<string, unknown>[]): Pr
     hsSectionCount: output.hsSectionCount,
     imageCount: output.imageCount,
     hasTree: output.hasTree,
+    pageIndex: output.pageIndex,
+    pageIndexDocId: output.pageIndexDocId,
     error: output.error ?? null
   }));
   const allSections = documentOutputs.flatMap((output) => Array.isArray(output.sections) ? output.sections : []);
@@ -358,11 +467,11 @@ async function buildBatchOutputs(documentOutputs: Record<string, unknown>[]): Pr
       sections: output.paths && typeof output.paths === "object" ? (output.paths as Record<string, unknown>).sectionMap : undefined,
       tree: output.paths && typeof output.paths === "object" ? (output.paths as Record<string, unknown>).tree : undefined,
       treeValidation: output.paths && typeof output.paths === "object" ? (output.paths as Record<string, unknown>).treeValidation : undefined,
+      pageIndexDocId: output.pageIndexDocId,
       error: output.error ?? null
     }))
   };
 
-  const convertedDir = path.resolve(process.cwd(), "data", "converted");
   await ensureDirectory(convertedDir);
   await writeJson(path.join(convertedDir, "batch.manifest.json"), manifest);
   await writeJson(path.join(convertedDir, "all.sections.json"), allSections);
@@ -405,6 +514,185 @@ function documentSummaries(outputs: Record<string, unknown> | undefined): Array<
   return Array.isArray(documents) ? documents as Array<{ document?: unknown }> : [];
 }
 
+async function listCachedTreeDocuments(): Promise<Array<{ document: string; docId?: string; treePath: string }>> {
+  const exists = await stat(convertedDir).then((item) => item.isDirectory()).catch(() => false);
+  if (!exists) {
+    return [];
+  }
+
+  const entries = await readdir(convertedDir, { withFileTypes: true });
+  const documents: Array<{ document: string; docId?: string; treePath: string }> = [];
+
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".tree.json")) {
+      continue;
+    }
+
+    const treePath = path.join(convertedDir, entry.name);
+    const treeJson = await readOptionalJson<Record<string, unknown>>(treePath);
+    const docId = extractCachedDocId(treeJson);
+
+    documents.push({
+      document: entry.name.replace(/\.tree\.json$/i, ".pdf"),
+      docId,
+      treePath: relativePath(treePath) ?? treePath
+    });
+  }
+
+  return documents.sort((left, right) => left.document.localeCompare(right.document));
+}
+
+async function answerFromCachedTrees(question: string): Promise<Record<string, unknown>> {
+  const documents = await listCachedTreeDocuments();
+  if (documents.length === 0) {
+    throw new Error("No cached tree JSON found in data/converted. Run parse with Upload to PageIndex once.");
+  }
+
+  const hits = await searchCachedTreeDocuments(question, documents);
+  if (hits.length === 0) {
+    return {
+      answer: "Không tìm thấy ngữ cảnh phù hợp trong các cached tree JSON.",
+      docIds: [],
+      documents: documents.map((document) => document.document),
+      mode: "cached-tree"
+    };
+  }
+
+  const context = hits
+    .slice(0, 10)
+    .map((hit, index) => [
+      `Result ${index + 1}`,
+      `Document: ${hit.document}`,
+      hit.title ? `Title: ${hit.title}` : undefined,
+      hit.text
+    ].filter(Boolean).join("\n"))
+    .join("\n\n---\n\n");
+  const marker12 = TokenValidator.validateContextSize(context.slice(0, 12000), { maxChars: 12000 });
+  const llm = new GeminiRoundRobinClient({ apiKeys: resolveGeminiApiKeys() });
+  const answer = await llm.synthesizeAnswer(
+    context.slice(0, 12000),
+    `${question}\nTrả lời dựa trên cached tree JSON. Luôn trích dẫn nguồn dạng <doc=TenFile.pdf>.`
+  );
+  const marker13 = TokenValidator.validateOutputSize(answer, { maxWords: 180 });
+  const validation = QAValidator.validateResponse(answer, { requireCitations: false });
+
+  return {
+    answer,
+    docIds: [],
+    documents: uniqueStrings(hits.map((hit) => hit.document)),
+    mode: "cached-tree",
+    validation: {
+      ...validation,
+      markers: [marker12, marker13, ...validation.markers]
+    }
+  };
+}
+
+async function searchCachedTreeDocuments(
+  question: string,
+  documents: Array<{ document: string; treePath: string }>
+): Promise<Array<{ document: string; title: string; text: string; score: number }>> {
+  const queryTokens = tokenizeForSearch(question);
+  const hits: Array<{ document: string; title: string; text: string; score: number }> = [];
+
+  for (const document of documents) {
+    const treeJson = await readOptionalJson<Record<string, unknown>>(path.resolve(process.cwd(), document.treePath));
+    const roots = normalizeTreeRoots(treeJson);
+    for (const node of flattenCachedTreeNodes(roots)) {
+      const haystack = normalizeSearchText(`${node.title} ${node.text}`);
+      const score = queryTokens.reduce((sum, token) => sum + countOccurrences(haystack, token), 0);
+      if (score > 0) {
+        hits.push({
+          document: document.document,
+          title: node.title,
+          text: node.text.slice(0, 2400),
+          score
+        });
+      }
+    }
+  }
+
+  return hits.sort((left, right) => right.score - left.score || left.document.localeCompare(right.document));
+}
+
+function normalizeTreeRoots(payload: Record<string, unknown> | undefined): unknown[] {
+  if (!payload) {
+    return [];
+  }
+  if (Array.isArray(payload.tree)) {
+    return payload.tree;
+  }
+  const rawResponse = typeof payload.rawResponse === "object" && payload.rawResponse !== null
+    ? (payload.rawResponse as Record<string, unknown>)
+    : undefined;
+  return Array.isArray(rawResponse?.structure) ? rawResponse.structure : [];
+}
+
+function flattenCachedTreeNodes(nodes: unknown[]): Array<{ title: string; text: string }> {
+  const refs: Array<{ title: string; text: string }> = [];
+  for (const node of nodes) {
+    if (typeof node !== "object" || node === null) {
+      continue;
+    }
+    const record = node as Record<string, unknown>;
+    const title = stringValue(record.title) ?? "";
+    const text = [stringValue(record.text), stringValue(record.summary), stringValue(record.prefix_summary)]
+      .filter(Boolean)
+      .join("\n");
+    if (title || text) {
+      refs.push({ title, text });
+    }
+    const children = Array.isArray(record.nodes) ? record.nodes : Array.isArray(record.children) ? record.children : [];
+    refs.push(...flattenCachedTreeNodes(children));
+  }
+  return refs;
+}
+
+function tokenizeForSearch(text: string): string[] {
+  return uniqueStrings(
+    normalizeSearchText(text)
+      .split(/[^a-z0-9.]+/g)
+      .filter((token) => token.length >= 3)
+  );
+}
+
+function normalizeSearchText(text: string): string {
+  return text
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function countOccurrences(text: string, token: string): number {
+  let count = 0;
+  let index = text.indexOf(token);
+  while (index >= 0) {
+    count += 1;
+    index = text.indexOf(token, index + token.length);
+  }
+  return count;
+}
+
+function extractCachedDocId(payload: Record<string, unknown> | undefined): string | undefined {
+  if (!payload) {
+    return undefined;
+  }
+
+  const rawResponse =
+    typeof payload.rawResponse === "object" && payload.rawResponse !== null
+      ? (payload.rawResponse as Record<string, unknown>)
+      : undefined;
+
+  return (
+    stringValue(payload.docId) ??
+    stringValue(payload.doc_id) ??
+    stringValue(payload.id) ??
+    stringValue(rawResponse?.doc_id) ??
+    stringValue(rawResponse?.docId) ??
+    stringValue(rawResponse?.id)
+  );
+}
+
 function pageNumberFromAssetName(fileName: string): number | undefined {
   const match = /-p(\d+)-/i.exec(fileName);
   if (!match) {
@@ -422,6 +710,33 @@ function safePdfFileName(fileName: string): string {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function firstStringValue(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const resolved = stringValue(value);
+    if (resolved) {
+      return resolved;
+    }
+  }
+
+  return undefined;
+}
+
+function stringListValue(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((item) => splitDocIds(stringValue(item)));
+}
+
+function splitDocIds(value: string | undefined): string[] {
+  return value?.split(",").map((item) => item.trim()).filter(Boolean) ?? [];
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
 }
 
 function numberValue(value: unknown): number | undefined {

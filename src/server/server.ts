@@ -17,6 +17,17 @@ app.get(/.*/, (_req, res) => {
   res.sendFile(path.join(uiDir, "index.html"));
 });
 
-app.listen(config.port, () => {
+const server = app.listen(config.port, () => {
   console.log(`Local UI: http://localhost:${config.port}`);
+});
+
+server.on("error", (error: NodeJS.ErrnoException) => {
+  if (error.code === "EADDRINUSE") {
+    console.error(`Port ${config.port} is already in use. Stop the existing dev server or set PORT=<other-port>.`);
+    process.exitCode = 1;
+    return;
+  }
+
+  console.error(error);
+  process.exitCode = 1;
 });
