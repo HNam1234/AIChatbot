@@ -1,0 +1,22 @@
+{
+  "name": "aichatbot-local-pdf-parser",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Milestone 1 local PDF parser pipeline in TypeScript with 0-token local execution.",
+  "main": "dist/mainFlow.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest run",
+    "parse": "tsx src/mainFlow.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.16"
+  }
+}
