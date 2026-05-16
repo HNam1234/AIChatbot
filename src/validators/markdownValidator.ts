@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+
 import type { ParsedBlock, ValidationMarkerResult, ValidationReport } from "../types";
 
 export class MarkdownValidator {
@@ -25,7 +27,8 @@ export class MarkdownValidator {
       validateHSCodeTitlePairing(markdownText, parsedBlocks),
       validateMissingHSCodeSections(markdownText, parsedBlocks),
       validateCaptionSourceLeakage(markdownText),
-      validateCaptionOverFusion(markdownText)
+      validateCaptionOverFusion(markdownText),
+      validateImageAssetLinks(markdownText, parsedBlocks)
     ];
     const errors = markers.filter((marker) => !marker.passed).map((marker) => marker.message);
 
@@ -187,10 +190,12 @@ function validateHSCodeTitlePairing(markdownText: string, parsedBlocks: ParsedBl
   const markdownSections = extractMarkdownHSCodeSections(markdownText);
   const layoutSections = extractLayoutHSCodeSections(parsedBlocks);
   const brokenPairs: Array<Record<string, unknown>> = [];
-  let pairCount = 0;
+  const unpairedHsCodes: UnpairedHSCodeDiagnostic[] = [];
+  let directPairCount = 0;
+  let groupedPairCount = 0;
 
-  for (const layoutSection of layoutSections) {
-    const markdownSection = markdownSections.find((section) => section.hs === layoutSection.hs);
+  for (const [sectionIndex, layoutSection] of layoutSections.entries()) {
+    const markdownSection = markdownSections[sectionIndex];
     const knownTitle = KNOWN_HS_TITLE_REGRESSIONS[layoutSection.hs];
     const expectedTitle = knownTitle ?? layoutSection.title;
     const parsedTitle = markdownSection?.title ?? "";
@@ -198,6 +203,8 @@ function validateHSCodeTitlePairing(markdownText: string, parsedBlocks: ParsedBl
 
     if (!markdownSection) {
       reason = "missing-markdown-heading";
+    } else if (markdownSection.hs !== layoutSection.hs) {
+      reason = "hs-code-order-mismatch";
     } else if (!expectedTitle) {
       reason = layoutSection.reason ?? "missing-layout-title";
     } else if (!parsedTitle) {
@@ -207,27 +214,49 @@ function validateHSCodeTitlePairing(markdownText: string, parsedBlocks: ParsedBl
     }
 
     if (reason) {
+      const diagnostic: UnpairedHSCodeDiagnostic = {
+        hsCode: layoutSection.hs,
+        pageNumber: layoutSection.pageNumber,
+        blockId: layoutSection.blockId,
+        nearestTextBefore: layoutSection.nearestTextBefore ?? "",
+        nearestTextAfter: layoutSection.nearestTextAfter ?? "",
+        reason
+      };
+      unpairedHsCodes.push(diagnostic);
       brokenPairs.push({
         hsCode: layoutSection.hs,
         parsedTitle,
         expectedTitle,
         pageNumber: layoutSection.pageNumber,
         blockId: layoutSection.blockId,
+        nearestTextBefore: diagnostic.nearestTextBefore,
+        nearestTextAfter: diagnostic.nearestTextAfter,
+        pairingKind: layoutSection.pairingKind,
+        groupCodes: layoutSection.groupCodes,
         reason
       });
     } else {
-      pairCount += 1;
+      if (layoutSection.pairingKind === "grouped") {
+        groupedPairCount += 1;
+      } else {
+        directPairCount += 1;
+      }
     }
   }
 
-  if (pairCount !== layoutSections.length || brokenPairs.length > 0) {
+  const pairedHSCodeCount = directPairCount + groupedPairCount;
+  if (pairedHSCodeCount !== layoutSections.length || brokenPairs.length > 0) {
     return {
       marker: "MARKER 5",
       passed: false,
-      message: `[Marker 5 Failed] Confirmed HS Code-title pairs (${pairCount}) do not match layout HS Code count (${layoutSections.length}).`,
+      message: `[Marker 5 Failed] Paired HS Codes (${pairedHSCodeCount}) do not match layout HS Code count (${layoutSections.length}).`,
       details: {
-        pairCount,
         layoutHSCodeCount: layoutSections.length,
+        directPairCount,
+        groupedPairCount,
+        pairedHSCodeCount,
+        pairCount: pairedHSCodeCount,
+        unpairedHsCodes,
         brokenPairs
       }
     };
@@ -236,8 +265,15 @@ function validateHSCodeTitlePairing(markdownText: string, parsedBlocks: ParsedBl
   return {
     marker: "MARKER 5",
     passed: true,
-    message: "[Marker 5 Passed] HS Code-title headings are intact.",
-    details: { pairCount, layoutHSCodeCount: layoutSections.length }
+    message: `[Marker 5 Passed] HS Code-title headings are intact (${pairedHSCodeCount}/${layoutSections.length} paired).`,
+    details: {
+      layoutHSCodeCount: layoutSections.length,
+      directPairCount,
+      groupedPairCount,
+      pairedHSCodeCount,
+      pairCount: pairedHSCodeCount,
+      unpairedHsCodes
+    }
   };
 }
 
@@ -305,12 +341,89 @@ function validateCaptionOverFusion(markdownText: string): ValidationMarkerResult
   };
 }
 
+function validateImageAssetLinks(markdownText: string, parsedBlocks: ParsedBlock[]): ValidationMarkerResult {
+  const imageLinks = extractMarkdownImageLinks(markdownText);
+  const imagesWithAssets = parsedBlocks.filter(
+    (block) => block.type === "image" && typeof block.metadata?.assetPath === "string"
+  );
+  const assetExportEnabled = imageLinks.length > 0 || imagesWithAssets.length > 0;
+
+  if (!assetExportEnabled) {
+    return {
+      marker: "MARKER 9",
+      passed: true,
+      message: "[Marker 9 Passed] Image asset export is not enabled; asset link check skipped.",
+      details: { imageLinkCount: 0, assetImageCount: 0 }
+    };
+  }
+
+  const assetPathToAbsolute = new Map<string, string>();
+  for (const image of imagesWithAssets) {
+    const assetPath = String(image.metadata?.assetPath ?? "");
+    const absolutePath = String(image.metadata?.assetAbsolutePath ?? "");
+    if (assetPath && absolutePath) {
+      assetPathToAbsolute.set(normalizeMarkdownPath(assetPath), absolutePath);
+    }
+  }
+
+  const brokenLinks = imageLinks
+    .map((link) => ({
+      ...link,
+      absolutePath: assetPathToAbsolute.get(normalizeMarkdownPath(link.path))
+    }))
+    .filter((link) => !link.absolutePath || !existsSync(link.absolutePath));
+
+  const includedImageIds = extractMarkdownImageIds(markdownText);
+  const imageById = new Map(parsedBlocks.map((block) => [block.id, block]));
+  const missingAssetBlocks = includedImageIds
+    .map((id) => imageById.get(id))
+    .filter((block): block is ParsedBlock => Boolean(block))
+    .filter((block) => {
+      if (block.type !== "image" || block.metadata?.decorative === true || block.metadata?.duplicateOf !== undefined) {
+        return false;
+      }
+
+      return typeof block.metadata?.assetPath !== "string" || !block.metadata.assetPath;
+    })
+    .map((block) => block.id);
+
+  if (brokenLinks.length > 0 || missingAssetBlocks.length > 0) {
+    return {
+      marker: "MARKER 9",
+      passed: false,
+      message: "[Marker 9 Failed] Broken Markdown image asset links or missing image asset metadata.",
+      details: {
+        brokenLinks,
+        missingAssetBlockIds: missingAssetBlocks,
+        imageLinkCount: imageLinks.length,
+        assetImageCount: imagesWithAssets.length
+      }
+    };
+  }
+
+  return {
+    marker: "MARKER 9",
+    passed: true,
+    message: "[Marker 9 Passed] Markdown image links resolve to exported local assets.",
+    details: {
+      imageLinkCount: imageLinks.length,
+      assetImageCount: imagesWithAssets.length
+    }
+  };
+}
+
 interface HSCodeSection {
   hs: string;
   title: string;
   pageNumber?: number;
   blockId?: string;
+  lineIndex?: number;
   reason?: string;
+  groupSize: number;
+  pairingKind: "direct" | "grouped";
+  groupCodes: string[];
+  nearestTextBefore?: string;
+  nearestTextAfter?: string;
 }
 
 interface TextLineRef {
@@ -322,6 +435,31 @@ interface TextLineRef {
   x0: number;
   x1: number;
 }
+
+interface HSCodeLineParse {
+  codes: string[];
+  trailingText: string;
+}
+
+interface HSCodeGroup {
+  codes: string[];
+  codeLines: TextLineRef[];
+  inlineTitle: string;
+  inlineTitleLine?: TextLineRef;
+  titleCandidateLines: TextLineRef[];
+}
+
+interface UnpairedHSCodeDiagnostic {
+  hsCode: string;
+  pageNumber?: number;
+  blockId?: string;
+  nearestTextBefore: string;
+  nearestTextAfter: string;
+  reason: string;
+}
+
+const HS_CODE_PATTERN = "\\d{4}\\.\\d{2}\\.\\d{2}";
+const HS_CODE_REGEX = new RegExp(`^(${HS_CODE_PATTERN})\\b\\s*(.*)$`);
 
 const KNOWN_HS_TITLE_REGRESSIONS: Record<string, string> = {
   "0701.90.10": "CHIPPING POTATOES",
@@ -345,7 +483,12 @@ function extractMarkdownHSCodeSections(markdownText: string): HSCodeSection[] {
   while ((match = regex.exec(markdownText)) !== null) {
     sections.push({
       hs: match[1],
-      title: cleanInlineText(match[2] ?? "")
+      title: cleanInlineText(match[2] ?? ""),
+      groupSize: 1,
+      pairingKind: "direct",
+      groupCodes: [match[1]],
+      nearestTextBefore: "",
+      nearestTextAfter: ""
     });
   }
 
@@ -358,65 +501,117 @@ function extractLayoutHSCodeSections(parsedBlocks: ParsedBlock[]): HSCodeSection
     .filter((block) => block.source === "layout" && block.type === "text" && block.text)
     .sort(compareReadingOrder);
   const tableBlocks = parsedBlocks.filter(isReliableTableBlock);
+  const allTextLines = textBlocks.flatMap(textLineRefs);
+  const consumedLineKeys = new Set<string>();
 
   for (let blockIndex = 0; blockIndex < textBlocks.length; blockIndex += 1) {
     const block = textBlocks[blockIndex];
     const lines = textLineRefs(block);
     for (const line of lines) {
-      const match = line.text.match(/^(\d{4}\.\d{2}\.\d{2})\b\s*(.*)$/);
-      if (!match) {
+      const lineKey = textLineKey(line);
+      if (consumedLineKeys.has(lineKey)) {
         continue;
       }
 
-      const title = selectLayoutTitleForHSCode(
-        block,
-        line.lineIndex,
-        match[2] ?? "",
-        textBlocks.slice(blockIndex + 1),
-        tableBlocks
-      );
+      const parsed = parseHSCodeLine(line.text);
+      if (!parsed) {
+        continue;
+      }
 
-      sections.push({
-        hs: match[1],
-        title: title.title,
-        pageNumber: block.pageNumber,
-        blockId: block.id,
-        reason: title.reason
-      });
+      const followingLines = collectLayoutTitleSearchLines(block, line.lineIndex, textBlocks.slice(blockIndex + 1));
+      const group = collectHSCodeGroup(line, parsed, followingLines);
+      const title = selectLayoutTitleForHSCodeGroup(group, tableBlocks);
+      const pairingKind = group.codes.length > 1 ? "grouped" : "direct";
+      const context = nearestLayoutText(group.codeLines, allTextLines);
+
+      for (const codeLine of group.codeLines) {
+        consumedLineKeys.add(textLineKey(codeLine));
+      }
+
+      for (const code of group.codes) {
+        sections.push({
+          hs: code,
+          title: title.title,
+          pageNumber: line.block.pageNumber,
+          blockId: line.block.id,
+          lineIndex: line.lineIndex,
+          reason: title.reason,
+          groupSize: group.codes.length,
+          pairingKind,
+          groupCodes: group.codes,
+          nearestTextBefore: context.before,
+          nearestTextAfter: context.after
+        });
+      }
     }
   }
 
   return sections;
 }
 
-function selectLayoutTitleForHSCode(
-  currentBlock: ParsedBlock,
-  hsLineIndex: number,
-  inlineTitle: string,
-  nextBlocks: ParsedBlock[],
+function collectHSCodeGroup(
+  firstLine: TextLineRef,
+  firstParse: HSCodeLineParse,
+  followingLines: TextLineRef[]
+): HSCodeGroup {
+  const codes = [...firstParse.codes];
+  const codeLines = [firstLine];
+  let inlineTitle = firstParse.trailingText;
+  let inlineTitleLine: TextLineRef | undefined = inlineTitle ? firstLine : undefined;
+  let cursor = 0;
+
+  if (!inlineTitle) {
+    while (cursor < followingLines.length) {
+      const candidate = followingLines[cursor];
+      const parsed = parseHSCodeLine(candidate.text);
+      if (!parsed) {
+        break;
+      }
+      if (!isAdjacentHSCodeLine(codeLines[codeLines.length - 1], candidate)) {
+        break;
+      }
+
+      codes.push(...parsed.codes);
+      codeLines.push(candidate);
+      cursor += 1;
+
+      if (parsed.trailingText) {
+        inlineTitle = parsed.trailingText;
+        inlineTitleLine = candidate;
+        break;
+      }
+    }
+  }
+
+  return {
+    codes,
+    codeLines,
+    inlineTitle,
+    inlineTitleLine,
+    titleCandidateLines: followingLines.slice(cursor)
+  };
+}
+
+function selectLayoutTitleForHSCodeGroup(
+  group: HSCodeGroup,
   tableBlocks: ParsedBlock[]
 ): { title: string; reason?: string } {
   const selectedLines: TextLineRef[] = [];
-  const hsLine = textLineRefs(currentBlock).find((line) => line.lineIndex === hsLineIndex);
-  const candidateLines = [
-    ...textLineRefs(currentBlock).filter((line) => line.lineIndex > hsLineIndex),
-    ...nextBlocks.filter((block) => !isPageNumberBlock(block)).flatMap(textLineRefs)
-  ];
+  const hsLine = group.codeLines[group.codeLines.length - 1];
 
-  if (inlineTitle.trim() && isValidTitleLine(inlineTitle, hsLine, tableBlocks)) {
+  if (
+    group.inlineTitle.trim() &&
+    group.inlineTitleLine &&
+    isValidTitleLine(group.inlineTitle, group.inlineTitleLine, tableBlocks)
+  ) {
     selectedLines.push({
-      block: currentBlock,
-      lineIndex: hsLineIndex,
-      text: cleanInlineText(inlineTitle),
-      y0: hsLine?.y0 ?? currentBlock.bbox?.y0 ?? 0,
-      y1: hsLine?.y1 ?? currentBlock.bbox?.y1 ?? 0,
-      x0: hsLine?.x0 ?? currentBlock.bbox?.x0 ?? 0,
-      x1: hsLine?.x1 ?? currentBlock.bbox?.x1 ?? 0
+      ...group.inlineTitleLine,
+      text: cleanInlineText(group.inlineTitle)
     });
   }
 
-  for (const candidate of candidateLines) {
-    if (/^\d{4}\.\d{2}\.\d{2}\b/.test(candidate.text)) {
+  for (const candidate of group.titleCandidateLines) {
+    if (parseHSCodeLine(candidate.text)) {
       break;
     }
 
@@ -425,7 +620,7 @@ function selectLayoutTitleForHSCode(
         break;
       }
       if (!isValidTitleLine(candidate.text, candidate, tableBlocks)) {
-        if (isBodyLikeLine(candidate.text)) {
+        if (isRejectedTitleBoundary(candidate.text) || isBodyLikeLine(candidate.text)) {
           break;
         }
         continue;
@@ -446,6 +641,108 @@ function selectLayoutTitleForHSCode(
   }
 
   return { title: cleanInlineText(selectedLines.map((line) => line.text).join(" ")) };
+}
+
+function collectLayoutTitleSearchLines(
+  currentBlock: ParsedBlock,
+  hsLineIndex: number,
+  nextBlocks: ParsedBlock[]
+): TextLineRef[] {
+  return [
+    ...textLineRefs(currentBlock).filter((line) => line.lineIndex > hsLineIndex),
+    ...nextBlocks.filter((block) => !isPageNumberBlock(block)).flatMap(textLineRefs)
+  ];
+}
+
+function parseHSCodeLine(text: string): HSCodeLineParse | undefined {
+  let rest = cleanInlineText(text);
+  const codes: string[] = [];
+
+  while (rest.length > 0) {
+    const match = rest.match(HS_CODE_REGEX);
+    if (!match || !rest.startsWith(match[1])) {
+      break;
+    }
+
+    codes.push(match[1]);
+    rest = cleanInlineText(match[2] ?? "");
+  }
+
+  if (codes.length === 0) {
+    return undefined;
+  }
+
+  return {
+    codes,
+    trailingText: rest
+  };
+}
+
+function isAdjacentHSCodeLine(previous: TextLineRef, candidate: TextLineRef): boolean {
+  if (previous.block.pageNumber !== candidate.block.pageNumber) {
+    return false;
+  }
+
+  return candidate.y0 - previous.y1 <= 45;
+}
+
+function textLineKey(line: TextLineRef): string {
+  return `${line.block.id}:${line.lineIndex}`;
+}
+
+function nearestLayoutText(
+  codeLines: TextLineRef[],
+  allTextLines: TextLineRef[]
+): { before: string; after: string } {
+  const codeLineKeys = new Set(codeLines.map(textLineKey));
+  const sortedCodeIndexes = codeLines
+    .map((line) => allTextLines.findIndex((candidate) => textLineKey(candidate) === textLineKey(line)))
+    .filter((index) => index >= 0)
+    .sort((left, right) => left - right);
+  const firstIndex = sortedCodeIndexes[0] ?? -1;
+  const lastIndex = sortedCodeIndexes[sortedCodeIndexes.length - 1] ?? firstIndex;
+
+  return {
+    before: nearestTextBefore(firstIndex, allTextLines, codeLineKeys),
+    after: nearestTextAfter(lastIndex, allTextLines, codeLineKeys)
+  };
+}
+
+function nearestTextBefore(index: number, allTextLines: TextLineRef[], excludedKeys: Set<string>): string {
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    const line = allTextLines[cursor];
+    if (!line || excludedKeys.has(textLineKey(line)) || isPageNumberBlock(line.block)) {
+      continue;
+    }
+
+    const text = diagnosticText(line.text);
+    if (text) {
+      return text;
+    }
+  }
+
+  return "";
+}
+
+function nearestTextAfter(index: number, allTextLines: TextLineRef[], excludedKeys: Set<string>): string {
+  for (let cursor = index + 1; cursor < allTextLines.length; cursor += 1) {
+    const line = allTextLines[cursor];
+    if (!line || excludedKeys.has(textLineKey(line)) || isPageNumberBlock(line.block)) {
+      continue;
+    }
+
+    const text = diagnosticText(line.text);
+    if (text) {
+      return text;
+    }
+  }
+
+  return "";
+}
+
+function diagnosticText(text: string): string {
+  const cleaned = cleanInlineText(text);
+  return cleaned.length > 180 ? `${cleaned.slice(0, 177).trim()}...` : cleaned;
 }
 
 function compareReadingOrder(a: ParsedBlock, b: ParsedBlock): number {
@@ -531,6 +828,17 @@ function isValidTitleLine(text: string, line: TextLineRef | undefined, tableBloc
   }
 
   return uppercaseRatio(cleaned) >= 0.6;
+}
+
+function isRejectedTitleBoundary(text: string): boolean {
+  const cleaned = cleanInlineText(text);
+  return (
+    /^CHAPTER\s+\d+/i.test(cleaned) ||
+    /^\(Source:/i.test(cleaned) ||
+    isPictureCaption(cleaned) ||
+    isTableHeaderText(cleaned) ||
+    isListOrTableRowText(cleaned)
+  );
 }
 
 function isBodyLikeLine(text: string): boolean {
@@ -633,6 +941,42 @@ function extractMarkdownCaptions(markdownText: string): string[] {
   }
 
   return captions;
+}
+
+function extractMarkdownImageLinks(markdownText: string): Array<{ alt: string; path: string }> {
+  const links: Array<{ alt: string; path: string }> = [];
+  const regex = /!\[([^\]]*)\]\(([^)]+)\)/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(markdownText)) !== null) {
+    const path = match[2].trim();
+    if (/^(?:https?:|data:|#)/i.test(path)) {
+      continue;
+    }
+
+    links.push({
+      alt: match[1],
+      path
+    });
+  }
+
+  return links;
+}
+
+function extractMarkdownImageIds(markdownText: string): string[] {
+  const ids: string[] = [];
+  const regex = /<!--\s*image-id:\s*([^\s>]+)\s*-->/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(markdownText)) !== null) {
+    ids.push(match[1]);
+  }
+
+  return ids;
+}
+
+function normalizeMarkdownPath(value: string): string {
+  return value.replace(/\\/g, "/");
 }
 
 function normalizeComparableText(text: string): string {

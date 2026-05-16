@@ -31,7 +31,22 @@ interface TitleSelection {
   selectedLines: TextLineRef[];
 }
 
-const HS_CODE_REGEX = /^(\d{4}\.\d{2}\.\d{2})\b\s*(.*)$/;
+interface HSCodeLineParse {
+  codes: string[];
+  trailingText: string;
+}
+
+interface HSCodeGroup {
+  codes: string[];
+  codeLines: TextLineRef[];
+  inlineTitle: string;
+  inlineTitleLine?: TextLineRef;
+  titleCandidateLines: TextLineRef[];
+}
+
+const HS_CODE_PATTERN = "\\d{4}\\.\\d{2}\\.\\d{2}";
+const HS_CODE_REGEX = new RegExp(`^(${HS_CODE_PATTERN})\\b\\s*(.*)$`);
+const MARKDOWN_HEADING_DASH = "\u2014";
 
 export class HSCodeReconstructor {
   public static buildMarkdown(
@@ -160,26 +175,25 @@ function renderTextBlock(
       continue;
     }
 
-    const hsMatch = line.match(HS_CODE_REGEX);
-    if (hsMatch) {
+    const hsLine = parseHSCodeLine(line);
+    if (hsLine) {
       flushBody();
-      const code = hsMatch[1];
-      const titleSelection = selectTitleForHSCode(block, lineRef.lineIndex, hsMatch[2] ?? "", nextBlocks, state);
+      const followingLines = collectTitleSearchLines(block, lineRef.lineIndex, nextBlocks);
+      const group = collectHSCodeGroup(lineRef, hsLine, followingLines);
+      const titleSelection = selectTitleForHSCodeGroup(group, state);
       const title = titleSelection.title;
 
-      for (const selectedLine of titleSelection.selectedLines) {
-        if (selectedLine.block.id === block.id) {
-          skippedCurrentLineIndexes.add(selectedLine.lineIndex);
-        } else {
-          const previousCount = state.consumedTextLineCounts.get(selectedLine.block.id) ?? 0;
-          state.consumedTextLineCounts.set(
-            selectedLine.block.id,
-            Math.max(previousCount, selectedLine.lineIndex + 1)
-          );
-        }
+      for (const consumedLine of [...group.codeLines, ...titleSelection.selectedLines]) {
+        markConsumedLine(consumedLine, block, skippedCurrentLineIndexes, state);
       }
 
-      parts.push(`## ${code}${title ? ` — ${title}` : ""}`);
+      const groupReference = renderGroupReference(group.codes);
+      for (const code of group.codes) {
+        parts.push(`## ${code}${title ? ` ${MARKDOWN_HEADING_DASH} ${title}` : ""}`);
+        if (groupReference) {
+          parts.push(groupReference);
+        }
+      }
       continue;
     }
 
@@ -190,13 +204,40 @@ function renderTextBlock(
   return parts;
 }
 
+function markConsumedLine(
+  line: TextLineRef,
+  currentBlock: ParsedBlock,
+  skippedCurrentLineIndexes: Set<number>,
+  state: RenderState
+): void {
+  if (line.block.id === currentBlock.id) {
+    skippedCurrentLineIndexes.add(line.lineIndex);
+    return;
+  }
+
+  const previousCount = state.consumedTextLineCounts.get(line.block.id) ?? 0;
+  state.consumedTextLineCounts.set(line.block.id, Math.max(previousCount, line.lineIndex + 1));
+}
+
+function renderGroupReference(codes: string[]): string | undefined {
+  if (codes.length <= 1) {
+    return undefined;
+  }
+
+  return `Grouped HS code set: ${codes.join(", ")}.`;
+}
+
 function renderImageBlock(block: ParsedBlock): string[] {
   if (block.metadata?.decorative === true || block.metadata?.duplicateOf !== undefined) {
     return [];
   }
 
-  const parts = [`<!-- image: ${block.id} -->`];
   const caption = sanitizeCaptionText(String(block.metadata?.captionText ?? ""));
+  const assetPath = getStringMetadata(block, "assetPath");
+  const parts = assetPath
+    ? [`![${escapeMarkdownAlt(caption || block.id)}](${assetPath})`, `<!-- image-id: ${block.id} -->`]
+    : [`<!-- image: ${block.id} -->`];
+
   if (caption) {
     parts.push(`*Caption: ${caption}*`);
   }
@@ -209,31 +250,66 @@ function renderTableBlock(block: ParsedBlock): string[] {
   return markdown ? [markdown] : [];
 }
 
-function selectTitleForHSCode(
-  currentBlock: ParsedBlock,
-  hsLineIndex: number,
-  inlineTitle: string,
-  nextBlocks: ParsedBlock[],
-  state: RenderState
-): TitleSelection {
-  const selectedLines: TextLineRef[] = [];
-  const hsLine = textLineRefs(currentBlock).find((line) => line.lineIndex === hsLineIndex);
-  const candidateLines = collectTitleSearchLines(currentBlock, hsLineIndex, nextBlocks);
+function collectHSCodeGroup(
+  firstLine: TextLineRef,
+  firstParse: HSCodeLineParse,
+  followingLines: TextLineRef[]
+): HSCodeGroup {
+  const codes = [...firstParse.codes];
+  const codeLines = [firstLine];
+  let inlineTitle = firstParse.trailingText;
+  let inlineTitleLine: TextLineRef | undefined = inlineTitle ? firstLine : undefined;
+  let cursor = 0;
 
-  if (inlineTitle.trim() && isValidTitleLine(inlineTitle, hsLine, state.tableBlocks)) {
+  if (!inlineTitle) {
+    while (cursor < followingLines.length) {
+      const candidate = followingLines[cursor];
+      const parsed = parseHSCodeLine(candidate.text);
+      if (!parsed) {
+        break;
+      }
+      if (!isAdjacentHSCodeLine(codeLines[codeLines.length - 1], candidate)) {
+        break;
+      }
+
+      codes.push(...parsed.codes);
+      codeLines.push(candidate);
+      cursor += 1;
+
+      if (parsed.trailingText) {
+        inlineTitle = parsed.trailingText;
+        inlineTitleLine = candidate;
+        break;
+      }
+    }
+  }
+
+  return {
+    codes,
+    codeLines,
+    inlineTitle,
+    inlineTitleLine,
+    titleCandidateLines: followingLines.slice(cursor)
+  };
+}
+
+function selectTitleForHSCodeGroup(group: HSCodeGroup, state: RenderState): TitleSelection {
+  const selectedLines: TextLineRef[] = [];
+  const hsLine = group.codeLines[group.codeLines.length - 1];
+
+  if (
+    group.inlineTitle.trim() &&
+    group.inlineTitleLine &&
+    isValidTitleLine(group.inlineTitle, group.inlineTitleLine, state.tableBlocks)
+  ) {
     selectedLines.push({
-      block: currentBlock,
-      lineIndex: hsLineIndex,
-      text: cleanInlineText(inlineTitle),
-      y0: hsLine?.y0 ?? currentBlock.bbox?.y0 ?? 0,
-      y1: hsLine?.y1 ?? currentBlock.bbox?.y1 ?? 0,
-      x0: hsLine?.x0 ?? currentBlock.bbox?.x0 ?? 0,
-      x1: hsLine?.x1 ?? currentBlock.bbox?.x1 ?? 0
+      ...group.inlineTitleLine,
+      text: cleanInlineText(group.inlineTitle)
     });
   }
 
-  for (const candidate of candidateLines) {
-    if (HS_CODE_REGEX.test(candidate.text)) {
+  for (const candidate of group.titleCandidateLines) {
+    if (parseHSCodeLine(candidate.text)) {
       break;
     }
 
@@ -242,7 +318,7 @@ function selectTitleForHSCode(
         break;
       }
       if (!isValidTitleLine(candidate.text, candidate, state.tableBlocks)) {
-        if (isBodyLikeLine(candidate.text)) {
+        if (isRejectedTitleBoundary(candidate.text) || isBodyLikeLine(candidate.text)) {
           break;
         }
         continue;
@@ -262,6 +338,38 @@ function selectTitleForHSCode(
     title: cleanInlineText(selectedLines.map((line) => line.text).join(" ")),
     selectedLines
   };
+}
+
+function parseHSCodeLine(text: string): HSCodeLineParse | undefined {
+  let rest = cleanInlineText(text);
+  const codes: string[] = [];
+
+  while (rest.length > 0) {
+    const match = rest.match(HS_CODE_REGEX);
+    if (!match || !rest.startsWith(match[1])) {
+      break;
+    }
+
+    codes.push(match[1]);
+    rest = cleanInlineText(match[2] ?? "");
+  }
+
+  if (codes.length === 0) {
+    return undefined;
+  }
+
+  return {
+    codes,
+    trailingText: rest
+  };
+}
+
+function isAdjacentHSCodeLine(previous: TextLineRef, candidate: TextLineRef): boolean {
+  if (previous.block.pageNumber !== candidate.block.pageNumber) {
+    return false;
+  }
+
+  return candidate.y0 - previous.y1 <= 45;
 }
 
 function collectTitleSearchLines(
@@ -372,6 +480,17 @@ function isValidTitleLine(text: string, line: TextLineRef | undefined, tableBloc
   }
 
   return uppercaseRatio(cleaned) >= 0.6;
+}
+
+function isRejectedTitleBoundary(text: string): boolean {
+  const cleaned = cleanInlineText(text);
+  return (
+    /^CHAPTER\s+\d+/i.test(cleaned) ||
+    /^\(Source:/i.test(cleaned) ||
+    isPictureCaption(cleaned) ||
+    isTableHeaderText(cleaned) ||
+    isListOrTableRowText(cleaned)
+  );
 }
 
 function isBodyLikeLine(text: string): boolean {
@@ -519,6 +638,15 @@ function documentTitle(sourcePath?: string): string {
   }
 
   return path.basename(sourcePath, path.extname(sourcePath)).replace(/[_-]+/g, " ").trim() || "Parsed Document";
+}
+
+function getStringMetadata(block: ParsedBlock, key: string): string | undefined {
+  const value = block.metadata?.[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function escapeMarkdownAlt(text: string): string {
+  return text.replace(/[[\]\\]/g, "\\$&");
 }
 
 function wordCount(text: string): number {

@@ -147,6 +147,11 @@ const PYTHON_JSON_HELPER = String.raw`
 import json
 import sys
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 JSON_START = "__PDF_PIPELINE_JSON_START__"
 JSON_END = "__PDF_PIPELINE_JSON_END__"
 

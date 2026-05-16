@@ -136,6 +136,9 @@ export interface PipelineOptions extends ToolRuntimeOptions {
   outputPath?: string;
   blocksPath?: string;
   validationReportPath?: string;
+  sectionMapPath?: string;
+  treeOutputPath?: string;
+  treeValidationReportPath?: string;
   doclingPageBatchSize?: number;
   doclingThreads?: number;
   ocrLanguage?: string;
@@ -143,6 +146,15 @@ export interface PipelineOptions extends ToolRuntimeOptions {
   ensureDocumentHeader?: boolean;
   includePageMarkers?: boolean;
   noiseTolerance?: number;
+  exportAssets?: boolean;
+  assetsDir?: string;
+  uploadPageIndex?: boolean;
+  pageIndexApiKey?: string;
+  pageIndexBaseUrl?: string;
+  pageIndexPollIntervalMs?: number;
+  pageIndexPollMaxAttempts?: number;
+  pageIndexTimeoutMs?: number;
+  onLog?: (message: string) => void;
 }
 
 export interface ValidationMarkerResult {
@@ -156,6 +168,27 @@ export interface ValidationReport {
   passed: boolean;
   markers: ValidationMarkerResult[];
   errors: string[];
+  warnings?: string[];
+}
+
+export interface SectionMapEntry {
+  document: string;
+  chapter: string | null;
+  hsCode: string;
+  title: string;
+  section: string;
+  pageStart: number | null;
+  pageEnd: number | null;
+  source: string | null;
+  markdownHeading: string;
+  textPreview: string;
+}
+
+export interface SectionMapResult {
+  document: string;
+  documentType?: "hs-code-reference" | "non-hs-reference";
+  sections: SectionMapEntry[];
+  warnings: string[];
 }
 
 export interface PipelineResult {
@@ -164,7 +197,14 @@ export interface PipelineResult {
   layout: LayoutAnalysis;
   routingPlan: RoutingPlan;
   validation: ValidationReport;
+  sectionMap?: SectionMapResult;
+  treeValidation?: ValidationReport;
   outputPath?: string;
   blocksPath?: string;
   validationReportPath?: string;
+  assetsDirPath?: string;
+  sectionMapPath?: string;
+  treeOutputPath?: string;
+  treeValidationReportPath?: string;
+  pageIndexDocId?: string;
 }

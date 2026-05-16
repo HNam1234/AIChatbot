@@ -98,3 +98,18 @@ export function defaultValidationReportPath(pdfPath: string): string {
   const fileName = `${path.basename(pdfPath, path.extname(pdfPath))}.milestone1.validation.json`;
   return path.resolve(process.cwd(), "data", "converted", fileName);
 }
+
+export function defaultSectionMapPath(pdfPath: string): string {
+  const fileName = `${path.basename(pdfPath, path.extname(pdfPath))}.sections.json`;
+  return path.resolve(process.cwd(), "data", "converted", fileName);
+}
+
+export function defaultTreePath(pdfPath: string): string {
+  const fileName = `${path.basename(pdfPath, path.extname(pdfPath))}.tree.json`;
+  return path.resolve(process.cwd(), "data", "converted", fileName);
+}
+
+export function defaultTreeValidationReportPath(pdfPath: string): string {
+  const fileName = `${path.basename(pdfPath, path.extname(pdfPath))}.tree.validation.json`;
+  return path.resolve(process.cwd(), "data", "converted", fileName);
+}

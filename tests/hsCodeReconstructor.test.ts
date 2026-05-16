@@ -66,6 +66,80 @@ describe("HSCodeReconstructor", () => {
     expect(markdown).not.toContain("*Caption: Pictures 1. Round Cabbages (Source: Malaysia)*");
   });
 
+  it("renders grouped Chapter 1 HS codes as separate shared-title headings", () => {
+    const blocks: ParsedBlock[] = [
+      textBlock("direct", 1, 10, 80, "CHAPTER 1\n0102.29.11\nOXEN\nOxen body."),
+      textBlock(
+        "grouped",
+        2,
+        20,
+        120,
+        [
+          "0105.11.10 0105.12.10 0105.13.10 0105.14.10 0105.15.10",
+          "0105.94.10 0105.99.10 0105.99.30",
+          "BREEDING",
+          "Breeding body."
+        ].join("\n")
+      )
+    ];
+
+    const markdown = HSCodeReconstructor.buildMarkdown(blocks, { ensureDocumentHeader: false });
+    const expectedPairs = [
+      ["0102.29.11", "OXEN"],
+      ["0105.11.10", "BREEDING"],
+      ["0105.12.10", "BREEDING"],
+      ["0105.13.10", "BREEDING"],
+      ["0105.14.10", "BREEDING"],
+      ["0105.15.10", "BREEDING"],
+      ["0105.94.10", "BREEDING"],
+      ["0105.99.10", "BREEDING"],
+      ["0105.99.30", "BREEDING"]
+    ];
+
+    for (const [code, title] of expectedPairs) {
+      expect(markdown).toContain(`## ${code} \u2014 ${title}`);
+    }
+    expect(markdown).toContain("Breeding body.");
+  });
+
+  it("does not group distant HS code lines or steal the next section title", () => {
+    const blocks: ParsedBlock[] = [
+      textBlock("missing-title", 1, 10, 80, "0101.10.00"),
+      textBlock("next-section", 1, 11, 320, "0102.29.11\nOXEN")
+    ];
+
+    const markdown = HSCodeReconstructor.buildMarkdown(blocks, { ensureDocumentHeader: false });
+
+    expect(markdown).toContain("## 0101.10.00");
+    expect(markdown).toContain("## 0102.29.11 \u2014 OXEN");
+    expect(markdown).not.toContain("## 0101.10.00 \u2014 OXEN");
+  });
+
+  it("renders exported image assets as Markdown image links", () => {
+    const blocks: ParsedBlock[] = [
+      {
+        id: "img-asset",
+        type: "image",
+        source: "layout",
+        pageNumber: 1,
+        order: 10,
+        bbox: { page: 1, x0: 100, y0: 220, x1: 320, y1: 360 },
+        captionLinked: true,
+        metadata: {
+          decorative: false,
+          captionText: "Picture 1. Palm Nuts",
+          assetPath: "assets/Chapter12/img-asset.png"
+        }
+      }
+    ];
+
+    const markdown = HSCodeReconstructor.buildMarkdown(blocks, { ensureDocumentHeader: false });
+
+    expect(markdown).toContain("![Picture 1. Palm Nuts](assets/Chapter12/img-asset.png)");
+    expect(markdown).toContain("<!-- image-id: img-asset -->");
+    expect(markdown).toContain("*Caption: Picture 1. Palm Nuts*");
+  });
+
   it("uses title and body from the block after an HS code instead of a later table header", () => {
     const blocks: ParsedBlock[] = [
       textBlock("code", 1, 10, 260, "1211.90.95"),

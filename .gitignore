@@ -13,6 +13,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Local/generated pipeline data. Keep .gitkeep only; do not commit PDFs, assets, trees, or temp logs.
 data/uploads/*
 data/converted/*
 data/state/*

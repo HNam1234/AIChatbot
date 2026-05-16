@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import type { ParsedBlock } from "../src/types";
 import { MarkdownValidator } from "../src/validators/markdownValidator";
@@ -104,6 +107,15 @@ describe("MarkdownValidator", () => {
     expect(marker5?.passed).toBe(false);
     expect(marker5?.details?.pairCount).toBe(1);
     expect(marker5?.details?.layoutHSCodeCount).toBe(2);
+    expect(marker5?.details?.unpairedHsCodes).toMatchObject([
+      {
+        hsCode: "1211.90.95",
+        pageNumber: 1,
+        blockId: "hs-2",
+        nearestTextAfter: "AGARWOOD (GAHARU) CHIPS",
+        reason: "known-regression-mismatch"
+      }
+    ]);
   });
 
   it("passes marker 5 for Chapter 12 regression HS title pairs", () => {
@@ -138,6 +150,67 @@ describe("MarkdownValidator", () => {
     expect(marker5?.details?.pairCount).toBe(7);
   });
 
+  it("passes marker 5 for Chapter 1 grouped HS title pairs", () => {
+    const expectedPairs = [
+      ["0102.29.11", "OXEN"],
+      ["0105.11.10", "BREEDING"],
+      ["0105.12.10", "BREEDING"],
+      ["0105.13.10", "BREEDING"],
+      ["0105.14.10", "BREEDING"],
+      ["0105.15.10", "BREEDING"],
+      ["0105.94.10", "BREEDING"],
+      ["0105.99.10", "BREEDING"],
+      ["0105.99.30", "BREEDING"]
+    ];
+    const markdown = [
+      "# CHAPTER 1",
+      "",
+      ...expectedPairs.map(([code, title]) => `## ${code} \u2014 ${title}`)
+    ].join("\n");
+    const report = MarkdownValidator.validatePhase1Detailed(markdown, [
+      textBlock("direct", 1, 10, "CHAPTER 1\n0102.29.11\nOXEN\nOxen body."),
+      textBlock(
+        "grouped",
+        2,
+        20,
+        [
+          "0105.11.10 0105.12.10 0105.13.10 0105.14.10 0105.15.10",
+          "0105.94.10 0105.99.10 0105.99.30",
+          "BREEDING",
+          "Breeding body."
+        ].join("\n")
+      )
+    ]);
+    const marker5 = report.markers.find((marker) => marker.marker === "MARKER 5");
+
+    expect(marker5?.passed).toBe(true);
+    expect(marker5?.details).toMatchObject({
+      layoutHSCodeCount: 9,
+      directPairCount: 1,
+      groupedPairCount: 8,
+      pairedHSCodeCount: 9,
+      unpairedHsCodes: []
+    });
+  });
+
+  it("pairs duplicate HS codes by occurrence order for marker 5", () => {
+    const markdown = [
+      "# CHAPTER 3",
+      "",
+      "## 0301.99.22 \u2014 BREEDING CARP",
+      "",
+      "## 0301.99.22 \u2014 OTHER CARP"
+    ].join("\n");
+    const report = MarkdownValidator.validatePhase1Detailed(markdown, [
+      textBlock("first", 1, 10, "0301.99.22\nBREEDING CARP"),
+      textBlock("second", 2, 20, "0301.99.22\nOTHER CARP")
+    ]);
+    const marker5 = report.markers.find((marker) => marker.marker === "MARKER 5");
+
+    expect(marker5?.passed).toBe(true);
+    expect(marker5?.details?.pairedHSCodeCount).toBe(2);
+  });
+
   it("fails markers 7 and 8 when captions leak source text or over-fuse content", () => {
     const markdown = [
       "# CHAPTER 7",
@@ -152,6 +225,55 @@ describe("MarkdownValidator", () => {
 
     expect(report.errors.some((error) => error.includes("Marker 7 Failed"))).toBe(true);
     expect(report.errors.some((error) => error.includes("Marker 8 Failed"))).toBe(true);
+  });
+
+  it("passes marker 9 when Markdown image links point to exported assets", () => {
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), "asset-marker-"));
+    try {
+      const assetPath = path.join(tempDir, "img-1.png");
+      writeFileSync(assetPath, "png");
+      const markdown = ["# Doc", "", "![Caption](assets/img-1.png)", "<!-- image-id: img-1 -->"].join("\n");
+      const report = MarkdownValidator.validatePhase1Detailed(markdown, [
+        {
+          id: "img-1",
+          type: "image",
+          source: "layout",
+          pageNumber: 1,
+          order: 1,
+          captionLinked: true,
+          metadata: {
+            assetPath: "assets/img-1.png",
+            assetAbsolutePath: assetPath
+          }
+        }
+      ]);
+      const marker9 = report.markers.find((marker) => marker.marker === "MARKER 9");
+
+      expect(marker9?.passed).toBe(true);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails marker 9 on broken Markdown image links", () => {
+    const markdown = ["# Doc", "", "![Caption](assets/missing.png)", "<!-- image-id: img-1 -->"].join("\n");
+    const report = MarkdownValidator.validatePhase1Detailed(markdown, [
+      {
+        id: "img-1",
+        type: "image",
+        source: "layout",
+        pageNumber: 1,
+        order: 1,
+        captionLinked: true,
+        metadata: {
+          assetPath: "assets/missing.png",
+          assetAbsolutePath: path.join(os.tmpdir(), "missing-image-asset.png")
+        }
+      }
+    ]);
+    const marker9 = report.markers.find((marker) => marker.marker === "MARKER 9");
+
+    expect(marker9?.passed).toBe(false);
   });
 });
 

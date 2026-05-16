@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>HSCode PDF Pipeline</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="toolbar">
+        <div>
+          <h1>HSCode PDF Pipeline</h1>
+          <p>Local parser demo with batch progress, PDF preview, and parse result mapping.</p>
+        </div>
+      </header>
+
+      <section class="panel settings">
+        <h2>API Settings</h2>
+        <div class="settings-grid">
+          <div>
+            <label>PageIndex API Key</label>
+            <div class="settings-row">
+              <input id="pageindex-key" name="temporaryPageIndexApiKey" type="password" autocomplete="off" placeholder="sk-..." />
+              <button id="toggle-pageindex-key" type="button" class="secondary">Show</button>
+            </div>
+            <label class="check"><input id="temporary-pageindex-key" type="checkbox" checked /> Use only for this run</label>
+            <div class="actions">
+              <button id="save-pageindex-key" type="button" class="secondary">Save PageIndex Key to .env</button>
+              <span id="pageindex-settings-status" class="muted">Loading...</span>
+            </div>
+          </div>
+
+          <div>
+            <label>Gemini API Key</label>
+            <div class="settings-row">
+              <input id="gemini-key" name="temporaryGeminiApiKey" type="password" autocomplete="off" placeholder="AIza..." />
+              <button id="toggle-gemini-key" type="button" class="secondary">Show</button>
+            </div>
+            <label class="check"><input id="temporary-gemini-key" type="checkbox" checked /> Use only for this run</label>
+            <div class="actions">
+              <button id="save-gemini-key" type="button" class="secondary">Save Gemini Key to .env</button>
+              <span id="gemini-settings-status" class="muted">Loading...</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <form id="pipeline-form">
+          <div class="form-grid">
+            <label>
+              PDFs
+              <input id="pdf" name="files" type="file" accept="application/pdf,.pdf" multiple required />
+            </label>
+            <label>
+              OCR language
+              <input name="ocrLanguage" type="text" value="vie" />
+            </label>
+            <label>
+              Docling threads
+              <input name="doclingThreads" type="number" min="1" value="4" />
+            </label>
+          </div>
+
+          <div class="checks">
+            <label><input name="exportAssets" type="checkbox" checked /> Export image assets</label>
+            <label><input id="upload-pageindex" name="uploadPageIndex" type="checkbox" /> Upload to PageIndex</label>
+            <label><input name="sequential" type="checkbox" checked disabled /> Run files sequentially</label>
+            <label><input name="failFast" type="checkbox" /> Stop on first failure</label>
+          </div>
+          <div id="pageindex-warning" class="warning hidden">Enter PageIndex API key in API Settings or create .env.</div>
+          <div id="selected-files" class="selected-files muted">No files selected.</div>
+          <button type="submit">Run Pipeline</button>
+        </form>
+      </section>
+
+      <section class="panel status-card">
+        <div class="status-grid">
+          <div><span>Pipeline status</span><strong id="job-status">Idle</strong></div>
+          <div><span>Current file</span><strong id="current-file">n/a</strong></div>
+          <div><span>Current step</span><strong id="current-step">n/a</strong></div>
+          <div><span>Elapsed</span><strong id="elapsed">0s</strong></div>
+        </div>
+        <div class="progress">
+          <div id="progress-fill"></div>
+        </div>
+        <div id="progress-text" class="progress-text">0% - waiting</div>
+      </section>
+
+      <section class="workspace">
+        <section class="panel pdf-panel">
+          <div class="panel-heading">
+            <h2>PDF Preview</h2>
+            <div class="page-controls">
+              <button id="prev-page" type="button" class="secondary">Prev</button>
+              <input id="page-number" type="number" min="1" value="1" />
+              <button id="next-page" type="button" class="secondary">Next</button>
+            </div>
+          </div>
+          <iframe id="pdf-frame" title="PDF preview"></iframe>
+          <a id="open-page" class="muted" href="#" target="_blank" rel="noreferrer">Open PDF page in new tab</a>
+        </section>
+
+        <section class="panel result-panel">
+          <div class="tabs" role="tablist">
+            <button type="button" class="tab active" data-tab="markdown">Markdown</button>
+            <button type="button" class="tab" data-tab="rendered">Rendered</button>
+            <button type="button" class="tab" data-tab="sections">Sections</button>
+            <button type="button" class="tab" data-tab="tree">Tree JSON</button>
+            <button type="button" class="tab" data-tab="validation">Validation</button>
+            <button type="button" class="tab" data-tab="assets">Assets</button>
+          </div>
+          <div id="tab-markdown" class="tab-panel"><pre id="markdown" class="markdown muted">No Markdown yet.</pre></div>
+          <div id="tab-rendered" class="tab-panel hidden"><article id="rendered" class="rendered muted">No rendered preview yet.</article></div>
+          <div id="tab-sections" class="tab-panel hidden">
+            <div id="section-detail" class="section-detail muted">Select a section to inspect page mapping.</div>
+            <div id="sections" class="table-wrap muted">No sections yet.</div>
+          </div>
+          <div id="tab-tree" class="tab-panel hidden"><div id="tree" class="tree muted">No tree JSON yet.</div></div>
+          <div id="tab-validation" class="tab-panel hidden"><div id="markers" class="markers muted">No markers yet.</div></div>
+          <div id="tab-assets" class="tab-panel hidden"><div id="images" class="images muted">No images yet.</div></div>
+        </section>
+      </section>
+
+      <section class="panel">
+        <h2>Batch Results</h2>
+        <div id="batch-table" class="table-wrap muted">No documents yet.</div>
+      </section>
+
+      <section class="panel">
+        <h2>Logs</h2>
+        <pre id="logs" class="logs"></pre>
+      </section>
+
+      <section class="panel">
+        <h2>Q&A Placeholder</h2>
+        <div class="qa">
+          <input id="question" type="text" placeholder="Milestone 3 Q&A will use all.sections.json." />
+          <button id="ask" type="button">Ask</button>
+        </div>
+        <div id="answer" class="muted"></div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
