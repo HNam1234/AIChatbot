@@ -46,7 +46,6 @@ import {
   HS_CODE_PATTERN,
   normalizeSectionMetadata,
   rankSectionsForQuestion,
-  renderHsCodeAnswer,
   selectRelevantSections,
   selectAlternativeSections,
   type CandidateRelevance,
@@ -55,6 +54,16 @@ import {
   type RetrievedTreeHit,
   type SectionMetadata
 } from "../agent/qaAnswerFormatter";
+import {
+  detectIntent,
+  handleChapterSummary,
+  handleDefinition,
+  handleDocumentSummary,
+  handleExactHsCodeLookup,
+  handleProductClassification,
+  type RoutedQaAnswer,
+  type QaDocumentMetadata
+} from "../agent/qaIntentRouter";
 import { resolveGeminiApiKeys } from "../config/gemini";
 import { TokenValidator } from "../validators/tokenValidator";
 
@@ -1322,9 +1331,11 @@ async function answerFromCachedTrees(
   options: { geminiApiKeys?: string[]; debug?: boolean; cachedTreeDocuments?: string[]; localSectionDocuments?: string[] } = {}
 ): Promise<Record<string, unknown>> {
   const startedAt = Date.now();
+  const detection = detectIntent(question);
   const selectedCachedTreeDocuments = uniqueStrings(options.cachedTreeDocuments ?? []);
   const localSectionDocuments = uniqueStrings(options.localSectionDocuments ?? []);
   serverTrace("answerFromCachedTrees", "started", {
+    intent: detection.intent,
     overrideGeminiKeys: options.geminiApiKeys?.length ?? 0,
     selectedCachedTreeDocuments: selectedCachedTreeDocuments.length,
     localSectionDocuments: localSectionDocuments.length
@@ -1346,6 +1357,62 @@ async function answerFromCachedTrees(
     });
   }
 
+  const scopedDocumentNames = documents.length > 0
+    ? documents.map((document) => document.document)
+    : localFallbackDocuments;
+  const [sectionMetadata, documentMetadata] = await Promise.all([
+    loadSectionMetadata(scopedDocumentNames),
+    loadDocumentMetadata(scopedDocumentNames)
+  ]);
+  const baseDebug = {
+    detectedIntent: detection.intent,
+    intentConfidence: detection.confidence,
+    intentReason: detection.reason,
+    indexSource: {
+      selectedCachedTreeDocuments,
+      localSectionDocuments
+    },
+    cacheStatus: {
+      cachedTreeDocumentCount: documents.length,
+      scopedDocumentNames,
+      sectionMetadataCount: sectionMetadata.length,
+      documentMetadataCount: documentMetadata.length
+    }
+  };
+
+  if (detection.intent === "exact_hscode_lookup") {
+    const routed = handleExactHsCodeLookup(question, sectionMetadata, detection, baseDebug);
+    return finalizeRoutedAnswer(routed, {
+      mode: "cached-tree",
+      documents,
+      sourceDocuments: routed.selectedPrimary?.document ? [String(routed.selectedPrimary.document)] : [],
+      retrieval: undefined,
+      debug: options.debug
+    });
+  }
+
+  if (detection.intent === "chapter_summary") {
+    const routed = handleChapterSummary(question, sectionMetadata, documentMetadata, detection, baseDebug);
+    return finalizeRoutedAnswer(routed, {
+      mode: "cached-tree",
+      documents,
+      sourceDocuments: routed.documentSummary?.document ? [String(routed.documentSummary.document)] : [],
+      retrieval: undefined,
+      debug: options.debug
+    });
+  }
+
+  if (detection.intent === "document_summary") {
+    const routed = handleDocumentSummary(question, sectionMetadata, documentMetadata, detection, baseDebug);
+    return finalizeRoutedAnswer(routed, {
+      mode: "cached-tree",
+      documents,
+      sourceDocuments: routed.documentSummary?.document ? [String(routed.documentSummary.document)] : [],
+      retrieval: undefined,
+      debug: options.debug
+    });
+  }
+
   const searchStartedAt = Date.now();
   const retrieval = documents.length > 0
     ? await searchCachedTreeDocuments(question, documents)
@@ -1361,6 +1428,17 @@ async function answerFromCachedTrees(
   });
   if (hits.length === 0) {
     const indexSource = buildIndexSource(retrieval, documents, []);
+    const routed = detection.intent === "definition"
+      ? handleDefinition(question, undefined, retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults, detection, {
+          ...baseDebug,
+          ...debugReport,
+          indexSource
+        })
+      : handleProductClassification(question, undefined, [], undefined, retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults, detection, {
+          ...baseDebug,
+          ...debugReport,
+          indexSource
+        });
     const emptyResponse = {
       answer: documents.length > 0
         ? "Không tìm thấy ngữ cảnh phù hợp trong các cached tree JSON."
@@ -1379,7 +1457,24 @@ async function answerFromCachedTrees(
         answerRepairApplied: false
       }
     };
-    return options.debug ? { ...emptyResponse, debug: debugReport } : emptyResponse;
+    return options.debug
+      ? {
+          ...emptyResponse,
+          intent: routed.intent,
+          answer: routed.answer,
+          selectedPrimary: null,
+          documentSummary: null,
+          citations: [],
+          debug: routed.debug
+        }
+      : {
+          ...emptyResponse,
+          intent: routed.intent,
+          answer: routed.answer,
+          selectedPrimary: null,
+          documentSummary: null,
+          citations: []
+        };
   }
 
   const topHits = hits.slice(0, 10);
@@ -1431,11 +1526,18 @@ async function answerFromCachedTrees(
     serverTrace("answerFromCachedTrees", "gemini synthesis failed; using fallback formatter", { error: llmError });
   }
   const alternatives = selectAlternativeSections(hits, question);
-  const rendered = renderHsCodeAnswer(llmAnswer, hits[0], alternatives, { question, answerStyle: "class-eval" });
-  const answer = rendered.answer;
-  debugReport.selectedPrimary = publicSectionCitation(hits[0]);
-  debugReport.finalAnswerHsCodes = rendered.finalHsCodes;
-  debugReport.answerRepairApplied = rendered.answerRepairApplied;
+  const routed = detection.intent === "definition"
+    ? handleDefinition(question, hits[0], retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults, detection, {
+        ...baseDebug,
+        ...debugReport
+      })
+    : handleProductClassification(question, hits[0], alternatives, llmAnswer, retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults, detection, {
+        ...baseDebug,
+        ...debugReport
+      });
+  const answer = routed.answer;
+  const finalHsCodes = Array.isArray(routed.debug.finalHsCodes) ? routed.debug.finalHsCodes as string[] : hsCodesForSection(hits[0]);
+  const answerRepairApplied = Boolean(routed.debug.answerRepairApplied);
   const marker13 = TokenValidator.validateOutputSize(answer, { maxWords: 180 });
   const validation = QAValidator.validateResponse(answer, { requireCitations: false });
   serverTrace("answerFromCachedTrees", "completed", { elapsedMs: Date.now() - startedAt });
@@ -1443,7 +1545,10 @@ async function answerFromCachedTrees(
   const indexSource = buildIndexSource(retrieval, documents, sourceDocuments);
 
   const response = {
+    intent: routed.intent,
     answer,
+    selectedPrimary: routed.selectedPrimary,
+    documentSummary: routed.documentSummary,
     docIds: [],
     documents: sourceDocuments,
     mode: "cached-tree",
@@ -1453,20 +1558,20 @@ async function answerFromCachedTrees(
       bm25FallbackUsed: retrieval.bm25FallbackUsed,
       pageIndexResultCount: retrieval.pageIndexResultCount,
       contrastTerms: retrieval.contrastTerms,
-      selectedSection: publicSectionCitation(hits[0]),
-      finalHsCodes: rendered.finalHsCodes,
-      answerRepairApplied: rendered.answerRepairApplied
+      selectedSection: routed.selectedPrimary,
+      finalHsCodes,
+      answerRepairApplied
     },
-    citations: rendered.citations.map(publicSectionCitation),
+    citations: routed.citations,
     retrievedSections: topHits.slice(0, 5).map(publicSectionCitation),
-    metadataWarnings: rendered.metadataWarnings,
+    metadataWarnings: hits[0].metadataWarnings,
     llmError,
     validation: {
       ...validation,
       markers: [marker12, marker13, ...validation.markers]
     }
   };
-  return options.debug ? { ...response, debug: debugReport } : response;
+  return options.debug ? { ...response, debug: routed.debug } : response;
 }
 
 async function searchCachedTreeDocuments(
@@ -1592,6 +1697,56 @@ function buildIndexSource(
   };
 }
 
+function finalizeRoutedAnswer(
+  routed: RoutedQaAnswer,
+  options: {
+    mode: string;
+    documents: CachedTreeDocument[];
+    sourceDocuments: string[];
+    retrieval?: CachedTreeRetrievalResult;
+    debug?: boolean;
+  }
+): Record<string, unknown> {
+  const indexSource = options.retrieval
+    ? buildIndexSource(options.retrieval, options.documents, options.sourceDocuments)
+    : {
+        label: options.sourceDocuments.length > 0 ? "Local metadata" : "Local metadata",
+        source: "local-metadata",
+        cachedDocumentCount: options.documents.length,
+        documents: options.sourceDocuments.map((document) => ({ document, status: "metadata" }))
+      };
+  const finalHsCodes = routed.selectedPrimary
+    ? uniqueStrings([
+        ...(Array.isArray(routed.selectedPrimary.groupedHsCodes) ? routed.selectedPrimary.groupedHsCodes.map(String) : []),
+        typeof routed.selectedPrimary.hsCode === "string" ? routed.selectedPrimary.hsCode : ""
+      ].filter(Boolean))
+    : [];
+  const response = {
+    intent: routed.intent,
+    answer: routed.answer,
+    selectedPrimary: routed.selectedPrimary,
+    documentSummary: routed.documentSummary,
+    docIds: [],
+    documents: options.sourceDocuments,
+    mode: options.mode,
+    indexSource,
+    retrieval: {
+      source: options.retrieval?.retrievalSource ?? "local-metadata",
+      bm25FallbackUsed: options.retrieval?.bm25FallbackUsed ?? false,
+      pageIndexResultCount: options.retrieval?.pageIndexResultCount ?? 0,
+      contrastTerms: options.retrieval?.contrastTerms ?? [],
+      selectedSection: routed.selectedPrimary,
+      finalHsCodes,
+      answerRepairApplied: false
+    },
+    citations: routed.citations,
+    retrievedSections: [],
+    metadataWarnings: [],
+    validation: QAValidator.validateResponse(routed.answer, { requireCitations: false })
+  };
+  return options.debug ? { ...response, debug: routed.debug } : response;
+}
+
 function publicCachedTreeDocument(document: CachedTreeDocument): Record<string, unknown> {
   return {
     document: document.document,
@@ -1698,6 +1853,74 @@ async function loadSectionMetadata(documentNames: string[]): Promise<SectionMeta
   }
 
   return records;
+}
+
+async function loadDocumentMetadata(documentNames: string[]): Promise<QaDocumentMetadata[]> {
+  const byDocument = new Map<string, QaDocumentMetadata>();
+  const scoped = new Set(documentNames);
+  const put = (document: QaDocumentMetadata) => {
+    if (!document.document) {
+      return;
+    }
+    if (scoped.size > 0 && !scoped.has(document.document)) {
+      return;
+    }
+    byDocument.set(document.document, { ...(byDocument.get(document.document) ?? {}), ...document });
+  };
+
+  const manifest = await readOptionalJson<{ documents?: unknown[] }>(path.join(convertedDir, "batch.manifest.json"));
+  for (const item of manifest?.documents ?? []) {
+    if (typeof item !== "object" || item === null) {
+      continue;
+    }
+    const record = item as Record<string, unknown>;
+    const input = stringValue(record.input);
+    const document = input ? path.basename(input) : path.basename(stringValue(record.sections) ?? "");
+    const markdownPath = stringValue(record.markdown);
+    const rootText = markdownPath ? await readOptionalText(resolveWorkspacePath(markdownPath)) : "";
+    put({
+      document: document || path.basename(stringValue(record.tree) ?? ""),
+      input,
+      markdown: markdownPath,
+      sections: stringValue(record.sections),
+      tree: stringValue(record.tree),
+      documentType: stringValue(record.documentType),
+      markdownText: rootText,
+      rootText
+    });
+  }
+
+  const allDocuments = await readOptionalJson<unknown>(path.join(convertedDir, "all.documents.json"));
+  if (Array.isArray(allDocuments)) {
+    for (const item of allDocuments) {
+      if (typeof item !== "object" || item === null) {
+        continue;
+      }
+      const record = item as Record<string, unknown>;
+      const document = stringValue(record.document);
+      if (!document) {
+        continue;
+      }
+      put({
+        document,
+        documentType: stringValue(record.documentType) ?? stringValue(record.status)
+      });
+    }
+  }
+
+  for (const documentName of documentNames) {
+    if (!byDocument.has(documentName)) {
+      const markdown = await readOptionalText(path.join(convertedDir, documentName.replace(/\.pdf$/i, ".milestone1.md")));
+      put({
+        document: documentName,
+        markdown: markdown ? relativePath(path.join(convertedDir, documentName.replace(/\.pdf$/i, ".milestone1.md"))) : undefined,
+        markdownText: markdown,
+        rootText: markdown
+      });
+    }
+  }
+
+  return [...byDocument.values()].sort((left, right) => left.document.localeCompare(right.document));
 }
 
 function publicSectionCitation(section: EnrichedRetrievedSection): Record<string, unknown> {

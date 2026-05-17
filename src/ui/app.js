@@ -433,7 +433,8 @@ askButton.addEventListener("click", async () => {
     ? `Scope: ${(payload.docIds || docIds).length} PageIndex document(s)`
     : `Index source: ${formatIndexSource(indexSource, payload.retrieval)}`;
   const retrievalStatus = renderRetrievalStatus(payload.retrieval, indexSource);
-  const citationCards = renderCitationCards(payload.citations || []);
+  const summaryIntent = payload.intent === "chapter_summary" || payload.intent === "document_summary";
+  const citationCards = summaryIntent ? "" : renderCitationCards(payload.citations || []);
   renderDebugOutput(renderDebugPanel(payload.debug, indexSource, payload.retrieval));
   answerEl.innerHTML = `
     <div class="answer-box">
@@ -808,11 +809,19 @@ function renderDebugPanel(debug, indexSource, retrieval) {
     ? renderDebugSelected(debug.selectedPrimary)
     : "";
   const candidates = Array.isArray(debug.candidates) ? debug.candidates : [];
+  const intentLine = debug.detectedIntent
+    ? `<span>Intent: ${escapeHtml(debug.detectedIntent)} (${escapeHtml(debug.intentReason || "")})</span>`
+    : "";
+  const documentLine = debug.resolvedDocument
+    ? `<dt>Resolved document</dt><dd><pre>${escapeHtml(JSON.stringify(debug.resolvedDocument, null, 2))}</pre></dd>`
+    : "";
   return `
     <details class="debug-panel" open>
       <summary>Q&A debug</summary>
+      ${intentLine}
       ${selected}
       <dl>
+        ${documentLine}
         <dt>Signals</dt><dd><pre>${escapeHtml(JSON.stringify(debug.extractedSignals || {}, null, 2))}</pre></dd>
         <dt>Retrieval</dt><dd><pre>${escapeHtml(JSON.stringify(debug.retrieval || {}, null, 2))}</pre></dd>
       </dl>

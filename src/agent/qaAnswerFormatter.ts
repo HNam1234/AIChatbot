@@ -405,6 +405,19 @@ export function evaluateCandidateRelevance(
   const numericMatches = signals.numericRanges.filter((range) => candidateMatchesNumericRange(section, range));
   const contrastMatches = signals.contrastTerms.filter((term) => includesSignal(allText, term));
   const hsCodeMatches = hsCodesForSection(section).filter((code) => normalizeForSearch(question).includes(code));
+  const meaningfulEvidenceTokens = uniqueStrings([
+    ...titleTokenMatches,
+    ...bodyTokenMatches,
+    ...sourceTokenMatches,
+    ...rareTokenMatches
+  ]).filter((token) => !isWeakGenericQueryToken(token));
+  const onlyWeakTokenEvidence =
+    hsCodeMatches.length === 0 &&
+    phraseMatches.length === 0 &&
+    numericMatches.length === 0 &&
+    scientificMatches.length === 0 &&
+    meaningfulEvidenceTokens.length === 0 &&
+    titleTokenMatches.length + bodyTokenMatches.length + sourceTokenMatches.length > 0;
   const matchedTerms = uniqueStrings([
     ...hsCodeMatches,
     ...titleTokenMatches,
@@ -459,6 +472,8 @@ export function evaluateCandidateRelevance(
   const minimumScore = hasStrongMatch ? 5 : 8;
   if (contrastTermOnlyMatch) {
     rejectedReason = "candidate only matches contrast baseline terms";
+  } else if (onlyWeakTokenEvidence) {
+    rejectedReason = "candidate only matches weak generic/chapter tokens or bare numbers";
   } else if (relevanceScore < minimumScore) {
     rejectedReason = `relevance score below threshold ${minimumScore}`;
   } else if (lowGenericOverlap) {
@@ -979,6 +994,21 @@ const QUERY_STOPWORDS = new Set([
   "that"
 ]);
 
+const WEAK_MATCH_TOKENS = new Set([
+  "chapter",
+  "chuong",
+  "noi",
+  "dung",
+  "tom",
+  "tat",
+  "liet",
+  "ke",
+  "main",
+  "summary",
+  "document",
+  "file"
+]);
+
 const SMALL_TITLE_WORDS = new Set(["of", "the", "and", "or", "for", "to", "in", "on", "with", "not"]);
 
 function extractScientificNames(question: string): string[] {
@@ -1040,6 +1070,10 @@ function buildUsefulPhrases(tokens: string[], sourceText: string): string[] {
 
 function isRareQueryToken(token: string): boolean {
   return token.length >= 6 || /\d/.test(token);
+}
+
+function isWeakGenericQueryToken(token: string): boolean {
+  return /^\d+$/.test(token) || WEAK_MATCH_TOKENS.has(token);
 }
 
 function extractNumericRanges(question: string): string[] {
