@@ -434,12 +434,14 @@ askButton.addEventListener("click", async () => {
     : `Index source: ${formatIndexSource(indexSource, payload.retrieval)}`;
   const retrievalStatus = renderRetrievalStatus(payload.retrieval, indexSource);
   const summaryIntent = payload.intent === "chapter_summary" || payload.intent === "document_summary";
+  const documentSummaryCard = summaryIntent ? renderDocumentSummaryCard(payload.documentSummary) : "";
   const citationCards = summaryIntent ? "" : renderCitationCards(payload.citations || []);
   renderDebugOutput(renderDebugPanel(payload.debug, indexSource, payload.retrieval));
   answerEl.innerHTML = `
     <div class="answer-box">
       <div class="answer-text">${escapeHtml(payload.answer || "")}</div>
       ${retrievalStatus}
+      ${documentSummaryCard}
       ${citationCards}
       <p>${escapeHtml(answerScope)}</p>
       ${marker ? `<p>${escapeHtml(marker.message || "")}</p>` : ""}
@@ -777,6 +779,36 @@ function renderCitationCards(citations) {
       </dl>
     </div>
   `).join("")}</div>`;
+}
+
+function renderDocumentSummaryCard(summary) {
+  if (!summary) {
+    return "";
+  }
+
+  const sections = Array.isArray(summary.sections) ? summary.sections : [];
+  const title = summary.type === "chapter_summary"
+    ? `Chapter ${summary.chapterNumber || "n/a"} summary`
+    : "Document summary";
+  return `
+    <div class="citation-cards">
+      <div class="citation-card">
+        <strong>${escapeHtml(title)}</strong>
+        <dl>
+          <dt>Document</dt><dd>${escapeHtml(summary.document || "n/a")}</dd>
+          <dt>Sections</dt><dd>${escapeHtml(String(summary.sectionCount ?? sections.length ?? 0))}</dd>
+          ${summary.isReference !== undefined ? `<dt>Reference</dt><dd>${summary.isReference ? "yes" : "no"}</dd>` : ""}
+        </dl>
+        ${sections.length > 0 ? `
+          <ul>
+            ${sections.slice(0, 8).map((section) => `
+              <li>${escapeHtml(section.title || "Untitled")} ${Array.isArray(section.codes) && section.codes.length > 0 ? `- ${escapeHtml(section.codes.join(", "))}` : ""}</li>
+            `).join("")}
+          </ul>
+        ` : ""}
+      </div>
+    </div>
+  `;
 }
 
 function renderRetrievalStatus(retrieval, indexSource) {

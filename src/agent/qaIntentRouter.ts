@@ -166,7 +166,7 @@ export function handleChapterSummary(
 
   return {
     intent: "chapter_summary",
-    answer,
+    answer: formatChapterSummaryAnswer(chapterNumber, items, answer),
     selectedPrimary: null,
     documentSummary,
     citations: [],
@@ -337,11 +337,31 @@ function buildDebug(
   };
 }
 
+function formatChapterSummaryAnswer(
+  chapterNumber: number | undefined,
+  items: Array<{ title: string; codes: string[] }>,
+  fallback: string
+): string {
+  if (chapterNumber === undefined || items.length === 0) {
+    return fallback;
+  }
+  return [
+    `Chapter ${chapterNumber} nói về các nội dung chính:`,
+    ...items.map((item) => `- ${item.title} — HS Code: ${item.codes.join(", ")}.`)
+  ].join("\n");
+}
+
 function extractChapterSummaryNumber(normalized: string): number | undefined {
   const patterns = [
     /\btom\s+tat\s+(?:chuong|chapter)\s+(\d{1,3})\b/,
     /\bnoi\s+dung\s+chinh\s+(?:chuong|chapter)\s+(\d{1,3})\b/,
     /\b(?:chuong|chapter)\s+(\d{1,3})\s+co\s+gi\b/,
+    /\b(?:chuong|chapter)\s+(\d{1,3})\s+noi\s+ve(?:\s+cai)?\s+(?:gi|j)\b/,
+    /\b(?:chuong|chapter)\s+(\d{1,3})\s+co\s+noi\s+dung\s+gi\b/,
+    /\b(?:chuong|chapter)\s+(\d{1,3})\s+gom(?:\s+nhung)?\s+gi\b/,
+    /\b(?:chuong|chapter)\s+(\d{1,3})\s+ve\s+gi\b/,
+    /\bwhat\s+is\s+(?:chuong|chapter)\s+(\d{1,3})\s+about\b/,
+    /\bwhat\s+does\s+(?:chuong|chapter)\s+(\d{1,3})\s+cover\b/,
     /\bliet\s+ke\s+ma\s+trong\s+(?:chuong|chapter)\s+(\d{1,3})\b/
   ];
   for (const pattern of patterns) {
@@ -431,6 +451,7 @@ function extractGenericChapterNumber(value: string): string | undefined {
   const patterns = [
     /chapter[\s_-]*(\d+)/i,
     /chapter\s+(\d+)/i,
+    /chuong\s+(\d+)/i,
     /chương\s+(\d+)/i
   ];
   for (const pattern of patterns) {

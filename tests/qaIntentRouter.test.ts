@@ -32,12 +32,21 @@ describe("qaIntentRouter", () => {
       title: "MECHANICALLY DEBONED MEAT",
       section: "0207.14.10 - MECHANICALLY DEBONED MEAT",
       textPreview: "Grouped HS code set: 0207.14.10, 0207.27.10."
+    },
+    {
+      document: "Tariff_chapter-10.pdf",
+      chapter: "CHAPTER 10",
+      hsCode: "1001.99.10",
+      title: "WHEAT",
+      section: "1001.99.10 - WHEAT",
+      textPreview: "Wheat and meslin."
     }
   ];
 
   const documents: QaDocumentMetadata[] = [
     { document: "Chapter01.pdf", input: "data/uploads/Chapter01.pdf" },
     { document: "Chapter02.pdf", input: "data/uploads/Chapter02.pdf" },
+    { document: "Tariff_chapter-10.pdf", input: "data/uploads/Tariff_chapter-10.pdf" },
     {
       document: "Introduction.pdf",
       input: "data/uploads/Introduction.pdf",
@@ -97,8 +106,40 @@ describe("qaIntentRouter", () => {
     expect(result.documentSummary?.document).toBe("Chapter02.pdf");
     expect(result.selectedPrimary).toBeNull();
     expect(result.citations).toEqual([]);
-    expect(result.answer).toContain("Chapter 2 gồm các nội dung chính:");
+    expect(result.answer).toContain("Chapter 2 nói về các nội dung chính:");
     expect(result.answer).toContain("0207.14.10");
+  });
+
+  it("routes natural Vietnamese chapter-about phrasing to chapter_summary", () => {
+    const queries = [
+      "chapter 10 nói về cái j",
+      "chương 10 nói về gì",
+      "chapter 10 có nội dung gì",
+      "chapter 10 gồm những gì",
+      "chapter 10 về gì"
+    ];
+
+    for (const query of queries) {
+      const detection = detectIntent(query);
+      const result = handleChapterSummary(query, sections, documents, detection);
+
+      expect(detection.intent).toBe("chapter_summary");
+      expect(detection.chapterNumber).toBe(10);
+      expect(result.intent).toBe("chapter_summary");
+      expect(result.selectedPrimary).toBeNull();
+      expect(result.documentSummary?.document).toBe("Tariff_chapter-10.pdf");
+      expect(result.answer).toContain("Chapter 10 nói về các nội dung chính:");
+      expect(result.answer).not.toContain("Sản phẩm là");
+    }
+  });
+
+  it("routes English chapter-about phrasing to chapter_summary", () => {
+    for (const query of ["what is chapter 10 about", "what does chapter 10 cover"]) {
+      const detection = detectIntent(query);
+
+      expect(detection.intent).toBe("chapter_summary");
+      expect(detection.chapterNumber).toBe(10);
+    }
   });
 
   it("summarizes reference documents from manifest metadata", () => {
