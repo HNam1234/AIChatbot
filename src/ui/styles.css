@@ -118,8 +118,16 @@ p {
   height: calc(100vh - 74px);
   min-height: 720px;
   display: grid;
-  grid-template-columns: minmax(320px, 390px) minmax(440px, 1fr) minmax(360px, 500px);
+  grid-template-columns: minmax(320px, 390px) minmax(520px, 1fr) minmax(340px, 440px);
   gap: 14px;
+}
+
+.chat-screen.debug-collapsed .notebook-grid {
+  grid-template-columns: minmax(320px, 390px) minmax(520px, 1fr);
+}
+
+.chat-screen.debug-collapsed .debug-sidebar {
+  display: none;
 }
 
 .screen {
@@ -194,7 +202,7 @@ p {
 
 .chat-pane {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   padding: 0;
 }
 
@@ -749,6 +757,7 @@ button.compact {
 }
 
 .chat-thread {
+  min-width: 0;
   min-height: 0;
   overflow: auto;
   padding: 22px 24px;
@@ -764,6 +773,7 @@ button.compact {
 }
 
 .chat-composer {
+  min-width: 0;
   margin: 0 16px 16px;
   padding: 10px;
   border: 1px solid var(--line-strong);
@@ -812,6 +822,74 @@ button.compact {
 
 .answer-text {
   white-space: pre-wrap;
+}
+
+.debug-sidebar {
+  display: grid;
+  grid-template-rows: auto minmax(140px, 0.42fr) minmax(260px, 1fr) auto;
+  gap: 12px;
+}
+
+.terminal-section,
+.debug-section {
+  min-height: 0;
+}
+
+.terminal-output,
+.debug-output {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid #202b36;
+  border-radius: 12px;
+  background: var(--code-bg);
+  color: #e8edf2;
+  padding: 12px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.terminal-output {
+  height: 100%;
+  white-space: pre-wrap;
+}
+
+.debug-output {
+  height: 100%;
+  background: #ffffff;
+  color: var(--text);
+  border-color: var(--line);
+}
+
+.debug-output.muted {
+  display: grid;
+  place-items: center;
+  background: var(--surface-soft);
+  color: var(--muted);
+  text-align: center;
+}
+
+.debug-summary {
+  display: grid;
+  gap: 7px;
+}
+
+.debug-summary strong {
+  color: var(--primary-strong);
+}
+
+.artifact-drawer {
+  min-height: 0;
+}
+
+.artifact-drawer summary {
+  cursor: pointer;
+  color: #263445;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.artifact-drawer[open] {
+  overflow: auto;
 }
 
 .artifact-section {
@@ -1236,19 +1314,11 @@ a:hover {
 
 @media (max-width: 1320px) {
   .notebook-grid {
-    grid-template-columns: minmax(300px, 350px) minmax(420px, 1fr);
+    grid-template-columns: minmax(280px, 330px) minmax(420px, 1fr) minmax(300px, 360px);
   }
 
   .setup-grid {
     grid-template-columns: 1fr;
-  }
-
-  .studio-pane {
-    grid-column: 1 / -1;
-    display: grid;
-    grid-template-columns: minmax(320px, 0.9fr) minmax(420px, 1.1fr);
-    align-items: start;
-    max-height: 560px;
   }
 
   .drawer {

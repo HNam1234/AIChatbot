@@ -53,6 +53,10 @@ const backToSetupButton = document.querySelector("#back-to-setup");
 const continueToChatButton = document.querySelector("#continue-to-chat");
 const querySourceListEl = document.querySelector("#query-source-list");
 const screenSubtitleEl = document.querySelector("#screen-subtitle");
+const debugOutputEl = document.querySelector("#debug-output");
+const chatTerminalEl = document.querySelector("#chat-terminal");
+const toggleDebugPanelButton = document.querySelector("#toggle-debug-panel");
+const collapseDebugPanelButton = document.querySelector("#collapse-debug-panel");
 
 let activeJobId = null;
 let pollTimer = null;
@@ -65,6 +69,7 @@ let clientLogs = [];
 let selectedCacheRows = [];
 let availableSources = [];
 let selectedSourceKeys = new Set();
+let debugPanelCollapsed = false;
 let cacheStatusRequestId = 0;
 let uploadInProgress = false;
 let settings = {
@@ -102,6 +107,8 @@ continueToChatButton.addEventListener("click", () => {
     showChatScreen();
   }
 });
+toggleDebugPanelButton?.addEventListener("click", () => setDebugPanelCollapsed(!debugPanelCollapsed));
+collapseDebugPanelButton?.addEventListener("click", () => setDebugPanelCollapsed(true));
 questionAllDocsInput.addEventListener("change", updateAgentScope);
 questionDocIdInput.addEventListener("input", updateAgentScope);
 prevPageButton.addEventListener("click", () => setPdfPage(Math.max(1, currentPage - 1)));
@@ -317,6 +324,7 @@ askButton.addEventListener("click", async () => {
         ? "selected"
         : "local-sections";
   answerEl.className = "chat-thread muted";
+  renderDebugOutput(escapeHtml("Waiting for retrieval debug..."), true);
   answerEl.textContent = selectedScope === "cached-tree-selected"
     ? `Searching cached tree JSON for ${cachedTreeDocuments.length} selected source(s)...`
     : selectedScope === "local-sections"
@@ -348,6 +356,7 @@ askButton.addEventListener("click", async () => {
   if (!response.ok) {
     answerEl.className = "chat-thread warning";
     answerEl.textContent = payload.error || "Could not get answer.";
+    renderDebugOutput(escapeHtml(payload.error || "Could not get retrieval debug."), true);
     return;
   }
   answerEl.className = "chat-thread";
@@ -358,13 +367,17 @@ askButton.addEventListener("click", async () => {
     : `Index source: ${formatIndexSource(indexSource, payload.retrieval)}`;
   const retrievalStatus = renderRetrievalStatus(payload.retrieval, indexSource);
   const citationCards = renderCitationCards(payload.citations || []);
-  const debugPanel = questionDebugInput?.checked ? renderDebugPanel(payload.debug) : "";
+  renderDebugOutput(
+    questionDebugInput?.checked
+      ? renderDebugPanel(payload.debug)
+      : renderDebugSummary(indexSource, payload.retrieval),
+    !questionDebugInput?.checked
+  );
   answerEl.innerHTML = `
     <div class="answer-box">
       <div class="answer-text">${escapeHtml(payload.answer || "")}</div>
       ${retrievalStatus}
       ${citationCards}
-      ${debugPanel}
       <p>${escapeHtml(answerScope)}</p>
       ${marker ? `<p>${escapeHtml(marker.message || "")}</p>` : ""}
     </div>
@@ -389,7 +402,7 @@ async function pollStatus() {
   }
 
   setTopStatus(job);
-  logsEl.textContent = [...clientLogs, ...(job.logs || [])].join("\n");
+  syncTerminalLogs(job.logs || []);
   renderBatchStatus(job.files || []);
 
   if (job.status === "completed" || job.status === "failed") {
@@ -725,7 +738,7 @@ function renderRetrievalStatus(retrieval, indexSource) {
 
 function renderDebugPanel(debug) {
   if (!debug) {
-    return "";
+    return "Debug payload is empty. Run the question again with Debug retrieval enabled.";
   }
 
   const selected = debug.selectedPrimary && Object.keys(debug.selectedPrimary).length > 0
@@ -745,6 +758,23 @@ function renderDebugPanel(debug) {
       </div>
     </details>
   `;
+}
+
+function renderDebugSummary(indexSource, retrieval) {
+  return `
+    <div class="debug-summary">
+      <strong>Debug retrieval is off</strong>
+      <span>Index source: ${escapeHtml(formatIndexSource(indexSource, retrieval))}</span>
+      ${retrieval?.source ? `<span>Retrieval source: ${escapeHtml(retrieval.source)}</span>` : ""}
+      ${retrieval?.bm25FallbackUsed ? "<span>BM25/local fallback used</span>" : ""}
+    </div>
+  `;
+}
+
+function renderDebugOutput(content, muted = false) {
+  if (!debugOutputEl) return;
+  debugOutputEl.className = muted ? "debug-output muted" : "debug-output";
+  debugOutputEl.innerHTML = content || "No retrieval debug yet.";
 }
 
 function renderDebugSelected(selected) {
@@ -806,9 +836,11 @@ function activateTab(tabName) {
 
 function resetResult() {
   logsEl.textContent = "";
+  if (chatTerminalEl) chatTerminalEl.textContent = "No runtime logs yet.";
   clientLogs = [];
   answerEl.className = "chat-thread muted";
   answerEl.textContent = "Ask a question about the selected document, all cached trees, or local sections.";
+  renderDebugOutput(escapeHtml("Enable Debug retrieval, ask a question, then inspect candidates here."), true);
   markdownEl.textContent = "No Markdown yet.";
   markdownEl.className = "markdown muted";
   renderedEl.textContent = "No rendered preview yet.";
@@ -1064,6 +1096,17 @@ function showChatScreen() {
   updateAgentScope();
 }
 
+function setDebugPanelCollapsed(collapsed) {
+  debugPanelCollapsed = collapsed;
+  chatScreen?.classList.toggle("debug-collapsed", collapsed);
+  if (toggleDebugPanelButton) {
+    toggleDebugPanelButton.textContent = collapsed ? "Show terminal" : "Hide terminal";
+  }
+  if (collapseDebugPanelButton) {
+    collapseDebugPanelButton.textContent = collapsed ? "Collapsed" : "Collapse";
+  }
+}
+
 function hasProcessedSources() {
   return availableSources.length > 0 || indexedDocuments.length > 0;
 }
@@ -1231,8 +1274,17 @@ function formatBytes(bytes) {
 
 function appendUiLog(message) {
   clientLogs.push(message);
-  logsEl.textContent = clientLogs.join("\n");
+  syncTerminalLogs();
+}
+
+function syncTerminalLogs(jobLogs = []) {
+  const text = [...clientLogs, ...jobLogs].join("\n");
+  logsEl.textContent = text;
   logsEl.scrollTop = logsEl.scrollHeight;
+  if (chatTerminalEl) {
+    chatTerminalEl.textContent = text || "No runtime logs yet.";
+    chatTerminalEl.scrollTop = chatTerminalEl.scrollHeight;
+  }
 }
 
 function traceLine(functionName, message, details = {}) {

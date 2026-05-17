@@ -187,6 +187,7 @@
                 <span class="kicker">Chat</span>
                 <h2>Ask Your Parsed Documents</h2>
               </div>
+              <button id="toggle-debug-panel" type="button" class="secondary compact">Hide terminal</button>
             </div>
 
             <div id="answer" class="chat-thread muted">
@@ -199,8 +200,32 @@
             </div>
           </section>
 
-          <aside class="notebook-pane studio-pane" aria-label="Notebook Studio">
-            <section class="artifact-section pdf-panel">
+          <aside id="debug-sidebar" class="notebook-pane studio-pane debug-sidebar" aria-label="Terminal and retrieval debug">
+            <div class="pane-heading compact-heading">
+              <div>
+                <span class="kicker">Terminal</span>
+                <h2>Debug Retrieval</h2>
+              </div>
+              <button id="collapse-debug-panel" type="button" class="secondary compact">Collapse</button>
+            </div>
+
+            <section class="artifact-section terminal-section">
+              <div class="block-heading">
+                <span>Runtime terminal</span>
+                <small>pipeline and UI logs</small>
+              </div>
+              <pre id="chat-terminal" class="terminal-output muted">No runtime logs yet.</pre>
+            </section>
+
+            <section class="artifact-section debug-section">
+              <div class="block-heading">
+                <span>Retrieval debug</span>
+                <small>shown after Q&A</small>
+              </div>
+              <div id="debug-output" class="debug-output muted">Enable Debug retrieval, ask a question, then inspect candidates here.</div>
+            </section>
+
+            <section class="artifact-section pdf-panel hidden">
               <div class="pane-heading compact-heading">
                 <div>
                   <span class="kicker">Preview</span>
@@ -216,13 +241,8 @@
               <a id="open-page" class="muted" href="#" target="_blank" rel="noreferrer">Open PDF page in new tab</a>
             </section>
 
-            <section class="artifact-section result-panel">
-              <div class="pane-heading compact-heading">
-                <div>
-                  <span class="kicker">Artifacts</span>
-                  <h2>Parsed Output</h2>
-                </div>
-              </div>
+            <details class="artifact-section result-panel artifact-drawer">
+              <summary>Parsed artifacts</summary>
               <div class="tabs" role="tablist">
                 <button type="button" class="tab active" data-tab="markdown">Markdown</button>
                 <button type="button" class="tab" data-tab="rendered">Rendered</button>
@@ -240,7 +260,7 @@
               <div id="tab-tree" class="tab-panel hidden"><div id="tree" class="tree muted">No tree JSON yet.</div></div>
               <div id="tab-validation" class="tab-panel hidden"><div id="markers" class="markers muted">No markers yet.</div></div>
               <div id="tab-assets" class="tab-panel hidden"><div id="images" class="images muted">No images yet.</div></div>
-            </section>
+            </details>
           </aside>
         </section>
       </section>
