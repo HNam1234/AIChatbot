@@ -15,6 +15,20 @@ export interface GeminiSynthesisOptions {
   maxOutputTokens?: number;
 }
 
+export interface SelectedSectionAnswerContext {
+  document?: string;
+  section?: string;
+  title?: string;
+  hsCode?: string;
+  source?: string;
+  text: string;
+}
+
+export interface GeminiQueryPlannerOptions {
+  temperature?: number;
+  maxOutputTokens?: number;
+}
+
 export interface GeminiTextGenerator {
   generateText(options: {
     apiKey: string;
@@ -73,6 +87,32 @@ export class GeminiRoundRobinClient {
       temperature: options.temperature ?? this.temperature,
       maxOutputTokens: options.maxOutputTokens ?? this.maxOutputTokens
     };
+    return await this.generateWithFailover(prompt, config);
+  }
+
+  public async synthesizeSectionAnswer(
+    section: SelectedSectionAnswerContext,
+    query: string,
+    options: GeminiSynthesisOptions = {}
+  ): Promise<string> {
+    const prompt = buildSelectedSectionAnswerPrompt(section, query);
+    const config: GenerateContentConfig = {
+      temperature: options.temperature ?? this.temperature,
+      maxOutputTokens: options.maxOutputTokens ?? this.maxOutputTokens
+    };
+    return await this.generateWithFailover(prompt, config);
+  }
+
+  public async planQuery(prompt: string, options: GeminiQueryPlannerOptions = {}): Promise<string> {
+    const config: GenerateContentConfig = {
+      temperature: options.temperature ?? 0,
+      maxOutputTokens: options.maxOutputTokens ?? 384,
+      responseMimeType: "application/json"
+    };
+    return await this.generateWithFailover(prompt, config);
+  }
+
+  private async generateWithFailover(prompt: string, config: GenerateContentConfig): Promise<string> {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= this.apiKeys.length; attempt += 1) {
@@ -128,6 +168,36 @@ export function buildHsCodePrompt(context: string, query: string, language: stri
     context,
     "",
     `Question: ${query}`
+  ].join("\n");
+}
+
+export function buildSelectedSectionAnswerPrompt(section: SelectedSectionAnswerContext, query: string): string {
+  return [
+    "You are answering a question using only the selected HSCode document section.",
+    "Do not use outside knowledge.",
+    "Do not invent information.",
+    "If the selected section does not contain the requested information, say so.",
+    "Prefer Vietnamese for Vietnamese or mixed-language questions.",
+    "Answer the user's actual question directly.",
+    "If the user asks about requirements, characteristics, appearance, usage, or notes, extract that field from the selected section and do not output HS Code unless the user asks for HS Code.",
+    "If the user asks for a definition or meaning, answer from the selected section text, then append HS Code from selected section metadata when available.",
+    "",
+    "Selected section metadata:",
+    `- document: ${section.document ?? ""}`,
+    `- section: ${section.section ?? ""}`,
+    `- title: ${section.title ?? ""}`,
+    `- hsCode: ${section.hsCode ?? ""}`,
+    `- source: ${section.source ?? ""}`,
+    "",
+    "Selected section text:",
+    "---",
+    section.text,
+    "---",
+    "",
+    "User question:",
+    query,
+    "",
+    "Return a concise answer."
   ].join("\n");
 }
 

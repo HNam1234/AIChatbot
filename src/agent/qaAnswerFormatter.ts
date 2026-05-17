@@ -273,7 +273,7 @@ export function buildStructuredAnswer(
   const normalizedProductName = productTitle ? normalizeProductTitle(productTitle) : null;
   const hsCodes = hsCodesForSection(selectedPrimary);
   const conciseExplanation =
-    definitionStyleQuestion(question ?? "") ? extractDefinitionSentence(selectedPrimary.text) : shortLlmExplanation(llmAnswer);
+    isDefinitionStyleQuestion(question ?? "") ? extractDefinitionSentence(selectedPrimary.text) : shortLlmExplanation(llmAnswer);
   const note = extractClassificationNote(selectedPrimary.text);
 
   return {
@@ -612,6 +612,21 @@ export function hsCodesForSection(section: Pick<EnrichedRetrievedSection, "hsCod
   return uniqueStrings([...(section.groupedHsCodes ?? []), section.hsCode].filter((code): code is string => Boolean(code)));
 }
 
+export function prefersVietnameseAnswer(question: string | undefined): boolean {
+  if (!question?.trim()) {
+    return true;
+  }
+  const normalized = normalizeForSearch(question);
+  if (/[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]/i.test(question) ||
+    /\b(la|gi|can|phai|yeu|cau|ngoai|quan|nhin|trong|nhu|nao|chuong|tom|tat|noi|dung|cong|dung|dac|diem|ma|thuoc)\b/.test(normalized)) {
+    return true;
+  }
+  if (!/[a-z]/i.test(question)) {
+    return true;
+  }
+  return false;
+}
+
 export function hasSectionHsMetadata(section: Pick<EnrichedRetrievedSection, "hsCode" | "groupedHsCodes">): boolean {
   return hsCodesForSection(section).length > 0;
 }
@@ -661,10 +676,12 @@ function formatHsCodeLine(codes: string[], question: string | undefined): string
 
 function renderClassEvalAnswer(structured: StructuredAnswer, question: string | undefined): string {
   const product = structured.normalizedProductName || structured.productTitle || "sản phẩm phù hợp";
-  const definition = definitionStyleQuestion(question ?? "") ? structured.conciseExplanation : null;
+  const definition = isDefinitionStyleQuestion(question ?? "") && !asksForHsCodeOrClassificationQuestion(question ?? "")
+    ? formatDefinitionExplanation(structured.conciseExplanation ?? firstSectionSentence(structured.selectedPrimary.text), question)
+    : null;
   const prefix = definition ? ensureSentenceEnd(stripHsCodes(definition)) : `Sản phẩm là ${product},`;
   const codeLine = formatClassEvalHsCodeLine(structured.hsCodes);
-  const note = structured.note ? ` Lưu ý: ${ensureSentenceEnd(stripHsCodes(structured.note))}` : "";
+  const note = !definition && structured.note ? ` Lưu ý: ${ensureSentenceEnd(stripHsCodes(structured.note))}` : "";
   const answer = `${prefix} ${codeLine}${note}`;
   return validateClassEvalAnswer(answer, structured) ? answer : fallbackClassEvalAnswer(structured);
 }
@@ -684,6 +701,32 @@ function joinHsCodes(codes: string[]): string {
     return codes.join(" hoặc ");
   }
   return `${codes.slice(0, -1).join(", ")} hoặc ${codes[codes.length - 1]}`;
+}
+
+function formatDefinitionExplanation(value: string | null, question: string | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+  if (!prefersVietnameseAnswer(question)) {
+    return value;
+  }
+  return vietnameseDefinitionSentence(value);
+}
+
+function vietnameseDefinitionSentence(value: string): string {
+  const cleaned = ensureSentenceEnd(value.replace(/^Shared description:\s*/i, "").replace(/\s+/g, " ").trim());
+  if (/\b(là|được định nghĩa là|có nghĩa là)\b/i.test(cleaned)) {
+    return cleaned;
+  }
+  const knownAs = cleaned.match(/^(.+?)\s+(?:are|is)\s+also\s+known\s+as\s+(.+?)[.!?]?$/i);
+  if (knownAs?.[1] && knownAs[2]) {
+    return `${normalizeProductTitle(knownAs[1])} còn được gọi là ${knownAs[2].trim()}.`;
+  }
+  const definition = cleaned.match(/^(.+?)\s+(?:are|is|refers to|means|defined as)\s+(.+?)[.!?]?$/i);
+  if (definition?.[1] && definition[2]) {
+    return `${normalizeProductTitle(definition[1])} là ${definition[2].trim()}.`;
+  }
+  return `Thông tin mô tả: ${cleaned}`;
 }
 
 function groupedPageRangeKey(document: string, title: string, codes: string[]): string {
@@ -737,7 +780,7 @@ function classEvalRepairApplied(llmAnswer: string | undefined, structured: Struc
     cleanDirectAnswer(llmAnswer) !== stripHsCodes(answer);
 }
 
-function normalizeProductTitle(value: string): string {
+export function normalizeProductTitle(value: string): string {
   const cleaned = normalizeDisplayText(value)
     .replace(HS_CODE_PATTERN, "")
     .replace(/^[\s—–-]+/, "")
@@ -746,20 +789,11 @@ function normalizeProductTitle(value: string): string {
   if (!cleaned) {
     return "";
   }
-  return cleaned
-    .toLowerCase()
-    .split(/(\s+|[()/-])/)
-    .map((part, index, parts) => {
-      if (!/[a-z]/i.test(part)) {
-        return part;
-      }
-      if (SMALL_TITLE_WORDS.has(part) && index > 0 && index < parts.length - 1) {
-        return part;
-      }
-      return `${part.charAt(0).toUpperCase()}${part.slice(1)}`;
-    })
-    .join("")
-    .replace(/\(([^)]+)\)/g, (_match, inner: string) => `(${titleCasePhrase(inner)})`);
+  const withoutDescriptiveParentheses = cleaned.replace(/\((not\s+fit\s+for\s+human\s+consumption)\)/i, "$1");
+  const sentenceCase = uppercaseFirstLetter(withoutDescriptiveParentheses.toLowerCase())
+    .replace(/\bhs\b/g, "HS")
+    .replace(/\bgenus\s+([a-z]+)/g, (_match, genus: string) => `genus ${uppercaseFirstLetter(genus)}`);
+  return sentenceCase.replace(/\(([^)]+)\)/g, (_match, inner: string) => `(${titleCasePhrase(inner)})`);
 }
 
 function titleCasePhrase(value: string): string {
@@ -775,9 +809,22 @@ function titleCasePhrase(value: string): string {
     .join(" ");
 }
 
-function definitionStyleQuestion(question: string): boolean {
+function uppercaseFirstLetter(value: string): string {
+  return value.replace(/[a-z]/, (letter) => letter.toUpperCase());
+}
+
+export function isDefinitionStyleQuestion(question: string): boolean {
+  const normalized = normalizeForSearch(question);
   return /\b(define|definition|what is|what are|means|refers to)\b/i.test(question) ||
-    /là gì|được định nghĩa|định nghĩa/i.test(question);
+    /là gì|được định nghĩa|định nghĩa/i.test(question) ||
+    /\b(la\s+gi|duoc\s+dinh\s+nghia|dinh\s+nghia)\b/.test(normalized) ||
+    /lÃ[\s\S]{0,80}gÃ/i.test(question);
+}
+
+function asksForHsCodeOrClassificationQuestion(question: string): boolean {
+  const normalized = normalizeForSearch(question);
+  return HS_CODE_PATTERN.test(question) ||
+    /\b(hs\s*code|hscode|ma\s+hs|ma\s+hscode|tariff\s+code|customs\s+code|classification|classified|classify|phan\s+loai|thuoc\s+ma|ma\s+nao|code\s+nao|which\s+code|belong\s+to\s+which\s+hs\s+code)\b/.test(normalized);
 }
 
 function extractDefinitionSentence(text: string): string | null {
@@ -785,6 +832,11 @@ function extractDefinitionSentence(text: string): string | null {
     /\b(are|is|refers to|means|defined as)\b/i.test(candidate) ||
     /là|được định nghĩa là|có nghĩa là/i.test(candidate)
   );
+  return sentence ? shortenSentence(sentence, 180) : null;
+}
+
+function firstSectionSentence(text: string): string | null {
+  const sentence = splitSentences(cleanRetrievedText(text))[0];
   return sentence ? shortenSentence(sentence, 180) : null;
 }
 

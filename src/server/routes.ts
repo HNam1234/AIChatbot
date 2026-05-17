@@ -57,12 +57,14 @@ import {
   type SectionMetadata
 } from "../agent/qaAnswerFormatter";
 import {
-  detectIntent,
+  handleClarificationNeeded,
   handleChapterSummary,
-  handleDefinition,
   handleDocumentSummary,
   handleExactHsCodeLookup,
   handleProductClassification,
+  handleSelectedSectionQa,
+  asksForHsCodeOrClassification,
+  detectIntent,
   type RoutedQaAnswer,
   type QaDocumentMetadata
 } from "../agent/qaIntentRouter";
@@ -1501,6 +1503,8 @@ export async function answerFromCachedTrees(
     detectedIntent: detection.intent,
     intentConfidence: detection.confidence,
     intentReason: detection.reason,
+    queryPlan: detection.queryPlan,
+    plannerSource: detection.plannerSource,
     indexSource: {
       selectedCachedTreeDocuments,
       localSectionDocuments
@@ -1554,12 +1558,26 @@ export async function answerFromCachedTrees(
     });
   }
 
+  if (isNumericOnlyQuestion(question)) {
+    const routed = handleClarificationNeeded(question, detection, baseDebug);
+    return finalizeRoutedAnswer(routed, {
+      mode: "cached-tree",
+      documents,
+      sourceDocuments: [],
+      retrieval: undefined,
+      debug: options.debug,
+      cacheInfo: responseCacheInfo,
+      scope
+    });
+  }
+
   const searchStartedAt = Date.now();
+  const retrievalQuestion = question;
   const retrieval = documents.length > 0
-    ? await searchCachedTreeDocuments(question, documents, scope)
-    : await searchLocalSectionsOnly(question, localFallbackDocuments, scope);
+    ? await searchCachedTreeDocuments(retrievalQuestion, documents, scope)
+    : await searchLocalSectionsOnly(retrievalQuestion, localFallbackDocuments, scope);
   const hits = retrieval.hits;
-  const debugReport = createQaDebugReport(question, retrieval);
+  const debugReport = createQaDebugReport(retrievalQuestion, retrieval);
   serverTrace("answerFromCachedTrees", "cached tree search completed", {
     hitCount: hits.length,
     pageIndexResultCount: retrieval.pageIndexResultCount,
@@ -1569,21 +1587,14 @@ export async function answerFromCachedTrees(
   });
   if (hits.length === 0) {
     const indexSource = buildIndexSource(retrieval, documents, []);
-    const routed = detection.intent === "definition"
-      ? handleDefinition(question, undefined, retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults, detection, {
-          ...baseDebug,
-          ...debugReport,
-          indexSource
-        })
-      : handleProductClassification(question, undefined, [], undefined, retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults, detection, {
-          ...baseDebug,
-          ...debugReport,
-          indexSource
-        });
+    const candidateRelevance = retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults;
+    const routed = handleSelectedSectionQa(question, undefined, undefined, candidateRelevance, detection, {
+      ...baseDebug,
+      ...debugReport,
+      indexSource
+    });
     const emptyResponse = {
-      answer: scopedNotFoundMessage(scope) ?? (documents.length > 0
-        ? "Không tìm thấy ngữ cảnh phù hợp trong các cached tree JSON."
-        : "Không tìm thấy ngữ cảnh phù hợp trong local sections cache."),
+      answer: scopedNotFoundMessage(scope) ?? routed.answer,
       scope: scopeSnapshot(scope, documents.map((document) => document.document)),
       docIds: [],
       documents: documents.map((document) => document.document),
@@ -1631,10 +1642,11 @@ export async function answerFromCachedTrees(
   });
   let llmAnswer: string | undefined;
   let llmError: string | undefined;
-  const useTemplateFastPath = shouldUseTemplateFastPath(detection.intent, hits[0], answerStyle);
+  const explicitHsQuestion = asksForHsCodeOrClassification(question);
+  const useTemplateFastPath = explicitHsQuestion && shouldUseTemplateFastPath("product_classification", hits[0], answerStyle);
   if (useTemplateFastPath) {
     serverTrace("answerFromCachedTrees", "template fast path used", {
-      intent: detection.intent,
+      intent: explicitHsQuestion ? "product_classification" : detection.intent,
       selectedSection: hits[0].section,
       answerStyle
     });
@@ -1643,20 +1655,32 @@ export async function answerFromCachedTrees(
     if (useTemplateFastPath) {
       throw new TemplateFastPathSkip();
     }
+    if (!explicitHsQuestion && options.geminiApiKeys?.length === 0) {
+      throw new TemplateFastPathSkip();
+    }
     const llm = new GeminiRoundRobinClient({ apiKeys: resolveGeminiApiKeys(options.geminiApiKeys ?? []) });
     const llmStartedAt = Date.now();
     serverTrace("answerFromCachedTrees", "gemini synthesis started", { keyCount: llm.keyCount });
-    llmAnswer = await llm.synthesizeAnswer(
-      context.slice(0, 12000),
-      [
-        question,
-        "",
-        "Use the retrieved section metadata. If hsCode is present, final answer must include HS Code.",
-        "Citation must include document, page/page range, and section.",
-        "Do not invent HS Code. Prefer metadata for hsCode/title/citation."
-      ].join("\n")
-    );
-    if (llmAnswer && answerMentionsHsCodeOutsideSection(llmAnswer, topHits[0])) {
+    llmAnswer = explicitHsQuestion
+      ? await llm.synthesizeAnswer(
+          context.slice(0, 12000),
+          [
+            question,
+            "",
+            "Use the retrieved section metadata. If hsCode is present, final answer must include HS Code.",
+            "Citation must include document, page/page range, and section.",
+            "Do not invent HS Code. Prefer metadata for hsCode/title/citation."
+          ].join("\n")
+        )
+      : await llm.synthesizeSectionAnswer({
+          document: hits[0].document,
+          section: hits[0].section,
+          title: hits[0].title,
+          hsCode: hits[0].hsCode,
+          source: hits[0].source,
+          text: hits[0].text
+        }, question, { language: "Vietnamese" });
+    if (explicitHsQuestion && llmAnswer && answerMentionsHsCodeOutsideSection(llmAnswer, topHits[0])) {
       serverTrace("answerFromCachedTrees", "unsupported HS code detected; retrying strict prompt", {
         selectedSection: topHits[0].section,
         allowedCodes: hsCodesForSection(topHits[0])
@@ -1684,17 +1708,18 @@ export async function answerFromCachedTrees(
     serverTrace("answerFromCachedTrees", "gemini synthesis failed; using fallback formatter", { error: llmError });
     }
   }
-  const alternatives = selectAlternativeSections(hits, question);
-  const routed = detection.intent === "definition"
-    ? handleDefinition(question, hits[0], retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults, detection, {
+  const alternatives = selectAlternativeSections(hits, retrievalQuestion);
+  const candidateRelevance = retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults;
+  const routed = explicitHsQuestion
+    ? handleProductClassification(question, hits[0], alternatives, llmAnswer, candidateRelevance, detection, {
         ...baseDebug,
         ...debugReport,
-        answerGeneration: useTemplateFastPath ? "template" : llmAnswer ? "llm" : "template-fallback"
+        answerGeneration: "template"
       })
-    : handleProductClassification(question, hits[0], alternatives, llmAnswer, retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults, detection, {
+    : handleSelectedSectionQa(question, hits[0], llmAnswer, candidateRelevance, detection, {
         ...baseDebug,
         ...debugReport,
-        answerGeneration: useTemplateFastPath ? "template" : llmAnswer ? "llm" : "template-fallback"
+        answerGeneration: llmAnswer ? "llm" : "template-fallback"
       });
   const answer = routed.answer;
   const finalHsCodes = Array.isArray(routed.debug.finalHsCodes) ? routed.debug.finalHsCodes as string[] : hsCodesForSection(hits[0]);
@@ -1779,7 +1804,7 @@ async function searchCachedTreeDocuments(
   }
 
   const rankedPageIndexHits = rankRetrievedSectionsByUsability(pageIndexHits, question);
-  const pageIndexSelection = selectRelevantSections(rankedPageIndexHits, question, { requireHsMetadata: true });
+  const pageIndexSelection = selectRelevantSections(rankedPageIndexHits, question, { requireHsMetadata: asksForHsCodeOrClassification(question) });
   const usablePageIndexHits = pageIndexSelection.ranked;
   if (usablePageIndexHits.length > 0) {
     return {
@@ -1799,7 +1824,7 @@ async function searchCachedTreeDocuments(
     contrastTerms: contrast.terms
   });
   const bm25Candidates = rankRetrievedSectionsByUsability(searchLocalSectionMetadataFallback(scoringContext, sectionMetadata), question);
-  const bm25Selection = selectRelevantSections(bm25Candidates, question, { requireHsMetadata: true });
+  const bm25Selection = selectRelevantSections(bm25Candidates, question, { requireHsMetadata: asksForHsCodeOrClassification(question) });
   return {
     hits: bm25Selection.ranked,
     retrievalSource: "bm25-fallback",
@@ -1840,7 +1865,7 @@ async function searchLocalSectionsOnly(
   const sectionMetadata = (await loadSectionMetadata(documentNames, scope))
     .filter((section) => (allowedDocuments.size === 0 || allowedDocuments.has(section.document)) && scopeAllowsDocument(scope, section.document));
   const bm25Candidates = rankRetrievedSectionsByUsability(searchLocalSectionMetadataFallback(scoringContext, sectionMetadata), question);
-  const bm25Selection = selectRelevantSections(bm25Candidates, question, { requireHsMetadata: true });
+  const bm25Selection = selectRelevantSections(bm25Candidates, question, { requireHsMetadata: asksForHsCodeOrClassification(question) });
   return {
     hits: bm25Selection.ranked,
     retrievalSource: "local-sections",
@@ -2251,6 +2276,10 @@ function answerMentionsHsCodeOutsideSection(answer: string, section: EnrichedRet
   }
   const mentionedCodes = [...answer.matchAll(new RegExp(HS_CODE_PATTERN.source, "g"))].map((match) => match[0]);
   return mentionedCodes.some((code) => !allowedCodes.has(code));
+}
+
+function isNumericOnlyQuestion(question: string): boolean {
+  return /^\s*\d+(?:[.,]\d+)?\s*%?\s*$/.test(question);
 }
 
 function normalizeTreeRoots(payload: Record<string, unknown> | undefined): unknown[] {

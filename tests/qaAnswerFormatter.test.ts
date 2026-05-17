@@ -276,11 +276,55 @@ describe("qaAnswerFormatter", () => {
 
     const result = renderHsCodeAnswer("Wrong extra text. HS Code: 9999.99.99.", section);
 
-    expect(result.answer).toContain("Wheat (Not Fit for Human Consumption)");
+    expect(result.answer).toContain("Wheat not fit for human consumption");
     expect(result.answer).toContain("HS Code:");
     expect(result.answer).toContain("1001.99.10");
-    expect(result.answer).not.toContain("Nguồn:");
+    expect(result.answer).not.toContain("Nguá»“n:");
     expect(result.answer).not.toContain("9999.99.99");
+  });
+
+  it("renders Vietnamese product query with Vietnamese wrapper", () => {
+    const section = sectionFixture({
+      document: "Chapter09.pdf",
+      hsCode: "0901.21.12",
+      title: "ARABICA COFFEE",
+      section: "0901.21.12 - ARABICA COFFEE",
+      text: "Arabica coffee has a milder taste."
+    });
+
+    const result = renderHsCodeAnswer(undefined, section, [], { question: "Arabica coffee thuá»™c mÃ£ HS nÃ o?" });
+
+    expect(result.answer).toBe("Sản phẩm là Arabica coffee, HS Code: 0901.21.12.");
+  });
+
+  it("renders mixed Vietnamese-English product query with official English title", () => {
+    const section = sectionFixture({
+      document: "Chapter12.pdf",
+      hsCode: "1211.90.95",
+      title: "AGARWOOD (GAHARU) CHIPS",
+      section: "1211.90.95 - AGARWOOD (GAHARU) CHIPS",
+      text: "Agarwood chips are resinous fragrant wood pieces used for incense and perfume."
+    });
+
+    const result = renderHsCodeAnswer(undefined, section, [], { question: "Agarwood chips lÃ  mÃ£ nÃ o?" });
+
+    expect(result.answer).toBe("Sản phẩm là Agarwood (Gaharu) chips, HS Code: 1211.90.95.");
+  });
+
+  it("renders Agarwood descriptive query with normalized title and HS Code", () => {
+    const section = sectionFixture({
+      document: "Chapter12.pdf",
+      hsCode: "1211.90.95",
+      title: "AGARWOOD (GAHARU) CHIPS",
+      section: "1211.90.95 - AGARWOOD (GAHARU) CHIPS",
+      text: "Agarwood chips are resinous fragrant wood pieces used for incense and perfume."
+    });
+
+    const result = renderHsCodeAnswer(undefined, section, [], {
+      question: "Resinous fragrant agarwood chips dÃ¹ng lÃ m incense thuá»™c mÃ£ nÃ o?"
+    });
+
+    expect(result.answer).toBe("Sản phẩm là Agarwood (Gaharu) chips, HS Code: 1211.90.95.");
   });
 
   it("renders class-eval grouped-code product answer with all grouped codes", () => {
@@ -300,10 +344,10 @@ describe("qaAnswerFormatter", () => {
     expect(result.answer).toContain("0207.45.10");
     expect(result.answer).toContain("hoặc");
     expect(result.answer).toContain("tùy trạng thái hàng hóa");
-    expect(result.answer).not.toContain("Nguồn:");
+    expect(result.answer).not.toContain("Nguá»“n:");
   });
 
-  it("renders class-eval definition answer from selected text", () => {
+  it("renders definition answers with selected HS code metadata", () => {
     const section = sectionFixture({
       document: "Chapter01.pdf",
       hsCode: "0102.29.11",
@@ -314,9 +358,38 @@ describe("qaAnswerFormatter", () => {
 
     const result = renderHsCodeAnswer(undefined, section, [], { question: "What is Oxen?" });
 
-    expect(result.answer).toContain("Oxen are castrated adult male bovine animals.");
+    expect(result.answer).toBe("Oxen are castrated adult male bovine animals. HS Code: 0102.29.11.");
     expect(result.answer).toContain("HS Code: 0102.29.11");
-    expect(result.answer).not.toContain("Nguồn:");
+    expect(result.answer).not.toContain("Nguá»“n:");
+  });
+
+  it("uses Vietnamese definition wrapper for mixed-language definition questions", () => {
+    const section = sectionFixture({
+      document: "Chapter01.pdf",
+      hsCode: "0102.29.11",
+      title: "OXEN",
+      section: "0102.29.11 - OXEN",
+      text: "Oxen are castrated adult male bovine animals. They are commonly used as draught animals."
+    });
+
+    const result = renderHsCodeAnswer(undefined, section, [], { question: "Oxen là gì?" });
+
+    expect(result.answer).toBe("Oxen là castrated adult male bovine animals. HS Code: 0102.29.11.");
+    expect(result.answer).toContain("HS Code: 0102.29.11");
+  });
+
+  it("keeps metadata template when definition-like wording explicitly asks for HS code", () => {
+    const section = sectionFixture({
+      document: "Chapter01.pdf",
+      hsCode: "0102.29.11",
+      title: "OXEN",
+      section: "0102.29.11 - OXEN",
+      text: "Oxen are castrated adult male bovine animals. They are commonly used as draught animals."
+    });
+
+    const result = renderHsCodeAnswer(undefined, section, [], { question: "Oxen HS Code là gì?" });
+
+    expect(result.answer).toBe("Sản phẩm là Oxen, HS Code: 0102.29.11.");
   });
 
   it("includes short classification note when source text has a caveat", () => {
@@ -355,7 +428,7 @@ describe("qaAnswerFormatter", () => {
 
     expect(result.answer).toContain("HS Code: 0901.11.30");
     expect(result.answer).not.toContain("0901.21.12");
-    expect(result.answer).not.toContain("Mã liên quan");
+    expect(result.answer).not.toContain("MÃ£ liÃªn quan");
   });
 
   it("extracts distinctive signals and selects an attribute-heavy candidate by properties", () => {
@@ -511,7 +584,7 @@ describe("qaAnswerFormatter", () => {
       text: "Chapter 10 content summary."
     });
 
-    const relevance = evaluateCandidateRelevance(candidate, "chapter 10 nội dung");
+    const relevance = evaluateCandidateRelevance(candidate, "chapter 10 ná»™i dung");
 
     expect(relevance.rejected).toBe(true);
     expect(relevance.rejectedReason).toContain("weak generic");

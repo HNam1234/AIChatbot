@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   detectIntent,
   handleChapterSummary,
-  handleDefinition,
   handleDocumentSummary,
   handleExactHsCodeLookup,
   handleProductClassification,
+  handleSelectedSectionQa,
   type QaDocumentMetadata
 } from "../src/agent/qaIntentRouter";
 import {
@@ -81,7 +81,70 @@ describe("qaIntentRouter", () => {
     expect(result.answer).toContain("0207.27.10");
   });
 
-  it("returns definition text with HS code metadata", () => {
+  it("uses metadata template when the query explicitly asks for HS Code", () => {
+    const query = "Dried sample chips HS Code lÃ  gÃ¬?";
+    const selected = retrievedFixture({
+      document: "Chapter12.pdf",
+      hsCode: "1211.90.95",
+      title: "DRIED SAMPLE CHIPS",
+      section: "1211.90.95 - DRIED SAMPLE CHIPS",
+      text: "Dried sample chips are resinous pieces."
+    });
+    const result = handleSelectedSectionQa(query, selected, undefined, [candidateFor(selected, {
+      finalScore: 80,
+      matchedTerms: ["dried", "sample", "chips"],
+      candidateMatchedPhrases: ["dried sample"]
+    })], detectIntent(query));
+
+    expect(result.answerMode).toBe("classification");
+    expect(result.answer).toBe("Sản phẩm là Dried sample chips, HS Code: 1211.90.95.");
+  });
+
+  it("answers non-HS field questions from selected section text without forcing HS Code", () => {
+    const selected = retrievedFixture({
+      document: "Chapter03.pdf",
+      hsCode: "0301.99.10",
+      title: "BREEDING SAMPLE",
+      section: "0301.99.10 - BREEDING SAMPLE",
+      text: "Appearance: the body is balanced and fins are normal.",
+      score: 80
+    });
+    const result = handleSelectedSectionQa(
+      "Breeding sample cáº§n ngoáº¡i quan tháº¿ nÃ o?",
+      selected,
+      "Breeding sample cáº§n cÃ³ thÃ¢n cÃ¢n Ä‘á»‘i vÃ  vÃ¢y bÃ¬nh thÆ°á»ng.",
+      [candidateFor(selected, { finalScore: 80, matchedTerms: ["breeding", "sample"] })],
+      detectIntent("Breeding sample cáº§n ngoáº¡i quan tháº¿ nÃ o?")
+    );
+
+    expect(result.answerMode).toBe("selected_section_qa");
+    expect(result.answer).toContain("thÃ¢n cÃ¢n Ä‘á»‘i");
+    expect(result.answer).not.toContain("HS Code");
+    expect(result.answer).not.toContain("Sản phẩm là");
+  });
+
+  it("keeps selected-section answers free of debug metadata", () => {
+    const selected = retrievedFixture({
+      document: "Chapter77.pdf",
+      hsCode: "7701.00.00",
+      title: "SAMPLE MATERIAL",
+      section: "7701.00.00 - SAMPLE MATERIAL",
+      text: "Usage: used for demonstration.",
+      score: 80
+    });
+    const result = handleSelectedSectionQa(
+      "Sample material dÃ¹ng Ä‘á»ƒ lÃ m gÃ¬?",
+      selected,
+      "Sample material Ä‘Æ°á»£c dÃ¹ng Ä‘á»ƒ demonstration. Index source: cached tree. PageIndex logs: ok.",
+      [candidateFor(selected, { finalScore: 80, matchedTerms: ["sample", "material"] })],
+      detectIntent("Sample material dÃ¹ng Ä‘á»ƒ lÃ m gÃ¬?")
+    );
+
+    expect(result.answer).toContain("demonstration");
+    expect(result.answer).not.toMatch(/Index source|PageIndex|cache freshness|final score|candidate debug/i);
+  });
+
+  it("answers definition questions through selected section QA with selected HS code metadata", () => {
     const query = "What is Oxen?";
     const selected = retrievedFixture({
       document: "Chapter01.pdf",
@@ -90,33 +153,34 @@ describe("qaIntentRouter", () => {
       section: "0102.29.11 - OXEN",
       text: "Oxen are castrated adult male bovine animals. They are used as draft animals."
     });
-    const result = handleDefinition(query, selected, [], detectIntent(query));
+    const result = handleSelectedSectionQa(query, selected, "Oxen are castrated adult male bovine animals.", [
+      candidateFor(selected, { finalScore: 80, matchedTerms: ["oxen"], candidateMatchedPhrases: ["what oxen"] })
+    ], detectIntent(query));
 
-    expect(result.intent).toBe("definition");
+    expect(result.intent).toBe("selected_section_qa");
     expect(result.selectedPrimary?.hsCode).toBe("0102.29.11");
     expect(result.answer).toContain("Oxen are castrated adult male bovine animals.");
     expect(result.answer).toContain("HS Code: 0102.29.11");
+    expect(result.answer).not.toMatch(/Index source|PageIndex|cache freshness|final score|candidate debug/i);
   });
 
   it("summarizes chapter 2 dynamically without selecting a product section", () => {
-    const query = "tóm tắt chương 2";
+    const query = "chapter 2 summary";
     const result = handleChapterSummary(query, sections, documents, detectIntent(query));
 
     expect(result.intent).toBe("chapter_summary");
     expect(result.documentSummary?.document).toBe("Chapter02.pdf");
     expect(result.selectedPrimary).toBeNull();
     expect(result.citations).toEqual([]);
-    expect(result.answer).toContain("Chapter 2 nói về các nội dung chính:");
+    expect(result.answer).toContain("Chapter 2 gồm các nội dung chính:");
     expect(result.answer).toContain("0207.14.10");
   });
 
-  it("routes natural Vietnamese chapter-about phrasing to chapter_summary", () => {
+  it("routes structurally clear chapter summary phrasing to chapter_summary", () => {
     const queries = [
-      "chapter 10 nói về cái j",
-      "chương 10 nói về gì",
-      "chapter 10 có nội dung gì",
-      "chapter 10 gồm những gì",
-      "chapter 10 về gì"
+      "chapter 10 contents",
+      "chapter 10 summary",
+      "chapter 10 about"
     ];
 
     for (const query of queries) {
@@ -128,7 +192,7 @@ describe("qaIntentRouter", () => {
       expect(result.intent).toBe("chapter_summary");
       expect(result.selectedPrimary).toBeNull();
       expect(result.documentSummary?.document).toBe("Tariff_chapter-10.pdf");
-      expect(result.answer).toContain("Chapter 10 nói về các nội dung chính:");
+      expect(result.answer).toContain("Chapter 10 gồm các nội dung chính:");
       expect(result.answer).not.toContain("Sản phẩm là");
     }
   });
@@ -143,7 +207,7 @@ describe("qaIntentRouter", () => {
   });
 
   it("summarizes reference documents from manifest metadata", () => {
-    const query = "document Introduction có gì";
+    const query = "document Introduction summary";
     const result = handleDocumentSummary(query, sections, documents, detectIntent(query));
 
     expect(result.intent).toBe("document_summary");
@@ -154,7 +218,7 @@ describe("qaIntentRouter", () => {
 
   it("does not carry product selection into a following chapter summary", () => {
     const product = handleProductClassification(
-      "What is Oxen?",
+      "Oxen HS Code classification",
       retrievedFixture({
         document: "Chapter01.pdf",
         hsCode: "0102.29.11",
@@ -164,10 +228,10 @@ describe("qaIntentRouter", () => {
       }),
       [],
       undefined,
-      [],
-      detectIntent("What is Oxen?")
+      [candidateFor(retrievedFixture({ hsCode: "0102.29.11", title: "OXEN", section: "0102.29.11 - OXEN", text: "Oxen are castrated adult male bovine animals.", document: "Chapter01.pdf", score: 80 }), { finalScore: 80, matchedTerms: ["oxen"], candidateMatchedPhrases: ["oxen"] })],
+      detectIntent("Oxen HS Code?")
     );
-    const summary = handleChapterSummary("tóm tắt chương 2", sections, documents, detectIntent("tóm tắt chương 2"));
+    const summary = handleChapterSummary("chapter 2 summary", sections, documents, detectIntent("chapter 2 summary"));
 
     expect(product.selectedPrimary?.hsCode).toBe("0102.29.11");
     expect(summary.selectedPrimary).toBeNull();
@@ -206,7 +270,7 @@ describe("qaIntentRouter", () => {
 
     expect(result.answerMode).toBe("numeric_lookup");
     expect(result.answerConfidence).toBe("low");
-    expect(result.answer).not.toContain("Sáº£n pháº©m lÃ ");
+    expect(result.answer).not.toContain("Sản phẩm là");
   });
 
   it("allows rich product queries with score and multiple strong signals to classify", () => {
@@ -246,7 +310,7 @@ describe("qaIntentRouter", () => {
     })], detectIntent("resinous fragrant product"));
 
     expect(result.answerMode).not.toBe("classification");
-    expect(result.answer).not.toContain("Sáº£n pháº©m lÃ ");
+    expect(result.answer).not.toContain("Sản phẩm là");
   });
 
   it("does not classify medium score without strong signals", () => {
@@ -312,7 +376,7 @@ describe("qaIntentRouter", () => {
 
     expect(result.answerMode).toBe("exact_hscode_lookup");
     expect(result.answerConfidence).toBe("high");
-    expect(result.answer).toContain("HS Code 0102.29.11");
+    expect(result.answer).toContain("HS Code: 0102.29.11");
   });
 
   it("keeps chapter summary deterministic without product selectedPrimary", () => {
@@ -320,10 +384,10 @@ describe("qaIntentRouter", () => {
 
     expect(result.answerMode).toBe("chapter_summary");
     expect(result.selectedPrimary).toBeNull();
-    expect(result.answer).not.toContain("Sáº£n pháº©m lÃ ");
+    expect(result.answer).not.toContain("Sản phẩm là");
   });
 
-  it("definition asks clarification when candidate relevance is rejected", () => {
+  it("selected section QA asks clarification when candidate relevance is rejected", () => {
     const selected = retrievedFixture({
       document: "Chapter01.pdf",
       hsCode: "0102.29.11",
@@ -332,7 +396,7 @@ describe("qaIntentRouter", () => {
       text: "Oxen are castrated adult male bovine animals.",
       score: 1
     });
-    const result = handleDefinition("What is it?", selected, [candidateFor(selected, {
+    const result = handleSelectedSectionQa("What is it?", selected, undefined, [candidateFor(selected, {
       finalScore: 1,
       rejected: true,
       rejectedReason: "candidate has low generic token, phrase, and numeric overlap with query"
@@ -340,6 +404,37 @@ describe("qaIntentRouter", () => {
 
     expect(result.answerMode).toBe("clarification");
     expect(result.answer).toContain("Chưa đủ thông tin");
+  });
+
+  it("answers Vietnamese section attribute questions from LLM text without forcing HS Code", () => {
+    const selected = retrievedFixture({
+      document: "Chapter03.pdf",
+      hsCode: "0301.99.10",
+      title: "BREEDING FISH",
+      section: "0301.99.10 - BREEDING FISH",
+      text: [
+        "General requirements on appearance:",
+        "The fish body is balanced, without deformities, fins are complete and normal, and there are no visible wounds.",
+        "Uniform size, no signs of disease, and certified as suitable for breeding."
+      ].join("\n"),
+      score: 60
+    });
+    const result = handleSelectedSectionQa(
+      "Breeding fish cáº§n Ä‘Ã¡p á»©ng yÃªu cáº§u ngoáº¡i quan nÃ o?",
+      selected,
+      "Breeding fish cáº§n cÃ³ thÃ¢n cÃ¢n Ä‘á»‘i, khÃ´ng dá»‹ táº­t, vÃ¢y Ä‘áº§y Ä‘á»§ vÃ  bÃ¬nh thÆ°á»ng, khÃ´ng cÃ³ váº¿t thÆ°Æ¡ng nhÃ¬n tháº¥y, kÃ­ch thÆ°á»›c Ä‘á»“ng Ä‘á»u vÃ  khÃ´ng cÃ³ dáº¥u hiá»‡u bá»‡nh.",
+      [candidateFor(selected, { finalScore: 80, matchedTerms: ["breeding", "fish"], candidateMatchedPhrases: ["breeding fish"] })],
+      detectIntent("Breeding fish cáº§n Ä‘Ã¡p á»©ng yÃªu cáº§u ngoáº¡i quan nÃ o?")
+    );
+
+    expect(result.intent).toBe("selected_section_qa");
+    expect(result.answerMode).toBe("selected_section_qa");
+    expect(result.answer).toContain("Breeding fish cáº§n cÃ³ thÃ¢n cÃ¢n Ä‘á»‘i");
+    expect(result.answer).toContain("khÃ´ng dá»‹ táº­t");
+    expect(result.answer).toContain("vÃ¢y");
+    expect(result.answer).toContain("dáº¥u hiá»‡u");
+    expect(result.answer).not.toContain("HS Code");
+    expect(result.answer).not.toContain("Sản phẩm là");
   });
 });
 
