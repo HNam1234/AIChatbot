@@ -13,6 +13,11 @@ export interface AppConfig {
   pageIndexPollMaxAttempts: number;
   uiPipelineTimeoutMs: number;
   port: number;
+  host: string;
+  maxConcurrentJobs: number;
+  tmpRetentionHours: number;
+  tmpCleanupOnStart: boolean;
+  allowLocalSecretWrite: boolean;
 }
 
 export type GeminiKeySlotName = "GEMINI_KEY_1" | "GEMINI_KEY_2" | "GEMINI_KEY_3";
@@ -33,6 +38,9 @@ const DEFAULT_PAGEINDEX_POLL_INTERVAL_MS = 5000;
 const DEFAULT_PAGEINDEX_POLL_MAX_ATTEMPTS = 60;
 const DEFAULT_UI_PIPELINE_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_PORT = 3000;
+const DEFAULT_HOST = "127.0.0.1";
+const DEFAULT_MAX_CONCURRENT_JOBS = 1;
+const DEFAULT_TMP_RETENTION_HOURS = 24;
 const GEMINI_KEY_SLOTS: Array<{ name: GeminiKeySlotName; enabledName: GeminiKeySlotEnabledName }> = [
   { name: "GEMINI_KEY_1", enabledName: "GEMINI_KEY_1_ENABLED" },
   { name: "GEMINI_KEY_2", enabledName: "GEMINI_KEY_2_ENABLED" },
@@ -54,8 +62,28 @@ export function loadEnvConfig(): AppConfig {
       DEFAULT_PAGEINDEX_POLL_MAX_ATTEMPTS
     ),
     uiPipelineTimeoutMs: readPositiveInteger(process.env.UI_PIPELINE_TIMEOUT_MS, DEFAULT_UI_PIPELINE_TIMEOUT_MS),
-    port: readPositiveInteger(process.env.PORT, DEFAULT_PORT)
+    port: readPositiveInteger(process.env.PORT, DEFAULT_PORT),
+    host: nonEmpty(process.env.HOST) ?? DEFAULT_HOST,
+    maxConcurrentJobs: readPositiveInteger(process.env.MAX_CONCURRENT_JOBS, DEFAULT_MAX_CONCURRENT_JOBS),
+    tmpRetentionHours: readPositiveInteger(process.env.TMP_RETENTION_HOURS, DEFAULT_TMP_RETENTION_HOURS),
+    tmpCleanupOnStart: readBoolean(process.env.TMP_CLEANUP_ON_START, true),
+    allowLocalSecretWrite: readBoolean(process.env.ALLOW_LOCAL_SECRET_WRITE, false)
   };
+}
+
+export function isLocalhostHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1" || normalized === "[::1]";
+}
+
+export function canWriteSecretsFromUi(config: Pick<AppConfig, "host" | "allowLocalSecretWrite"> = loadEnvConfig()): boolean {
+  return isLocalhostHost(config.host) || config.allowLocalSecretWrite;
+}
+
+export function localhostExposureWarning(host: string): string | undefined {
+  return isLocalhostHost(host)
+    ? undefined
+    : "Warning: server is not bound to localhost. Do not expose this local demo without auth.";
 }
 
 export function maskSecret(value: string | undefined): string | null {
@@ -81,6 +109,8 @@ export function getApiSettingsStatus(): {
   pageIndexBaseUrl: string;
   pollIntervalMs: number;
   pollMaxAttempts: number;
+  host: string;
+  localDemoSecretWriteEnabled: boolean;
 } {
   const config = loadEnvConfig();
   const geminiKeySlots = GEMINI_KEY_SLOTS.map((slot) => {
@@ -106,7 +136,9 @@ export function getApiSettingsStatus(): {
     enabledGeminiKeyCount: geminiKeySlots.filter((slot) => slot.configured && slot.enabled).length,
     pageIndexBaseUrl: config.pageIndexBaseUrl,
     pollIntervalMs: config.pageIndexPollIntervalMs,
-    pollMaxAttempts: config.pageIndexPollMaxAttempts
+    pollMaxAttempts: config.pageIndexPollMaxAttempts,
+    host: config.host,
+    localDemoSecretWriteEnabled: canWriteSecretsFromUi(config)
   };
 }
 
@@ -232,6 +264,16 @@ function isEnabled(value: string | undefined): boolean {
 function readPositiveInteger(value: string | undefined, fallback: number): number {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function readBoolean(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined) {
+    return fallback;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1", "on", "yes"].includes(normalized)) return true;
+  if (["false", "0", "off", "no"].includes(normalized)) return false;
+  return fallback;
 }
 
 function upsertEnvValue(envText: string, key: string, value: string): string {

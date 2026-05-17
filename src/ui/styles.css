@@ -1033,6 +1033,35 @@ button.compact {
   background: rgba(180, 35, 24, 0.1);
 }
 
+.mapping-text-span {
+  position: absolute;
+  min-height: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: #7a4b00;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1;
+  overflow: hidden;
+  pointer-events: auto;
+}
+
+.mapping-text-span.visible {
+  border-color: rgba(122, 75, 0, 0.24);
+  background: rgba(255, 214, 102, 0.08);
+}
+
+.mapping-text-span:hover,
+.mapping-text-span.preview,
+.mapping-text-span.selected {
+  z-index: 30;
+  border-color: #b7791f;
+  background: rgba(255, 214, 102, 0.28);
+  box-shadow: 0 0 0 2px rgba(183, 121, 31, 0.18);
+}
+
 .mapping-message {
   font-size: 12px;
 }
@@ -1055,7 +1084,9 @@ button.compact {
 }
 
 .mapping-block,
-.mapping-section {
+.mapping-section,
+.mapping-unit,
+.mapping-markdown-unit {
   display: grid;
   gap: 6px;
   border: 1px solid var(--line);
@@ -1067,8 +1098,13 @@ button.compact {
 
 .mapping-block:hover,
 .mapping-section:hover,
+.mapping-unit:hover,
+.mapping-markdown-unit:hover,
 .mapping-block.selected,
-.mapping-section.selected {
+.mapping-section.selected,
+.mapping-unit.selected,
+.mapping-unit.preview,
+.mapping-markdown-unit.selected {
   border-color: #9ccfc7;
   background: #f0faf7;
 }
@@ -1090,14 +1126,17 @@ button.compact {
 
 .mapping-block-head span,
 .mapping-block small,
-.mapping-section small {
+.mapping-section small,
+.mapping-unit small {
   color: var(--muted);
   font-size: 11px;
   font-weight: 800;
 }
 
 .mapping-block p,
-.mapping-section p {
+.mapping-section p,
+.mapping-unit p,
+.mapping-markdown-unit p {
   margin: 0;
   max-width: none;
   color: var(--text);

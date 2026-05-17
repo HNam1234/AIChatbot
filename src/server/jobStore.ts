@@ -57,6 +57,10 @@ export class JobStore {
     return job;
   }
 
+  public static activeCount(): number {
+    return [...jobs.values()].filter((job) => job.status === "queued" || job.status === "running").length;
+  }
+
   public static get(id: string): PipelineJob | undefined {
     return jobs.get(id);
   }

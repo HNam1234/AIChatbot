@@ -12,6 +12,8 @@
     "parse:batch": "tsx src/mainFlow.ts --batch",
     "chat": "tsx src/mainFlow.ts --mode chat",
     "agent": "tsx src/mainFlow.ts --mode agent",
+    "eval:qa": "tsx src/cli/qaEvalRunner.ts",
+    "clean:tmp": "tsx src/cli/cleanTmp.ts",
     "dev": "tsx src/server/server.ts",
     "dev:watch": "tsx watch src/server/server.ts"
   },

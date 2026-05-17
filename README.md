@@ -101,10 +101,14 @@ GEMINI_KEY_3=your_third_gemini_key
 GEMINI_KEY_3_ENABLED=true
 
 PORT=3000
+HOST=127.0.0.1
+MAX_CONCURRENT_JOBS=1
+TMP_RETENTION_HOURS=24
+TMP_CLEANUP_ON_START=true
 UI_PIPELINE_TIMEOUT_MS=600000
 ```
 
-UI cũng có panel API Settings để lưu PageIndex key và bật/tắt từng Gemini key slot. Raw key không được trả về frontend, không log ra terminal.
+UI cũng có panel API Settings để lưu PageIndex key và bật/tắt từng Gemini key slot. Đây là local demo only: API keys được lưu trong `.env` cục bộ, không expose server này public. Raw key không được trả về frontend, không log ra terminal.
 
 ## Lệnh Build Và Kiểm Tra
 
@@ -112,6 +116,7 @@ UI cũng có panel API Settings để lưu PageIndex key và bật/tắt từng 
 npm run typecheck
 npm test
 npm run build
+npm run clean:tmp
 ```
 
 ## Chạy Parser Một PDF
@@ -163,14 +168,16 @@ npm run dev
 Mở:
 
 ```text
-http://localhost:3000
+http://127.0.0.1:3000
 ```
 
 `npm run dev` chạy server ổn định, phù hợp upload PDF lớn. `npm run dev:watch` chỉ nên dùng khi đang sửa code và không upload file lớn.
 
+Local demo mặc định chỉ bind `127.0.0.1`. Nếu set `HOST=0.0.0.0`, không expose server này public khi chưa có auth.
+
 ## UI Workflow
 
-1. Mở `http://localhost:3000`.
+1. Mở `http://127.0.0.1:3000`.
 2. Cấu hình PageIndex/Gemini keys nếu cần.
 3. Upload một hoặc nhiều PDF.
 4. Chọn OCR language, Docling threads, export assets, upload PageIndex.

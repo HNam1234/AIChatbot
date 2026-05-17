@@ -1,0 +1,90 @@
+[
+  {
+    "id": "exact-code-001",
+    "question": "Tra cứu HS Code 0102.29.11",
+    "expectedIntent": "exact_hscode_lookup",
+    "mustContainAll": ["0102.29.11"],
+    "mustContainAny": ["Oxen", "OXEN"],
+    "mustNotContain": ["Retrieval:", "PageIndex:", "Primary citation"],
+    "expectedHsCodes": ["0102.29.11"],
+    "expectedDocument": "Chapter01.pdf",
+    "expectedTitleContains": "OXEN"
+  },
+  {
+    "id": "coffee-attribute-001",
+    "question": "Which coffee is more bitter than Arabica and has higher caffeine?",
+    "expectedIntent": "product_classification",
+    "mustContainAll": ["HS Code"],
+    "mustContainAny": ["0901.11.30", "0901.21.12"],
+    "mustNotContain": ["Nguồn:", "Related citation", "Retrieval:"],
+    "expectedHsCodes": [],
+    "expectedDocument": "Chapter09.pdf",
+    "expectedTitleContains": "ROBUSTA"
+  },
+  {
+    "id": "definition-001",
+    "question": "What is Oxen?",
+    "expectedIntent": "definition",
+    "mustContainAll": ["HS Code", "0102.29.11"],
+    "mustContainAny": ["castrated", "bovine"],
+    "mustNotContain": ["Nguồn:", "Primary citation"],
+    "expectedHsCodes": ["0102.29.11"],
+    "expectedDocument": "Chapter01.pdf",
+    "expectedTitleContains": "OXEN"
+  },
+  {
+    "id": "chapter-summary-001",
+    "question": "chapter 10 nói về cái j",
+    "expectedIntent": "chapter_summary",
+    "mustContainAll": ["Chapter 10"],
+    "mustContainAny": ["Wheat", "WHEAT"],
+    "mustNotContain": ["Sản phẩm là", "Primary citation"],
+    "expectedHsCodes": [],
+    "expectedDocument": "Chapter10.pdf",
+    "expectedTitleContains": null
+  },
+  {
+    "id": "document-summary-001",
+    "question": "document Introduction có gì",
+    "expectedIntent": "document_summary",
+    "mustContainAll": ["Introduction.pdf"],
+    "mustContainAny": ["tham chiếu", "giới thiệu", "reference"],
+    "mustNotContain": ["Sản phẩm là", "Primary citation"],
+    "expectedHsCodes": [],
+    "expectedDocument": "Introduction.pdf",
+    "expectedTitleContains": null
+  },
+  {
+    "id": "grouped-code-001",
+    "question": "Mechanically deboned or separated meat là gì?",
+    "expectedIntent": "definition",
+    "mustContainAll": ["0207.14.91", "0207.27.91"],
+    "mustContainAny": ["tùy trạng thái", "biểu mã"],
+    "mustNotContain": ["Nguồn:", "Related citation"],
+    "expectedHsCodes": ["0207.14.91", "0207.27.91"],
+    "expectedDocument": "Chapter02.pdf",
+    "expectedTitleContains": "MECHANICALLY"
+  },
+  {
+    "id": "weak-match-001",
+    "question": "2",
+    "expectedIntent": "product_classification",
+    "mustContainAll": ["Không tìm thấy"],
+    "mustContainAny": [],
+    "mustNotContain": ["Sản phẩm là", "HS Code:"],
+    "expectedHsCodes": [],
+    "expectedDocument": null,
+    "expectedTitleContains": null
+  },
+  {
+    "id": "state-isolation-001",
+    "question": "chương 10 nói về gì",
+    "expectedIntent": "chapter_summary",
+    "mustContainAll": ["Chapter 10"],
+    "mustContainAny": ["Wheat", "WHEAT"],
+    "mustNotContain": ["Sản phẩm là Oxen", "Primary citation"],
+    "expectedHsCodes": [],
+    "expectedDocument": "Chapter10.pdf",
+    "expectedTitleContains": null
+  }
+]

@@ -187,6 +187,160 @@ describe("qaIntentRouter", () => {
     expect(relevance.rejected).toBe(true);
     expect(relevance.rejectedReason).toContain("weak generic");
   });
+
+  it("routes numeric-only product query to numeric lookup instead of classification", () => {
+    const query = "0.8";
+    const selected = retrievedFixture({
+      document: "Chapter09.pdf",
+      hsCode: "0901.11.30",
+      title: "ROBUSTA COFFEE",
+      section: "0901.11.30 - ROBUSTA COFFEE",
+      text: "Robusta coffee has acidity 0.8% and strong taste.",
+      score: 55
+    });
+    const result = handleProductClassification(query, selected, [], undefined, [candidateFor(selected, {
+      finalScore: 55,
+      numericMatches: ["0.8"],
+      matchedTerms: ["0.8"]
+    })], detectIntent(query));
+
+    expect(result.answerMode).toBe("numeric_lookup");
+    expect(result.answerConfidence).toBe("low");
+    expect(result.answer).not.toContain("Sáº£n pháº©m lÃ ");
+  });
+
+  it("allows rich product queries with score and multiple strong signals to classify", () => {
+    const query = "Bitter Robusta coffee beans with caffeine more than 2% and raw beans form";
+    const selected = retrievedFixture({
+      document: "Chapter09.pdf",
+      hsCode: "0901.11.30",
+      title: "ROBUSTA COFFEE",
+      section: "0901.11.30 - ROBUSTA COFFEE",
+      text: "Robusta coffee beans have bitter taste, caffeine more than 2%, and raw beans form.",
+      score: 72
+    });
+    const result = handleProductClassification(query, selected, [], undefined, [candidateFor(selected, {
+      finalScore: 72,
+      matchedTerms: ["robusta", "coffee", "bitter", "caffeine", "beans"],
+      candidateMatchedPhrases: ["robusta coffee", "raw beans"],
+      numericMatches: ["more than 2%"]
+    })], detectIntent(query));
+
+    expect(result.answerMode).toBe("classification");
+    expect(result.answerConfidence).toBe("high");
+    expect((result.debug.strongSignals ?? []).length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("does not classify when final score is below 20", () => {
+    const selected = retrievedFixture({
+      document: "Chapter12.pdf",
+      hsCode: "1211.90.95",
+      title: "AGARWOOD CHIPS",
+      section: "1211.90.95 - AGARWOOD CHIPS",
+      text: "Agarwood chips are resinous wood pieces.",
+      score: 19
+    });
+    const result = handleProductClassification("resinous fragrant product", selected, [], undefined, [candidateFor(selected, {
+      finalScore: 19,
+      matchedTerms: ["resinous"]
+    })], detectIntent("resinous fragrant product"));
+
+    expect(result.answerMode).not.toBe("classification");
+    expect(result.answer).not.toContain("Sáº£n pháº©m lÃ ");
+  });
+
+  it("does not classify medium score without strong signals", () => {
+    const selected = retrievedFixture({
+      document: "Chapter10.pdf",
+      hsCode: "1001.99.10",
+      title: "WHEAT",
+      section: "1001.99.10 - WHEAT",
+      text: "Wheat and meslin.",
+      score: 45
+    });
+    const result = handleProductClassification("grain goods", selected, [], undefined, [candidateFor(selected, {
+      finalScore: 45,
+      matchedTerms: ["grain"]
+    })], detectIntent("grain goods"));
+
+    expect(["lookup", "clarification"]).toContain(result.answerMode);
+    expect(result.answerMode).not.toBe("classification");
+  });
+
+  it("allows medium score with strong title and phrase signals", () => {
+    const selected = retrievedFixture({
+      document: "Chapter02.pdf",
+      hsCode: "0207.14.10",
+      title: "MECHANICALLY DEBONED MEAT",
+      section: "0207.14.10 - MECHANICALLY DEBONED MEAT",
+      text: "Mechanically deboned meat is meat paste separated by mechanical process.",
+      score: 55
+    });
+    const result = handleProductClassification("mechanically deboned meat paste", selected, [], undefined, [candidateFor(selected, {
+      finalScore: 55,
+      matchedTerms: ["mechanically", "deboned", "meat", "paste"],
+      candidateMatchedPhrases: ["mechanically deboned", "meat paste"]
+    })], detectIntent("mechanically deboned meat paste"));
+
+    expect(result.answerMode).toBe("classification");
+    expect(result.answerConfidence).toBe("medium");
+  });
+
+  it("does not classify contrast-only candidates", () => {
+    const selected = retrievedFixture({
+      document: "Chapter09.pdf",
+      hsCode: "0901.21.12",
+      title: "ARABICA COFFEE",
+      section: "0901.21.12 - ARABICA COFFEE",
+      text: "Arabica coffee has mild aroma.",
+      score: 60
+    });
+    const result = handleProductClassification("more bitter than Arabica", selected, [], undefined, [candidateFor(selected, {
+      finalScore: 60,
+      contrastTermOnlyMatch: true,
+      contrastTerms: ["arabica"],
+      rejected: true,
+      rejectedReason: "candidate only matches contrast baseline terms"
+    })], detectIntent("more bitter than Arabica"));
+
+    expect(result.answerMode).not.toBe("classification");
+    expect(result.debug.contradictions ?? []).toContain("contrast_term_only_match");
+  });
+
+  it("keeps exact HS code lookup deterministic even without relevance score", () => {
+    const result = handleExactHsCodeLookup("0102.29.11", sections, detectIntent("0102.29.11"));
+
+    expect(result.answerMode).toBe("exact_hscode_lookup");
+    expect(result.answerConfidence).toBe("high");
+    expect(result.answer).toContain("HS Code 0102.29.11");
+  });
+
+  it("keeps chapter summary deterministic without product selectedPrimary", () => {
+    const result = handleChapterSummary("chapter 2 noi dung", sections, documents, detectIntent("chapter 2 noi dung"));
+
+    expect(result.answerMode).toBe("chapter_summary");
+    expect(result.selectedPrimary).toBeNull();
+    expect(result.answer).not.toContain("Sáº£n pháº©m lÃ ");
+  });
+
+  it("definition asks clarification when candidate relevance is rejected", () => {
+    const selected = retrievedFixture({
+      document: "Chapter01.pdf",
+      hsCode: "0102.29.11",
+      title: "OXEN",
+      section: "0102.29.11 - OXEN",
+      text: "Oxen are castrated adult male bovine animals.",
+      score: 1
+    });
+    const result = handleDefinition("What is it?", selected, [candidateFor(selected, {
+      finalScore: 1,
+      rejected: true,
+      rejectedReason: "candidate has low generic token, phrase, and numeric overlap with query"
+    })], detectIntent("What is it?"));
+
+    expect(result.answerMode).toBe("clarification");
+    expect(result.answer).toContain("Chưa đủ thông tin");
+  });
 });
 
 function retrievedFixture(overrides: Partial<EnrichedRetrievedSection>): EnrichedRetrievedSection {
@@ -196,6 +350,35 @@ function retrievedFixture(overrides: Partial<EnrichedRetrievedSection>): Enriche
     captions: [],
     score: 1,
     metadataWarnings: [],
+    ...overrides
+  };
+}
+
+function candidateFor(section: EnrichedRetrievedSection, overrides: Partial<ReturnType<typeof evaluateCandidateRelevance>>): ReturnType<typeof evaluateCandidateRelevance> {
+  return {
+    document: section.document,
+    hsCode: section.hsCode,
+    groupedHsCodes: section.groupedHsCodes ?? [],
+    title: section.title,
+    section: section.section,
+    source: section.source,
+    pageStart: section.pageStart ?? null,
+    pageEnd: section.pageEnd ?? null,
+    matchedTerms: [],
+    matchedNumericRanges: [],
+    matchedAttributes: [],
+    missingImportantTerms: [],
+    contrastTermOnlyMatch: false,
+    relevanceScore: section.score,
+    queryTokens: [],
+    queryPhrases: [],
+    candidateMatchedTokens: [],
+    candidateMatchedPhrases: [],
+    numericMatches: [],
+    contrastTerms: [],
+    finalScore: section.score,
+    rejected: false,
+    rejectedReason: null,
     ...overrides
   };
 }

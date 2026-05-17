@@ -5,6 +5,7 @@ import {
   evaluateCandidateRelevance,
   extractQuerySignals,
   formatCitation,
+  propagateGroupedSectionPageRanges,
   rankSectionsForQuestion,
   renderHsCodeAnswer,
   selectAlternativeSections,
@@ -499,6 +500,62 @@ describe("qaAnswerFormatter", () => {
     expect(result.answer).toContain("HS Code: 1211.90.95");
     expect(result.answer).not.toContain("9999.99.99");
     expect(result.answerRepairApplied).toBe(true);
+  });
+
+  it("rejects candidates that only match generic chapter summary tokens", () => {
+    const candidate = sectionFixture({
+      document: "Chapter10.pdf",
+      hsCode: "1001.99.11",
+      title: "WHEAT",
+      section: "1001.99.11 - WHEAT",
+      text: "Chapter 10 content summary."
+    });
+
+    const relevance = evaluateCandidateRelevance(candidate, "chapter 10 nội dung");
+
+    expect(relevance.rejected).toBe(true);
+    expect(relevance.rejectedReason).toContain("weak generic");
+  });
+
+  it("keeps exact HS code evidence strong even when token overlap is otherwise weak", () => {
+    const candidate = sectionFixture({
+      document: "Chapter10.pdf",
+      hsCode: "1001.99.11",
+      title: "WHEAT",
+      section: "1001.99.11 - WHEAT",
+      text: "Wheat and meslin."
+    });
+
+    const relevance = evaluateCandidateRelevance(candidate, "1001.99.11");
+
+    expect(relevance.rejected).toBe(false);
+    expect(relevance.matchedTerms).toContain("1001.99.11");
+  });
+
+  it("propagates page range across grouped section metadata", () => {
+    const grouped: SectionMetadata[] = [
+      {
+        document: "Chapter02.pdf",
+        hsCode: "0207.14.91",
+        groupedHsCodes: ["0207.14.91", "0207.27.91"],
+        title: "MECHANICALLY DEBONED OR SEPARATED MEAT",
+        section: "0207.14.91 - MECHANICALLY DEBONED OR SEPARATED MEAT",
+        pageStart: 4,
+        pageEnd: 5
+      },
+      {
+        document: "Chapter02.pdf",
+        hsCode: "0207.27.91",
+        groupedHsCodes: ["0207.14.91", "0207.27.91"],
+        title: "MECHANICALLY DEBONED OR SEPARATED MEAT",
+        section: "0207.27.91 - MECHANICALLY DEBONED OR SEPARATED MEAT"
+      }
+    ];
+
+    const propagated = propagateGroupedSectionPageRanges(grouped);
+
+    expect(propagated[1]?.pageStart).toBe(4);
+    expect(propagated[1]?.pageEnd).toBe(5);
   });
 });
 

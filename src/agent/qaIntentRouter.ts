@@ -1,6 +1,7 @@
 import {
   HS_CODE_PATTERN,
   buildStructuredAnswer,
+  evaluateCandidateRelevance,
   hsCodesForSection,
   renderHsCodeAnswer,
   type CandidateRelevance,
@@ -15,6 +16,29 @@ export type QaIntent =
   | "definition"
   | "chapter_summary"
   | "document_summary";
+
+export type AnswerMode =
+  | "classification"
+  | "lookup"
+  | "numeric_lookup"
+  | "ambiguous_lookup"
+  | "clarification"
+  | "exact_hscode_lookup"
+  | "chapter_summary"
+  | "document_summary"
+  | "definition";
+
+export type AnswerConfidence = "high" | "medium" | "low";
+
+export interface GateResult {
+  answerMode: AnswerMode;
+  answerConfidence: AnswerConfidence;
+  confidenceReason: string;
+  finalScore: number;
+  strongSignals: string[];
+  contradictions: string[];
+  shouldAskClarification: boolean;
+}
 
 export interface IntentDetection {
   intent: QaIntent;
@@ -42,6 +66,13 @@ export interface QaDebugInfo {
   detectedIntent: QaIntent;
   intentConfidence: number;
   intentReason: string;
+  answerMode?: AnswerMode;
+  answerConfidence?: AnswerConfidence;
+  confidenceReason?: string;
+  finalScore?: number;
+  strongSignals?: string[];
+  contradictions?: string[];
+  rejectedReason?: string | null;
   resolvedDocument?: QaDocumentMetadata | null;
   selectedPrimary?: Record<string, unknown> | null;
   candidateRejectionReasons: Array<Record<string, unknown>>;
@@ -52,6 +83,8 @@ export interface QaDebugInfo {
 
 export interface RoutedQaAnswer {
   intent: QaIntent;
+  answerMode: AnswerMode;
+  answerConfidence: AnswerConfidence;
   answer: string;
   selectedPrimary: Record<string, unknown> | null;
   documentSummary: Record<string, unknown> | null;
@@ -72,7 +105,9 @@ export function detectIntent(query: string): IntentDetection {
     };
   }
 
-  const chapterNumber = extractChapterSummaryNumber(normalized);
+  const chapterNumber = hasChapterMarker(normalized) && hasSummaryVerb(normalized)
+    ? extractChapterNumber(normalized)
+    : undefined;
   if (chapterNumber !== undefined) {
     return {
       intent: "chapter_summary",
@@ -124,16 +159,28 @@ export function handleExactHsCodeLookup(
     ? `Sản phẩm là ${normalizeProductTitle(title)}, HS Code: ${exactCode}.`
     : `Không tìm thấy HS Code ${exactCode} trong metadata hiện có.`;
 
+  const gate = deterministicGate(
+    "exact_hscode_lookup",
+    selected ? "high" : "low",
+    selected ? 100 : 0,
+    selected ? ["exact_hscode_match"] : [],
+    selected ? "exact HS code exists in selected metadata" : "exact HS code not found in selected metadata"
+  );
+  const finalAnswer = selected ? `HS Code ${exactCode} là ${normalizeProductTitle(title)}.` : answer;
+
   return {
     intent: "exact_hscode_lookup",
-    answer,
+    answerMode: gate.answerMode,
+    answerConfidence: gate.answerConfidence,
+    answer: finalAnswer,
     selectedPrimary,
     documentSummary: null,
     citations: selectedPrimary ? [selectedPrimary] : [],
     debug: buildDebug(baseDebug, detection, {
       selectedPrimary,
       candidateRejectionReasons: [],
-      exactHsCode: exactCode
+      exactHsCode: exactCode,
+      ...debugGateFields(gate)
     })
   };
 }
@@ -145,7 +192,7 @@ export function handleChapterSummary(
   detection: IntentDetection = detectIntent(query),
   baseDebug: Partial<QaDebugInfo> = {}
 ): RoutedQaAnswer {
-  const chapterNumber = detection.chapterNumber ?? extractChapterSummaryNumber(normalizeForIntent(query));
+  const chapterNumber = detection.chapterNumber ?? extractChapterNumber(normalizeForIntent(query));
   const resolved = chapterNumber === undefined ? null : resolveChapterDocument(chapterNumber, sections, documents);
   const chapterSections = resolved
     ? sections.filter((section) => section.document === resolved.document)
@@ -166,6 +213,8 @@ export function handleChapterSummary(
 
   return {
     intent: "chapter_summary",
+    answerMode: "chapter_summary",
+    answerConfidence: items.length > 0 ? "high" : "low",
     answer: formatChapterSummaryAnswer(chapterNumber, items, answer),
     selectedPrimary: null,
     documentSummary,
@@ -173,7 +222,14 @@ export function handleChapterSummary(
     debug: buildDebug(baseDebug, detection, {
       resolvedDocument: resolved,
       selectedPrimary: null,
-      candidateRejectionReasons: []
+      candidateRejectionReasons: [],
+      ...debugGateFields(deterministicGate(
+        "chapter_summary",
+        items.length > 0 ? "high" : "low",
+        items.length > 0 ? 100 : 0,
+        resolved ? ["chapter_match"] : [],
+        resolved ? "chapter metadata resolved deterministically" : "chapter metadata not found"
+      ))
     })
   };
 }
@@ -215,6 +271,8 @@ export function handleDocumentSummary(
 
   return {
     intent: "document_summary",
+    answerMode: "document_summary",
+    answerConfidence: resolved ? "high" : "low",
     answer,
     selectedPrimary: null,
     documentSummary,
@@ -222,7 +280,14 @@ export function handleDocumentSummary(
     debug: buildDebug(baseDebug, detection, {
       resolvedDocument: resolved,
       selectedPrimary: null,
-      candidateRejectionReasons: []
+      candidateRejectionReasons: [],
+      ...debugGateFields(deterministicGate(
+        "document_summary",
+        resolved ? "high" : "low",
+        resolved ? 100 : 0,
+        resolved ? ["document_match"] : [],
+        resolved ? "document metadata resolved deterministically" : "document metadata not found"
+      ))
     })
   };
 }
@@ -235,10 +300,22 @@ export function handleDefinition(
   baseDebug: Partial<QaDebugInfo> = {}
 ): RoutedQaAnswer {
   if (!selectedSection) {
-    return emptyIntentAnswer("definition", "Không tìm thấy định nghĩa phù hợp trong metadata hiện có.", detection, candidates, baseDebug);
+    return emptyIntentAnswer("definition", clarificationAnswer(), detection, candidates, baseDebug, {
+      answerMode: "clarification",
+      answerConfidence: "low",
+      confidenceReason: "no relevant section found for definition",
+      finalScore: 0,
+      strongSignals: [],
+      contradictions: [],
+      shouldAskClarification: true
+    });
+  }
+  const gate = definitionGate(query, selectedSection, candidates);
+  if (gate.shouldAskClarification) {
+    return emptyIntentAnswer("definition", clarificationAnswer(), detection, candidates, baseDebug, gate);
   }
   const rendered = renderHsCodeAnswer(undefined, selectedSection, [], { question: query, answerStyle: "class-eval" });
-  return renderedIntentAnswer("definition", rendered, selectedSection, candidates, detection, baseDebug);
+  return renderedIntentAnswer("definition", rendered, selectedSection, candidates, detection, baseDebug, gate);
 }
 
 export function handleProductClassification(
@@ -251,10 +328,21 @@ export function handleProductClassification(
   baseDebug: Partial<QaDebugInfo> = {}
 ): RoutedQaAnswer {
   if (!selectedSection) {
-    return emptyIntentAnswer("product_classification", "Không tìm thấy ngữ cảnh phù hợp trong metadata hiện có.", detection, candidates, baseDebug);
+    const gate = productGate(query, undefined, candidates);
+    return emptyIntentAnswer("product_classification", gate.answerMode === "numeric_lookup" ? numericLookupAnswer(query) : clarificationAnswer(), detection, candidates, baseDebug, gate);
+  }
+  const gate = productGate(query, selectedSection, candidates);
+  if (gate.answerMode === "numeric_lookup") {
+    return lookupIntentAnswer("product_classification", numericLookupAnswer(query, selectedSection), selectedSection, candidates, detection, baseDebug, gate);
+  }
+  if (gate.answerMode === "ambiguous_lookup" || gate.answerMode === "lookup") {
+    return lookupIntentAnswer("product_classification", ambiguousLookupAnswer(selectedSection), selectedSection, candidates, detection, baseDebug, gate);
+  }
+  if (gate.shouldAskClarification) {
+    return emptyIntentAnswer("product_classification", clarificationAnswer(), detection, candidates, baseDebug, gate);
   }
   const rendered = renderHsCodeAnswer(llmAnswer, selectedSection, alternatives, { question: query, answerStyle: "class-eval" });
-  return renderedIntentAnswer("product_classification", rendered, selectedSection, candidates, detection, baseDebug);
+  return renderedIntentAnswer("product_classification", rendered, selectedSection, candidates, detection, baseDebug, gate);
 }
 
 export function sectionMetadataToRetrieved(section: SectionMetadata, score = 1): EnrichedRetrievedSection {
@@ -281,21 +369,56 @@ function renderedIntentAnswer(
   selectedSection: EnrichedRetrievedSection,
   candidates: CandidateRelevance[],
   detection: IntentDetection,
-  baseDebug: Partial<QaDebugInfo>
+  baseDebug: Partial<QaDebugInfo>,
+  gate: GateResult = deterministicGate(intent === "definition" ? "definition" : "classification", "high", selectedSection.score, [], "legacy deterministic render")
 ): RoutedQaAnswer {
   const selectedPrimary = publicSection(selectedSection);
   return {
     intent,
+    answerMode: gate.answerMode,
+    answerConfidence: gate.answerConfidence,
     answer: rendered.answer,
     selectedPrimary,
     documentSummary: null,
     citations: rendered.citations.map(publicSection),
     debug: buildDebug(baseDebug, detection, {
       selectedPrimary,
+      selectedPrimaryId: sectionIdentity(selectedSection),
       candidateRejectionReasons: candidateRejections(candidates),
       finalHsCodes: rendered.finalHsCodes,
       answerRepairApplied: rendered.answerRepairApplied,
-      structuredAnswer: buildStructuredAnswer(selectedSection, undefined)
+      structuredAnswer: buildStructuredAnswer(selectedSection, undefined),
+      rejectedReason: selectedCandidate(candidates, selectedSection)?.rejectedReason ?? null,
+      ...debugGateFields(gate)
+    })
+  };
+}
+
+function lookupIntentAnswer(
+  intent: QaIntent,
+  answer: string,
+  selectedSection: EnrichedRetrievedSection,
+  candidates: CandidateRelevance[],
+  detection: IntentDetection,
+  baseDebug: Partial<QaDebugInfo>,
+  gate: GateResult
+): RoutedQaAnswer {
+  const selectedPrimary = publicSection(selectedSection);
+  return {
+    intent,
+    answerMode: gate.answerMode,
+    answerConfidence: gate.answerConfidence,
+    answer,
+    selectedPrimary,
+    documentSummary: null,
+    citations: [selectedPrimary],
+    debug: buildDebug(baseDebug, detection, {
+      selectedPrimary,
+      selectedPrimaryId: sectionIdentity(selectedSection),
+      candidateRejectionReasons: candidateRejections(candidates),
+      finalHsCodes: hsCodesForSection(selectedSection),
+      rejectedReason: selectedCandidate(candidates, selectedSection)?.rejectedReason ?? null,
+      ...debugGateFields(gate)
     })
   };
 }
@@ -305,17 +428,22 @@ function emptyIntentAnswer(
   answer: string,
   detection: IntentDetection,
   candidates: CandidateRelevance[],
-  baseDebug: Partial<QaDebugInfo>
+  baseDebug: Partial<QaDebugInfo>,
+  gate: GateResult = deterministicGate("clarification", "low", 0, [], "no selected section")
 ): RoutedQaAnswer {
   return {
     intent,
+    answerMode: gate.answerMode,
+    answerConfidence: gate.answerConfidence,
     answer,
     selectedPrimary: null,
     documentSummary: null,
     citations: [],
     debug: buildDebug(baseDebug, detection, {
       selectedPrimary: null,
-      candidateRejectionReasons: candidateRejections(candidates)
+      candidateRejectionReasons: candidateRejections(candidates),
+      rejectedReason: topCandidate(candidates)?.rejectedReason ?? null,
+      ...debugGateFields(gate)
     })
   };
 }
@@ -337,6 +465,240 @@ function buildDebug(
   };
 }
 
+const CLASSIFICATION_MIN_SCORE = 50;
+const MIN_STRONG_SIGNALS = 2;
+
+function productGate(
+  query: string,
+  selectedSection: EnrichedRetrievedSection | undefined,
+  candidates: CandidateRelevance[]
+): GateResult {
+  const effectiveCandidates = selectedSection && candidates.length === 0
+    ? [evaluateCandidateRelevance(selectedSection, query)]
+    : candidates;
+  const selected = selectedSection ? selectedCandidate(effectiveCandidates, selectedSection) : topCandidate(effectiveCandidates);
+  const finalScore = selected?.finalScore ?? selectedSection?.score ?? 0;
+  const strongSignals = selectedSection && selected ? strongSignalsForCandidate(query, selectedSection, selected) : [];
+  const contradictions = selectedSection && selected ? contradictionsForCandidate(query, selectedSection, selected) : [];
+  const shortQuery = isAmbiguousProductQuery(query);
+  const numericOnly = isNumericOnlyQuery(query);
+  const rejectedReason = selected?.rejectedReason ?? null;
+  const rejected = Boolean(selected?.rejected);
+  const weakOnly = Boolean(rejectedReason && /weak generic|bare numbers|contrast baseline/i.test(rejectedReason));
+
+  if (numericOnly) {
+    return {
+      answerMode: "numeric_lookup",
+      answerConfidence: "low",
+      confidenceReason: "numeric-only query is lookup evidence, not product classification",
+      finalScore,
+      strongSignals,
+      contradictions,
+      shouldAskClarification: false
+    };
+  }
+
+  if (shortQuery) {
+    return {
+      answerMode: selectedSection ? "ambiguous_lookup" : "clarification",
+      answerConfidence: "low",
+      confidenceReason: "query has fewer than two meaningful non-generic tokens",
+      finalScore,
+      strongSignals,
+      contradictions,
+      shouldAskClarification: !selectedSection
+    };
+  }
+
+  if (!selectedSection) {
+    return {
+      answerMode: "clarification",
+      answerConfidence: "low",
+      confidenceReason: "no candidate inside selected scope",
+      finalScore,
+      strongSignals,
+      contradictions,
+      shouldAskClarification: true
+    };
+  }
+
+  if (rejected || weakOnly) {
+    return {
+      answerMode: "clarification",
+      answerConfidence: "low",
+      confidenceReason: rejectedReason ?? "candidate was rejected by relevance evaluator",
+      finalScore,
+      strongSignals,
+      contradictions,
+      shouldAskClarification: true
+    };
+  }
+
+  if (contradictions.length > 0) {
+    return {
+      answerMode: "clarification",
+      answerConfidence: "low",
+      confidenceReason: "critical contradiction detected",
+      finalScore,
+      strongSignals,
+      contradictions,
+      shouldAskClarification: true
+    };
+  }
+
+  const lowerThresholdAllowed = finalScore >= 40 &&
+    (strongSignals.includes("title_phrase_match") || strongSignals.includes("scientific_name_match"));
+  const signalMinimum = finalScore >= 70 ? 1 : MIN_STRONG_SIGNALS;
+  const enoughScore = finalScore >= CLASSIFICATION_MIN_SCORE || lowerThresholdAllowed;
+  const enoughSignals = strongSignals.length >= signalMinimum;
+
+  if (finalScore < 20) {
+    return {
+      answerMode: "clarification",
+      answerConfidence: "low",
+      confidenceReason: "final score below 20",
+      finalScore,
+      strongSignals,
+      contradictions,
+      shouldAskClarification: true
+    };
+  }
+
+  if (!enoughScore || !enoughSignals) {
+    return {
+      answerMode: finalScore >= 20 ? "lookup" : "clarification",
+      answerConfidence: "low",
+      confidenceReason: !enoughSignals ? "insufficient strong signals" : "classification score below threshold",
+      finalScore,
+      strongSignals,
+      contradictions,
+      shouldAskClarification: finalScore < 20
+    };
+  }
+
+  return {
+    answerMode: "classification",
+    answerConfidence: finalScore >= 70 ? "high" : "medium",
+    confidenceReason: "score and strong evidence satisfy classification gate",
+    finalScore,
+    strongSignals,
+    contradictions,
+    shouldAskClarification: false
+  };
+}
+
+function definitionGate(
+  query: string,
+  selectedSection: EnrichedRetrievedSection,
+  candidates: CandidateRelevance[]
+): GateResult {
+  const effectiveCandidates = candidates.length === 0 ? [evaluateCandidateRelevance(selectedSection, query)] : candidates;
+  const selected = selectedCandidate(effectiveCandidates, selectedSection);
+  const finalScore = selected?.finalScore ?? selectedSection.score;
+  const strongSignals = selected ? strongSignalsForCandidate(query, selectedSection, selected) : ["definition_selected"];
+  const rejectedReason = selected?.rejectedReason ?? null;
+  const shouldAsk = Boolean(selected?.rejected) || finalScore < 8 || isAmbiguousDefinitionQuery(query);
+  return {
+    answerMode: shouldAsk ? "clarification" : "definition",
+    answerConfidence: shouldAsk ? "low" : finalScore >= 50 ? "high" : "medium",
+    confidenceReason: shouldAsk ? rejectedReason ?? "definition query is too ambiguous" : "definition section is relevant",
+    finalScore,
+    strongSignals,
+    contradictions: [],
+    shouldAskClarification: shouldAsk
+  };
+}
+
+function strongSignalsForCandidate(
+  query: string,
+  section: EnrichedRetrievedSection,
+  candidate: CandidateRelevance
+): string[] {
+  const signals: string[] = [];
+  const normalizedQuery = normalizeForIntent(query);
+  const title = normalizeForIntent(`${section.title ?? ""} ${section.section ?? ""}`);
+  const body = normalizeForIntent(`${section.text ?? ""}`);
+  const captions = normalizeForIntent((section.captions ?? []).join(" "));
+  const titleTokens = meaningfulIntentTokens(title);
+  const queryTokens = meaningfulIntentTokens(normalizedQuery);
+  const sharedTitleTokens = queryTokens.filter((token) => titleTokens.includes(token));
+
+  if (candidate.matchedTerms.some((term) => HS_CODE_PATTERN.test(term))) signals.push("exact_hscode_match");
+  if (candidate.candidateMatchedPhrases.some((phrase) => title.includes(normalizeForIntent(phrase))) || sharedTitleTokens.length >= 2) signals.push("title_phrase_match");
+  if (candidate.candidateMatchedPhrases.length >= 1) signals.push("product_name_phrase_match");
+  if (candidate.matchedTerms.some((term) => /^[a-z]{3,}\s+[a-z]{3,}/.test(term))) signals.push("scientific_name_match");
+  if (candidate.numericMatches.length > 0 && candidate.candidateMatchedPhrases.length + candidate.matchedTerms.length > candidate.numericMatches.length) signals.push("numeric_range_match_plus_attribute");
+  if (candidate.candidateMatchedPhrases.length >= 2) signals.push("multiple_body_phrase_matches");
+  if (queryTokens.some((token) => captions.includes(token))) signals.push("caption_phrase_match");
+  if (candidate.matchedTerms.some((term) => term.length >= 7 && !/^\d+(?:\.\d+)?$/.test(term))) signals.push("rare_token_overlap");
+  if (["use", "used", "function", "purpose", "incense", "perfume", "breeding", "consumption", "food"].some((token) => normalizedQuery.includes(token) && body.includes(token))) signals.push("usage_function_match");
+  if (["fresh", "frozen", "dried", "roasted", "raw", "chips", "powder", "seedling", "beans", "paste"].some((token) => normalizedQuery.includes(token) && `${title} ${body}`.includes(token))) signals.push("trade_form_match");
+  return uniqueStrings(signals);
+}
+
+function contradictionsForCandidate(
+  query: string,
+  section: EnrichedRetrievedSection,
+  candidate: CandidateRelevance
+): string[] {
+  const normalizedQuery = normalizeForIntent(query);
+  const text = normalizeForIntent(`${section.title ?? ""} ${section.section ?? ""} ${section.text ?? ""}`);
+  const contradictions: string[] = [];
+  if (candidate.contrastTermOnlyMatch) contradictions.push("contrast_term_only_match");
+  if (candidate.contrastTerms.some((term) => normalizeForIntent(`${section.title ?? ""}`).includes(normalizeForIntent(term))) && candidate.candidateMatchedPhrases.length === 0) {
+    contradictions.push("contrast_title_without_positive_attribute");
+  }
+  if (normalizedQuery.includes("higher") && text.includes("lower") && !text.includes("higher") && candidate.matchedTerms.includes("lower")) contradictions.push("higher_lower_conflict");
+  if (normalizedQuery.includes("lower") && text.includes("higher") && !text.includes("lower") && candidate.matchedTerms.includes("higher")) contradictions.push("lower_higher_conflict");
+  if (normalizedQuery.includes("human consumption") && text.includes("not fit for human consumption")) contradictions.push("usage_conflict");
+  return uniqueStrings(contradictions);
+}
+
+function numericLookupAnswer(query: string, section?: EnrichedRetrievedSection): string {
+  const value = query.trim();
+  if (!section) {
+    return `Tìm thấy '${value}' trong metadata nhưng chưa đủ thông tin để xác định HS Code chắc chắn. Vui lòng cung cấp thêm mô tả sản phẩm nếu muốn xác định mã HS chắc chắn.`;
+  }
+  return `Tìm thấy '${value}' trong section ${normalizedTitle(section)}. HS Code liên quan: ${formatCodes(hsCodesForSection(section))}. Vui lòng cung cấp thêm mô tả sản phẩm nếu muốn xác định mã HS chắc chắn.`;
+}
+
+function ambiguousLookupAnswer(section: EnrichedRetrievedSection): string {
+  return `Tìm thấy section ${normalizedTitle(section)}. HS Code liên quan: ${formatCodes(hsCodesForSection(section))}. Vui lòng cung cấp thêm mô tả sản phẩm, trạng thái hàng hóa, công dụng hoặc thành phần để xác định HS Code chính xác hơn.`;
+}
+
+function clarificationAnswer(): string {
+  return "Chưa đủ thông tin để xác định HS Code chắc chắn. Vui lòng cung cấp thêm mô tả sản phẩm, thành phần, công dụng, trạng thái hàng hóa hoặc thông số kỹ thuật.";
+}
+
+function deterministicGate(
+  answerMode: AnswerMode,
+  answerConfidence: AnswerConfidence,
+  finalScore: number,
+  strongSignals: string[],
+  confidenceReason: string
+): GateResult {
+  return {
+    answerMode,
+    answerConfidence,
+    confidenceReason,
+    finalScore,
+    strongSignals,
+    contradictions: [],
+    shouldAskClarification: false
+  };
+}
+
+function debugGateFields(gate: GateResult): Partial<QaDebugInfo> {
+  return {
+    answerMode: gate.answerMode,
+    answerConfidence: gate.answerConfidence,
+    confidenceReason: gate.confidenceReason,
+    finalScore: gate.finalScore,
+    strongSignals: gate.strongSignals,
+    contradictions: gate.contradictions
+  };
+}
+
 function formatChapterSummaryAnswer(
   chapterNumber: number | undefined,
   items: Array<{ title: string; codes: string[] }>,
@@ -349,6 +711,23 @@ function formatChapterSummaryAnswer(
     `Chapter ${chapterNumber} nói về các nội dung chính:`,
     ...items.map((item) => `- ${item.title} — HS Code: ${item.codes.join(", ")}.`)
   ].join("\n");
+}
+
+export function hasChapterMarker(normalizedQuery: string): boolean {
+  return /\b(?:chuong|chapter)\s+\d{1,3}\b/.test(normalizedQuery) ||
+    /\bchapter[\s_-]*\d{1,3}\b/.test(normalizedQuery);
+}
+
+export function extractChapterNumber(normalizedQuery: string): number | undefined {
+  const match = normalizedQuery.match(/\b(?:chuong|chapter)\s+(\d{1,3})\b/) ??
+    normalizedQuery.match(/\bchapter[\s_-]*(\d{1,3})\b/);
+  return match ? Number(match[1]) : undefined;
+}
+
+export function hasSummaryVerb(normalizedQuery: string): boolean {
+  return /\b(tom\s+tat|noi\s+dung|noi\s+ve|ve\s+gi|co\s+gi|gom|liet\s+ke|main\s+content|about|cover)\b/.test(normalizedQuery) ||
+    /\bwhat\s+is\s+(?:chuong|chapter)\s+\d{1,3}\s+about\b/.test(normalizedQuery) ||
+    /\bwhat\s+does\s+(?:chuong|chapter)\s+\d{1,3}\s+cover\b/.test(normalizedQuery);
 }
 
 function extractChapterSummaryNumber(normalized: string): number | undefined {
@@ -505,6 +884,10 @@ function publicSection(section: SectionMetadata | EnrichedRetrievedSection): Rec
   };
 }
 
+function sectionIdentity(section: SectionMetadata | EnrichedRetrievedSection): string {
+  return [section.document, section.hsCode, section.section || section.title].filter(Boolean).join("|");
+}
+
 function candidateRejections(candidates: CandidateRelevance[]): Array<Record<string, unknown>> {
   return candidates
     .filter((candidate) => candidate.rejected)
@@ -520,6 +903,59 @@ function candidateRejections(candidates: CandidateRelevance[]): Array<Record<str
       numericMatches: candidate.numericMatches,
       finalScore: candidate.finalScore
     }));
+}
+
+function selectedCandidate(candidates: CandidateRelevance[], section: EnrichedRetrievedSection): CandidateRelevance | undefined {
+  const codes = new Set(hsCodesForSection(section));
+  return candidates.find((candidate) =>
+    candidate.document === section.document &&
+    (candidate.hsCode && codes.has(candidate.hsCode) ||
+      candidate.groupedHsCodes.some((code) => codes.has(code)) ||
+      normalizeForIntent(candidate.title ?? "") === normalizeForIntent(section.title ?? "") ||
+      normalizeForIntent(candidate.section ?? "") === normalizeForIntent(section.section ?? ""))
+  );
+}
+
+function topCandidate(candidates: CandidateRelevance[]): CandidateRelevance | undefined {
+  return [...candidates].sort((left, right) => right.finalScore - left.finalScore)[0];
+}
+
+function isNumericOnlyQuery(query: string): boolean {
+  return /^\s*\d+(?:[.,]\d+)?\s*%?\s*$/.test(query);
+}
+
+function isAmbiguousProductQuery(query: string): boolean {
+  if (query.match(HS_CODE_PATTERN)) return false;
+  return meaningfulIntentTokens(query).length < 2;
+}
+
+function isAmbiguousDefinitionQuery(query: string): boolean {
+  const normalized = normalizeForIntent(query).replace(/\b(what|define|definition|la|gi|duoc|dinh|nghia|is|are)\b/g, " ");
+  return meaningfulIntentTokens(normalized).length < 1;
+}
+
+function meaningfulIntentTokens(value: string): string[] {
+  const stopwords = new Set([
+    "the", "and", "for", "with", "what", "which", "define", "definition", "code", "hscode",
+    "hang", "hoa", "san", "pham", "duoc", "dinh", "nghia", "thuoc", "loai", "nao",
+    "cua", "cho", "trong", "mot", "cac", "voi", "hon", "khac", "thay", "khong",
+    "phai", "is", "are", "was", "were", "this", "that", "chapter", "chuong",
+    "noi", "dung", "tom", "tat", "document", "file"
+  ]);
+  return uniqueStrings(normalizeForIntent(value)
+    .split(/[^a-z0-9.]+/g)
+    .filter((token) => token.length >= 3 || /^\d+(?:\.\d+)?$/.test(token))
+    .filter((token) => !stopwords.has(token) && !/^\d+$/.test(token)));
+}
+
+function normalizedTitle(section: EnrichedRetrievedSection): string {
+  return normalizeProductTitle(section.title || titleFromSection(section.section) || section.section || "section phu hop");
+}
+
+function formatCodes(codes: string[]): string {
+  if (codes.length === 0) return "chưa có trong metadata";
+  if (codes.length === 1) return codes[0];
+  return codes.join(" hoặc ");
 }
 
 function cleanSummaryText(value: string): string {

@@ -411,13 +411,16 @@ export function evaluateCandidateRelevance(
     ...sourceTokenMatches,
     ...rareTokenMatches
   ]).filter((token) => !isWeakGenericQueryToken(token));
+  const meaningfulPhraseMatches = phraseMatches.filter((phrase) =>
+    meaningfulTokens(phrase).some((token) => !isWeakGenericQueryToken(token))
+  );
   const onlyWeakTokenEvidence =
     hsCodeMatches.length === 0 &&
-    phraseMatches.length === 0 &&
+    meaningfulPhraseMatches.length === 0 &&
     numericMatches.length === 0 &&
     scientificMatches.length === 0 &&
     meaningfulEvidenceTokens.length === 0 &&
-    titleTokenMatches.length + bodyTokenMatches.length + sourceTokenMatches.length > 0;
+    titleTokenMatches.length + bodyTokenMatches.length + sourceTokenMatches.length + phraseMatches.length > 0;
   const matchedTerms = uniqueStrings([
     ...hsCodeMatches,
     ...titleTokenMatches,
@@ -455,7 +458,7 @@ export function evaluateCandidateRelevance(
     scientificMatches.length +
     numericMatches.length;
   const contrastTermOnlyMatch = positiveEvidence === 0 && contrastMatches.length > 0;
-  const hasStrongMatch = hsCodeMatches.length + titlePhraseMatches.length + numericMatches.length + phraseMatches.length + rareTokenMatches.length + scientificMatches.length > 0;
+  const hasStrongMatch = hsCodeMatches.length + titlePhraseMatches.length + numericMatches.length + meaningfulPhraseMatches.length + rareTokenMatches.length + scientificMatches.length > 0;
   const lowGenericOverlap = titleTokenMatches.length + bodyTokenMatches.length + phraseMatches.length + numericMatches.length === 0;
 
   if (contrastTermOnlyMatch) {
@@ -613,6 +616,37 @@ export function hasSectionHsMetadata(section: Pick<EnrichedRetrievedSection, "hs
   return hsCodesForSection(section).length > 0;
 }
 
+export function propagateGroupedSectionPageRanges<T extends SectionMetadata>(sections: T[]): T[] {
+  const groups = new Map<string, { pageStart?: number; pageEnd?: number }>();
+  for (const section of sections) {
+    const codes = uniqueStrings([...(section.groupedHsCodes ?? []), section.hsCode].filter((code): code is string => Boolean(code))).sort();
+    if (codes.length <= 1 || !section.title || !section.document) {
+      continue;
+    }
+    const key = groupedPageRangeKey(section.document, section.title, codes);
+    const existing = groups.get(key) ?? {};
+    groups.set(key, {
+      pageStart: minDefined(existing.pageStart, section.pageStart),
+      pageEnd: maxDefined(existing.pageEnd, section.pageEnd ?? section.pageStart)
+    });
+  }
+
+  return sections.map((section) => {
+    const codes = uniqueStrings([...(section.groupedHsCodes ?? []), section.hsCode].filter((code): code is string => Boolean(code))).sort();
+    const range = codes.length > 1 && section.title && section.document
+      ? groups.get(groupedPageRangeKey(section.document, section.title, codes))
+      : undefined;
+    if (!range?.pageStart && !range?.pageEnd) {
+      return section;
+    }
+    return {
+      ...section,
+      pageStart: section.pageStart ?? range.pageStart,
+      pageEnd: section.pageEnd ?? range.pageEnd ?? range.pageStart
+    };
+  });
+}
+
 function formatHsCodeLine(codes: string[], question: string | undefined): string {
   if (codes.length <= 1) {
     return `HS Code: ${codes[0]}.`;
@@ -650,6 +684,22 @@ function joinHsCodes(codes: string[]): string {
     return codes.join(" hoặc ");
   }
   return `${codes.slice(0, -1).join(", ")} hoặc ${codes[codes.length - 1]}`;
+}
+
+function groupedPageRangeKey(document: string, title: string, codes: string[]): string {
+  return `${document}|${normalizeComparable(title)}|${codes.join("|")}`;
+}
+
+function minDefined(left: number | undefined, right: number | undefined): number | undefined {
+  if (left === undefined) return right;
+  if (right === undefined) return left;
+  return Math.min(left, right);
+}
+
+function maxDefined(left: number | undefined, right: number | undefined): number | undefined {
+  if (left === undefined) return right;
+  if (right === undefined) return left;
+  return Math.max(left, right);
 }
 
 function fallbackClassEvalAnswer(structured: StructuredAnswer): string {
@@ -1004,6 +1054,7 @@ const WEAK_MATCH_TOKENS = new Set([
   "liet",
   "ke",
   "main",
+  "content",
   "summary",
   "document",
   "file"

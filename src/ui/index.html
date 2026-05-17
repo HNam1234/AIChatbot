@@ -72,6 +72,7 @@
                 <span>API keys & settings</span>
                 <small>saved or temporary</small>
               </div>
+              <p class="warning-note">Local demo only: API keys are stored in local .env. Do not expose this server publicly.</p>
               <div class="settings-grid">
                 <div class="field-group">
                   <label for="pageindex-key">PageIndex API Key</label>
@@ -279,9 +280,10 @@
             <label>
               Right panel
               <select id="mapping-mode">
-                <option value="blocks">Blocks</option>
+                <option value="parsed-text">Parsed Text</option>
                 <option value="markdown">Markdown</option>
                 <option value="sections">Sections</option>
+                <option value="blocks">Blocks</option>
               </select>
             </label>
             <div class="mapping-nav">
@@ -291,9 +293,13 @@
           </div>
           <div id="mapping-cache-status" class="mapping-status muted">Load a processed document to inspect mapping data.</div>
           <div class="mapping-debug-controls">
-            <label class="check"><input id="mapping-show-overlay" type="checkbox" checked /> Show bbox overlay</label>
+            <label class="check"><input id="mapping-show-text-overlay" type="checkbox" checked /> Text span overlay</label>
+            <label class="check"><input id="mapping-show-overlay" type="checkbox" checked /> Block overlay</label>
+            <label class="check"><input id="mapping-selected-only" type="checkbox" /> Selected only</label>
+            <label class="check"><input id="mapping-show-text-spans" type="checkbox" /> Show all text spans</label>
+            <label class="check"><input id="mapping-show-blocks" type="checkbox" checked /> Show all blocks</label>
             <label class="check"><input id="mapping-section-only" type="checkbox" /> Show only selected section</label>
-            <label class="check"><input id="mapping-show-labels" type="checkbox" /> Block labels</label>
+            <label class="check"><input id="mapping-show-labels" type="checkbox" /> Debug labels</label>
             <label class="check"><input id="mapping-invert-y" type="checkbox" /> Invert Y</label>
             <label>
               Filter type

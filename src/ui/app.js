@@ -1,4 +1,10 @@
 import * as pdfjsLib from "/vendor/pdfjs/pdf.mjs";
+import {
+  bestMatchParsedUnitToPdfSpan,
+  bestMatchPdfSpanToParsedUnit,
+  fallbackBlockForPdfSpan,
+  normalizeTextForAlignment
+} from "/textAlignment.js";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = "/vendor/pdfjs/pdf.worker.mjs";
 
@@ -68,7 +74,11 @@ const mappingModeSelect = document.querySelector("#mapping-mode");
 const mappingPrevPageButton = document.querySelector("#mapping-prev-page");
 const mappingNextPageButton = document.querySelector("#mapping-next-page");
 const mappingCacheStatusEl = document.querySelector("#mapping-cache-status");
+const mappingShowTextOverlayInput = document.querySelector("#mapping-show-text-overlay");
 const mappingShowOverlayInput = document.querySelector("#mapping-show-overlay");
+const mappingSelectedOnlyInput = document.querySelector("#mapping-selected-only");
+const mappingShowTextSpansInput = document.querySelector("#mapping-show-text-spans");
+const mappingShowBlocksInput = document.querySelector("#mapping-show-blocks");
 const mappingSectionOnlyInput = document.querySelector("#mapping-section-only");
 const mappingShowLabelsInput = document.querySelector("#mapping-show-labels");
 const mappingInvertYInput = document.querySelector("#mapping-invert-y");
@@ -100,6 +110,10 @@ let mappingPdfDocument = null;
 let mappingCurrentPage = 1;
 let mappingSelectedBlockId = null;
 let mappingSelectedSectionKey = null;
+let mappingSelectedUnitId = null;
+let mappingSelectedPdfSpanId = null;
+let mappingMatchInfo = null;
+let mappingAlignmentIndex = null;
 let mappingViewportScale = 1;
 let mappingRenderToken = 0;
 let cacheStatusRequestId = 0;
@@ -163,7 +177,11 @@ mappingNextPageButton?.addEventListener("click", () => {
   void renderMappingPage(Math.min(mappingData?.pageCount || mappingCurrentPage + 1, mappingCurrentPage + 1));
 });
 mappingModeSelect?.addEventListener("change", renderMappingTextViewer);
+mappingShowTextOverlayInput?.addEventListener("change", renderMappingOverlays);
 mappingShowOverlayInput?.addEventListener("change", renderMappingOverlays);
+mappingSelectedOnlyInput?.addEventListener("change", renderMappingOverlays);
+mappingShowTextSpansInput?.addEventListener("change", renderMappingOverlays);
+mappingShowBlocksInput?.addEventListener("change", renderMappingOverlays);
 mappingSectionOnlyInput?.addEventListener("change", renderMappingOverlays);
 mappingShowLabelsInput?.addEventListener("change", renderMappingOverlays);
 mappingInvertYInput?.addEventListener("change", renderMappingOverlays);
@@ -174,6 +192,9 @@ mappingTypeFilterSelect?.addEventListener("change", () => {
 mappingClearSelectionButton?.addEventListener("click", () => {
   mappingSelectedBlockId = null;
   mappingSelectedSectionKey = null;
+  mappingSelectedUnitId = null;
+  mappingSelectedPdfSpanId = null;
+  mappingMatchInfo = null;
   renderMappingOverlays();
   renderMappingTextViewer();
   renderMappingDetails();
@@ -427,24 +448,25 @@ askButton.addEventListener("click", async () => {
     return;
   }
   answerEl.className = "chat-thread";
-  const marker = payload.validation?.markers?.[0];
-  const indexSource = payload.indexSource || selectedIndexSource();
-  const answerScope = indexSource?.source === "pageindex-chat"
+  const indexSource = payload.indexSourceDetails || (typeof payload.indexSource === "object" ? payload.indexSource : selectedIndexSource());
+  const indexSourceCode = typeof payload.indexSource === "string" ? payload.indexSource : indexSource?.source;
+  const answerScope = indexSource?.source === "pageindex-chat" || indexSourceCode === "pageindex_live"
     ? `Scope: ${(payload.docIds || docIds).length} PageIndex document(s)`
     : `Index source: ${formatIndexSource(indexSource, payload.retrieval)}`;
-  const retrievalStatus = renderRetrievalStatus(payload.retrieval, indexSource);
+  const retrievalStatus = renderRetrievalStatus(payload.retrieval, indexSource, payload);
   const summaryIntent = payload.intent === "chapter_summary" || payload.intent === "document_summary";
   const documentSummaryCard = summaryIntent ? renderDocumentSummaryCard(payload.documentSummary) : "";
   const citationCards = summaryIntent ? "" : renderCitationCards(payload.citations || []);
-  renderDebugOutput(renderDebugPanel(payload.debug, indexSource, payload.retrieval));
+  renderDebugOutput(renderDebugPanel(payload.debug, indexSource, payload.retrieval, payload));
   answerEl.innerHTML = `
     <div class="answer-box">
       <div class="answer-text">${escapeHtml(payload.answer || "")}</div>
+    </div>
+    <div class="answer-metadata">
       ${retrievalStatus}
       ${documentSummaryCard}
       ${citationCards}
       <p>${escapeHtml(answerScope)}</p>
-      ${marker ? `<p>${escapeHtml(marker.message || "")}</p>` : ""}
     </div>
   `;
 });
@@ -767,7 +789,7 @@ function renderCitationCards(citations) {
 
   return `<div class="citation-cards">${citations.map((citation, index) => `
     <div class="citation-card">
-      <strong>${index === 0 ? "Primary citation" : "Related citation"}</strong>
+      <strong>${index === 0 ? "Product citation" : "Scoped related match"}</strong>
       <dl>
         <dt>HS Code</dt><dd>${escapeHtml(citation.hsCode || "n/a")}</dd>
         <dt>Grouped</dt><dd>${escapeHtml(Array.isArray(citation.groupedHsCodes) && citation.groupedHsCodes.length > 0 ? citation.groupedHsCodes.join(", ") : "n/a")}</dd>
@@ -811,7 +833,7 @@ function renderDocumentSummaryCard(summary) {
   `;
 }
 
-function renderRetrievalStatus(retrieval, indexSource) {
+function renderRetrievalStatus(retrieval, indexSource, payload = {}) {
   if (!retrieval && !indexSource) {
     return "";
   }
@@ -826,13 +848,17 @@ function renderRetrievalStatus(retrieval, indexSource) {
       ${fallback ? "<span>BM25/local fallback used</span>" : "<span>PageIndex tree result used</span>"}
       ${codes ? `<span>Final HS Code(s): ${escapeHtml(codes)}</span>` : ""}
       ${retrieval?.answerRepairApplied ? "<span>Answer repair applied</span>" : ""}
+      ${payload.indexSource ? `<span>Index source code: ${escapeHtml(payload.indexSource)}</span>` : ""}
+      ${payload.pageIndexUploadStatus ? `<span>PageIndex upload/cache status: ${escapeHtml(payload.pageIndexUploadStatus)}</span>` : ""}
+      ${payload.cacheFreshness?.stale?.length ? `<span>Warning: stale cached tree used for ${escapeHtml(payload.cacheFreshness.stale.join(", "))}</span>` : ""}
+      ${payload.pageIndexUploadStatus === "skipped" && payload.cachedDocumentCount > 0 ? "<span>Warning: upload skipped, using available cached tree.</span>" : ""}
       ${indexSource?.warning ? `<span>${escapeHtml(indexSource.warning)}</span>` : ""}
       ${documentDetails}
     </div>
   `;
 }
 
-function renderDebugPanel(debug, indexSource, retrieval) {
+function renderDebugPanel(debug, indexSource, retrieval, payload = {}) {
   if (!debug) {
     return renderDebugSummary(indexSource, retrieval);
   }
@@ -854,6 +880,10 @@ function renderDebugPanel(debug, indexSource, retrieval) {
       ${selected}
       <dl>
         ${documentLine}
+        <dt>Index source</dt><dd>${escapeHtml(payload.indexSource || indexSource?.source || "unknown")}</dd>
+        <dt>Scope</dt><dd><pre>${escapeHtml(JSON.stringify(payload.scope || debug.scope || {}, null, 2))}</pre></dd>
+        <dt>Cache freshness</dt><dd><pre>${escapeHtml(JSON.stringify(payload.cacheFreshness || {}, null, 2))}</pre></dd>
+        <dt>Answer generation</dt><dd>${escapeHtml(payload.answerGeneration || debug.answerGeneration || "unknown")}</dd>
         <dt>Signals</dt><dd><pre>${escapeHtml(JSON.stringify(debug.extractedSignals || {}, null, 2))}</pre></dd>
         <dt>Retrieval</dt><dd><pre>${escapeHtml(JSON.stringify(debug.retrieval || {}, null, 2))}</pre></dd>
       </dl>
@@ -1401,6 +1431,10 @@ async function loadMappingDocument(documentName) {
   mappingPdfDocument = null;
   mappingSelectedBlockId = null;
   mappingSelectedSectionKey = null;
+  mappingSelectedUnitId = null;
+  mappingSelectedPdfSpanId = null;
+  mappingMatchInfo = null;
+  mappingAlignmentIndex = null;
   renderMappingDetails();
   if (mappingTextViewerEl) {
     mappingTextViewerEl.className = "mapping-text-viewer muted";
@@ -1416,6 +1450,7 @@ async function loadMappingDocument(documentName) {
   }
 
   mappingData = payload;
+  mappingAlignmentIndex = buildAlignmentIndex(payload);
   if (mappingDocumentSelect) mappingDocumentSelect.value = payload.document;
   setMappingStatus(formatMappingCacheStatus(payload));
   renderMappingTextViewer();
@@ -1464,21 +1499,44 @@ async function renderMappingPage(pageNumber) {
   await page.render({ canvasContext: context, viewport }).promise;
   if (token !== mappingRenderToken) return;
 
+  await loadMappingPageTextSpans(page, viewport);
+  if (token !== mappingRenderToken) return;
   renderMappingOverlays();
   if (mappingPdfMessageEl) {
     const count = currentMappingPageBlocks().length;
-    mappingPdfMessageEl.textContent = `${count} parsed block overlay(s) on this page.`;
+    const spanCount = currentMappingPageTextSpans().length;
+    mappingPdfMessageEl.textContent = `${spanCount} PDF text span(s), ${count} parsed block overlay(s) on this page.`;
   }
 }
 
 function renderMappingOverlays() {
   if (!mappingOverlay || !mappingCanvas) return;
   mappingOverlay.innerHTML = "";
-  mappingOverlay.classList.toggle("hidden", !mappingShowOverlayInput?.checked);
-  if (!mappingData || !mappingShowOverlayInput?.checked) return;
+  const showText = mappingShowTextOverlayInput?.checked !== false;
+  const showBlocks = mappingShowOverlayInput?.checked !== false;
+  mappingOverlay.classList.toggle("hidden", !showText && !showBlocks);
+  if (!mappingData || (!showText && !showBlocks)) return;
 
+  if (showBlocks) {
+    renderMappingBlockOverlays();
+  }
+  if (showText) {
+    renderMappingTextSpanOverlays();
+  }
+}
+
+function renderMappingBlockOverlays() {
   const blocks = currentMappingPageBlocks()
     .filter(mappingBlockVisible)
+    .filter((block) => {
+      if (mappingSelectedOnlyInput?.checked && block.id !== mappingSelectedBlockId && sectionKey(block) !== mappingSelectedSectionKey) {
+        return false;
+      }
+      if (!mappingShowBlocksInput?.checked && block.id !== mappingSelectedBlockId && sectionKey(block) !== mappingSelectedSectionKey) {
+        return false;
+      }
+      return true;
+    })
     .sort((left, right) => blockArea(right) - blockArea(left));
   for (const block of blocks) {
     const rect = bboxToCanvasRect(block.bbox);
@@ -1502,6 +1560,376 @@ function renderMappingOverlays() {
   }
 }
 
+function renderMappingTextSpanOverlays() {
+  const spans = currentMappingPageTextSpans()
+    .filter((span) => {
+      if (mappingSelectedOnlyInput?.checked && span.id !== mappingSelectedPdfSpanId && span.blockId !== mappingSelectedBlockId) {
+        return false;
+      }
+      return true;
+    });
+  for (const span of spans) {
+    const button = document.createElement("button");
+    button.type = "button";
+    const selected = span.id === mappingSelectedPdfSpanId;
+    const visible = selected || mappingShowTextSpansInput?.checked || mappingShowLabelsInput?.checked;
+    button.className = `mapping-text-span ${selected ? "selected" : ""} ${visible ? "visible" : ""}`;
+    button.dataset.pdfSpanId = span.id;
+    button.style.left = `${span.bbox.x0}px`;
+    button.style.top = `${span.bbox.y0}px`;
+    button.style.width = `${Math.max(2, span.bbox.x1 - span.bbox.x0)}px`;
+    button.style.height = `${Math.max(2, span.bbox.y1 - span.bbox.y0)}px`;
+    button.title = `PDF text: ${textPreview(span.text, 120)}`;
+    if (mappingShowLabelsInput?.checked) {
+      button.textContent = span.index;
+    }
+    button.addEventListener("mouseenter", () => previewParsedUnitForSpan(span));
+    button.addEventListener("mouseleave", clearMappingPreview);
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void selectPdfTextSpan(span);
+    });
+    mappingOverlay.appendChild(button);
+  }
+}
+
+async function loadMappingPageTextSpans(page, viewport) {
+  if (!mappingAlignmentIndex) return;
+  const pageIndex = ensureAlignmentPage(mappingCurrentPage);
+  if (pageIndex.pdfTextSpansLoaded) return;
+  try {
+    const content = await page.getTextContent();
+    pageIndex.pdfTextSpans = (content.items || [])
+      .map((item, index) => pdfTextItemToSpan(item, index, mappingCurrentPage, viewport))
+      .filter(Boolean)
+      .map((span) => ({
+        ...span,
+        blockId: nearestBlockForSpan(span)?.id
+      }));
+    pageIndex.pdfTextSpansLoaded = true;
+  } catch (error) {
+    pageIndex.pdfTextSpans = [];
+    pageIndex.pdfTextSpansLoaded = true;
+    if (mappingPdfMessageEl) {
+      mappingPdfMessageEl.textContent = `PDF text layer unavailable; using block fallback. ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+}
+
+function pdfTextItemToSpan(item, index, pageNumber, viewport) {
+  const text = String(item?.str || "").trim();
+  if (!text) return null;
+  const transform = Array.isArray(item.transform) ? item.transform : [1, 0, 0, 1, 0, 0];
+  const tx = pdfjsLib.Util.transform(viewport.transform, transform);
+  const height = Math.max(3, Math.hypot(tx[2], tx[3]) || Math.abs(item.height * mappingViewportScale) || 8);
+  const width = Math.max(3, Math.abs((Number(item.width) || text.length * 4) * mappingViewportScale));
+  const left = tx[4];
+  const top = tx[5] - height;
+  return {
+    id: `pdf-p${pageNumber}-t${index}`,
+    index,
+    pageNumber,
+    text,
+    normalizedText: normalizeTextForAlignment(text),
+    bbox: { x0: left, y0: top, x1: left + width, y1: top + height },
+    transform,
+    fontName: item.fontName || "",
+    dir: item.dir || ""
+  };
+}
+
+function buildAlignmentIndex(payload) {
+  const pages = {};
+  const index = {
+    document: payload.document,
+    parsedTextUnits: buildParsedTextUnits(payload),
+    pages
+  };
+  for (const block of payload.blocks || []) {
+    const page = ensureAlignmentPage(Number(block.pageNumber) || 1, index);
+    page.blockUnits.push({ ...block, normalizedText: normalizeTextForAlignment(block.text || block.markdownText || "") });
+  }
+  for (const unit of index.parsedTextUnits) {
+    const pageNumber = Number(unit.pageNumber) || 0;
+    if (pageNumber > 0) {
+      ensureAlignmentPage(pageNumber, index).parsedTextUnits.push(unit);
+    }
+  }
+  return index;
+}
+
+function ensureAlignmentPage(pageNumber, index = mappingAlignmentIndex) {
+  if (!index.pages[pageNumber]) {
+    index.pages[pageNumber] = {
+      pdfTextSpans: [],
+      pdfTextSpansLoaded: false,
+      parsedTextUnits: [],
+      blockUnits: []
+    };
+  }
+  return index.pages[pageNumber];
+}
+
+function buildParsedTextUnits(payload) {
+  const units = [];
+  for (const block of payload.blocks || []) {
+    const pieces = splitParsedText(block.text || block.markdownText || "");
+    pieces.forEach((text, index) => {
+      units.push({
+        id: `${block.id}-u${index}`,
+        document: payload.document,
+        pageNumber: block.pageNumber,
+        section: block.section,
+        hsCode: block.hsCode,
+        title: block.title,
+        blockId: block.id,
+        blockType: block.type,
+        text,
+        normalizedText: normalizeTextForAlignment(text),
+        markdownAnchor: block.section ? markdownAnchorForText(block.section) : undefined,
+        source: "block"
+      });
+    });
+  }
+  (payload.sections || []).forEach((section, sectionIndex) => {
+    const lines = splitParsedText([section.title, section.textPreview].filter(Boolean).join("\n"));
+    lines.forEach((text, lineIndex) => {
+      units.push({
+        id: `section-${sectionIndex}-u${lineIndex}`,
+        document: payload.document,
+        pageNumber: Number(section.pageStart) || undefined,
+        section: section.section,
+        hsCode: section.hsCode,
+        title: section.title,
+        text,
+        normalizedText: normalizeTextForAlignment(text),
+        markdownAnchor: markdownAnchorForText(section.markdownHeading || section.title || section.section || section.hsCode),
+        source: "section"
+      });
+    });
+  });
+  splitMarkdownUnits(payload.markdown || "", payload.document).forEach((unit) => units.push(unit));
+  return units.filter((unit) => unit.normalizedText);
+}
+
+function splitParsedText(text) {
+  const cleaned = String(text || "").replace(/\r/g, "\n").trim();
+  if (!cleaned) return [];
+  const lines = cleaned
+    .split(/\n+/g)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const source = lines.length > 1 ? lines : [cleaned];
+  return source.flatMap((line) => {
+    if (line.length <= 180) return [line];
+    return line
+      .split(/(?<=[.!?])\s+(?=[A-Z0-9])/g)
+      .map((piece) => piece.trim())
+      .filter(Boolean);
+  });
+}
+
+function splitMarkdownUnits(markdown, documentName) {
+  const units = [];
+  let currentHeading = "";
+  String(markdown || "")
+    .split(/\n{2,}/g)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .forEach((part, index) => {
+      const heading = /^(#{1,6})\s+(.+)$/m.exec(part);
+      if (heading) {
+        currentHeading = heading[2].trim();
+      }
+      const text = part.replace(/^#{1,6}\s+/gm, "").trim();
+      if (!text) return;
+      units.push({
+        id: `markdown-u${index}`,
+        document: documentName,
+        section: currentHeading,
+        title: heading ? heading[2].trim() : currentHeading,
+        text,
+        normalizedText: normalizeTextForAlignment(text),
+        markdownAnchor: markdownAnchorForText(heading ? heading[2] : currentHeading),
+        source: "markdown"
+      });
+    });
+  return units;
+}
+
+async function selectPdfTextSpan(span, options = {}) {
+  if (!span) return;
+  mappingSelectedPdfSpanId = span.id;
+  const pageIndex = ensureAlignmentPage(span.pageNumber);
+  const units = candidateParsedUnitsForSpan(span);
+  const match = bestMatchPdfSpanToParsedUnit(span, units, {
+    currentPage: span.pageNumber,
+    blocks: canvasAlignmentBlocks(span.pageNumber),
+    threshold: 32
+  });
+  if (match.item) {
+    mappingMatchInfo = match;
+    await selectParsedTextUnit(match.item.id, {
+      scrollPdf: false,
+      scrollText: options.scrollText !== false,
+      preserveMode: false,
+      matchedPdfSpanId: span.id
+    });
+    return;
+  }
+
+  const fallback = fallbackBlockForPdfSpan(span, canvasAlignmentBlocks(span.pageNumber));
+  if (fallback.item) {
+    mappingMatchInfo = fallback;
+    await selectMappingBlock(fallback.item.id, { scrollText: true, scrollPdf: false, confidence: "fallback" });
+    return;
+  }
+
+  mappingMatchInfo = { score: match.score, confidence: "none", reasons: ["no-parsed-text-match"] };
+  renderMappingOverlays();
+  renderMappingTextViewer();
+  renderMappingDetails();
+}
+
+async function selectParsedTextUnit(unitId, options = {}) {
+  const unit = mappingAlignmentIndex?.parsedTextUnits.find((candidate) => candidate.id === unitId);
+  if (!unit) return;
+  mappingSelectedUnitId = unit.id;
+  mappingSelectedBlockId = unit.blockId || null;
+  mappingSelectedSectionKey = unit.section || unit.hsCode || unit.title || null;
+  if (options.matchedPdfSpanId) {
+    mappingSelectedPdfSpanId = options.matchedPdfSpanId;
+  }
+  const targetPage = Number(unit.pageNumber) || Number(blockForUnit(unit)?.pageNumber) || mappingCurrentPage;
+  if (targetPage && targetPage !== mappingCurrentPage) {
+    await renderMappingPage(targetPage);
+  }
+  if (!options.matchedPdfSpanId) {
+    const pageIndex = ensureAlignmentPage(mappingCurrentPage);
+    const match = bestMatchParsedUnitToPdfSpan(unit, pageIndex.pdfTextSpans, {
+      currentPage: mappingCurrentPage,
+      blocks: canvasAlignmentBlocks(mappingCurrentPage),
+      threshold: 30
+    });
+    if (match.item) {
+      mappingSelectedPdfSpanId = match.item.id;
+      mappingMatchInfo = match;
+    } else if (unit.blockId) {
+      mappingMatchInfo = { score: match.score, confidence: "fallback", reasons: ["block-fallback"], item: blockForUnit(unit) };
+    } else {
+      mappingMatchInfo = { score: match.score, confidence: "none", reasons: ["no-pdf-text-match"] };
+    }
+  }
+  if (options.preserveMode !== true && mappingModeSelect && mappingModeSelect.value !== "parsed-text") {
+    mappingModeSelect.value = "parsed-text";
+  }
+  renderMappingOverlays();
+  renderMappingTextViewer();
+  renderMappingDetails(blockForUnit(unit), undefined, unit);
+  if (options.scrollText !== false) {
+    scrollMappingUnitIntoView(unit.id);
+  }
+  if (options.scrollPdf !== false) {
+    mappingPdfStage?.scrollIntoView({ block: "nearest" });
+  }
+}
+
+function candidateParsedUnitsForSpan(span) {
+  const pageIndex = ensureAlignmentPage(span.pageNumber);
+  const pageUnits = pageIndex.parsedTextUnits || [];
+  const blockUnits = span.blockId ? pageUnits.filter((unit) => unit.blockId === span.blockId) : [];
+  const units = blockUnits.length > 0 ? blockUnits : pageUnits;
+  return units.length > 0 ? units : mappingAlignmentIndex?.parsedTextUnits || [];
+}
+
+function nearestBlockForSpan(span) {
+  const pageIndex = ensureAlignmentPage(span.pageNumber);
+  let best = null;
+  let bestScore = 0;
+  for (const block of pageIndex.blockUnits) {
+    if (!block.bbox) continue;
+    const rect = bboxToCanvasRect(block.bbox);
+    const score = overlapRect(span.bbox, {
+      x0: rect.left,
+      y0: rect.top,
+      x1: rect.left + rect.width,
+      y1: rect.top + rect.height
+    });
+    if (score > bestScore) {
+      best = block;
+      bestScore = score;
+    }
+  }
+  return bestScore > 0.05 ? best : null;
+}
+
+function overlapRect(left, right) {
+  const x0 = Math.max(left.x0, right.x0);
+  const y0 = Math.max(left.y0, right.y0);
+  const x1 = Math.min(left.x1, right.x1);
+  const y1 = Math.min(left.y1, right.y1);
+  const intersection = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+  const area = Math.max(1, (left.x1 - left.x0) * (left.y1 - left.y0));
+  return intersection / area;
+}
+
+function blockForUnit(unit) {
+  return unit?.blockId ? mappingData?.blocks.find((block) => block.id === unit.blockId) : undefined;
+}
+
+function currentMappingPageTextSpans() {
+  return mappingAlignmentIndex?.pages?.[mappingCurrentPage]?.pdfTextSpans || [];
+}
+
+function currentMappingPageParsedUnits() {
+  return mappingAlignmentIndex?.pages?.[mappingCurrentPage]?.parsedTextUnits || [];
+}
+
+function canvasAlignmentBlocks(pageNumber) {
+  const pageIndex = ensureAlignmentPage(pageNumber);
+  return pageIndex.blockUnits.map((block) => {
+    if (pageNumber !== mappingCurrentPage || !block.bbox) return block;
+    const rect = bboxToCanvasRect(block.bbox);
+    return {
+      ...block,
+      bbox: {
+        x0: rect.left,
+        y0: rect.top,
+        x1: rect.left + rect.width,
+        y1: rect.top + rect.height
+      }
+    };
+  });
+}
+
+function previewParsedUnitForSpan(span) {
+  if (mappingModeSelect?.value !== "parsed-text") return;
+  const match = bestMatchPdfSpanToParsedUnit(span, candidateParsedUnitsForSpan(span), {
+    currentPage: span.pageNumber,
+    blocks: canvasAlignmentBlocks(span.pageNumber),
+    threshold: 42
+  });
+  if (match.item) {
+    mappingTextViewerEl?.querySelector(`[data-unit-id="${cssEscape(match.item.id)}"]`)?.classList.add("preview");
+  }
+}
+
+function previewPdfSpanForUnit(unit) {
+  const match = bestMatchParsedUnitToPdfSpan(unit, currentMappingPageTextSpans(), {
+    currentPage: mappingCurrentPage,
+    blocks: canvasAlignmentBlocks(mappingCurrentPage),
+    threshold: 42
+  });
+  if (match.item) {
+    mappingOverlay?.querySelector(`[data-pdf-span-id="${cssEscape(match.item.id)}"]`)?.classList.add("preview");
+  }
+}
+
+function clearMappingPreview() {
+  mappingTextViewerEl?.querySelectorAll(".preview").forEach((element) => element.classList.remove("preview"));
+  mappingOverlay?.querySelectorAll(".preview").forEach((element) => element.classList.remove("preview"));
+}
+
 function renderMappingTextViewer() {
   if (!mappingTextViewerEl) return;
   if (!mappingData) {
@@ -1512,9 +1940,12 @@ function renderMappingTextViewer() {
 
   const mode = mappingModeSelect?.value || "blocks";
   mappingTextViewerEl.className = "mapping-text-viewer";
+  if (mode === "parsed-text") {
+    renderMappingParsedTextUnits();
+    return;
+  }
   if (mode === "markdown") {
-    mappingTextViewerEl.innerHTML = `<pre class="mapping-markdown">${escapeHtml(mappingData.markdown || "No Markdown found.")}</pre>`;
-    scrollMappingSectionIntoView();
+    renderMappingMarkdown();
     return;
   }
   if (mode === "sections") {
@@ -1538,6 +1969,50 @@ function renderMappingTextViewer() {
       void selectMappingBlock(element.dataset.mappingBlockId, { scrollPdf: true });
     });
   });
+}
+
+function renderMappingParsedTextUnits() {
+  const pageUnits = currentMappingPageParsedUnits();
+  const units = pageUnits.length > 0 ? pageUnits : mappingAlignmentIndex?.parsedTextUnits || [];
+  const visibleUnits = units.filter((unit) => {
+    if (mappingTypeFilterSelect?.value !== "all" && unit.blockType && unit.blockType !== mappingTypeFilterSelect.value) return false;
+    if (mappingSectionOnlyInput?.checked && mappingSelectedSectionKey) {
+      return unit.section === mappingSelectedSectionKey || unit.hsCode === mappingSelectedSectionKey || unit.title === mappingSelectedSectionKey;
+    }
+    return true;
+  });
+  mappingTextViewerEl.innerHTML = visibleUnits.map((unit) => `
+    <article class="mapping-unit ${unit.id === mappingSelectedUnitId ? "selected" : ""}" data-unit-id="${escapeHtml(unit.id)}">
+      <div class="mapping-block-head">
+        <strong>${escapeHtml(unit.hsCode || unit.title || unit.blockType || unit.source)}</strong>
+        <span>p${escapeHtml(unit.pageNumber || "?")} &middot; ${escapeHtml(unit.source)}${unit.blockType ? ` &middot; ${escapeHtml(unit.blockType)}` : ""}</span>
+      </div>
+      <p>${escapeHtml(unit.text)}</p>
+      ${unit.section ? `<small>${escapeHtml(unit.section)}</small>` : ""}
+    </article>
+  `).join("") || "<div class=\"muted\">No parsed text units match the current filters.</div>";
+  mappingTextViewerEl.querySelectorAll("[data-unit-id]").forEach((element) => {
+    element.addEventListener("mouseenter", () => {
+      const unit = mappingAlignmentIndex?.parsedTextUnits.find((candidate) => candidate.id === element.dataset.unitId);
+      if (unit) previewPdfSpanForUnit(unit);
+    });
+    element.addEventListener("mouseleave", clearMappingPreview);
+    element.addEventListener("click", () => {
+      void selectParsedTextUnit(element.dataset.unitId, { scrollPdf: true, preserveMode: true });
+    });
+  });
+}
+
+function renderMappingMarkdown() {
+  const units = splitMarkdownUnits(mappingData.markdown || "", mappingData.document);
+  mappingTextViewerEl.innerHTML = units.length > 0
+    ? `<div class="mapping-markdown-list">${units.map((unit) => `
+        <article class="mapping-markdown-unit ${unit.markdownAnchor && selectedMarkdownAnchor() === unit.markdownAnchor ? "selected" : ""}" data-markdown-anchor="${escapeHtml(unit.markdownAnchor || "")}">
+          <p>${escapeHtml(unit.text)}</p>
+        </article>
+      `).join("")}</div>`
+    : `<pre class="mapping-markdown">${escapeHtml(mappingData.markdown || "No Markdown found.")}</pre>`;
+  scrollMappingMarkdownIntoView();
 }
 
 function renderMappingSections() {
@@ -1571,18 +2046,27 @@ async function selectMappingBlock(blockId, options = {}) {
   if (!block) return;
   mappingSelectedBlockId = block.id;
   mappingSelectedSectionKey = block.section ? sectionKey(block) : null;
+  mappingSelectedUnitId = mappingAlignmentIndex?.parsedTextUnits.find((unit) => unit.blockId === block.id)?.id || null;
+  if (!options.preservePdfSpan) {
+    mappingSelectedPdfSpanId = null;
+  }
+  mappingMatchInfo = { score: 0, confidence: options.confidence || "fallback", reasons: ["block-selection"] };
   if (block.pageNumber !== mappingCurrentPage) {
     await renderMappingPage(block.pageNumber);
   } else {
     renderMappingOverlays();
   }
-  if (options.scrollText !== false && mappingModeSelect && mappingModeSelect.value !== "blocks") {
-    mappingModeSelect.value = "blocks";
+  if (options.scrollText !== false && mappingModeSelect && !["blocks", "parsed-text"].includes(mappingModeSelect.value)) {
+    mappingModeSelect.value = "parsed-text";
   }
   renderMappingTextViewer();
-  renderMappingDetails(block);
+  renderMappingDetails(block, undefined, mappingAlignmentIndex?.parsedTextUnits.find((unit) => unit.id === mappingSelectedUnitId));
   if (options.scrollText !== false) {
-    scrollMappingBlockIntoView(block.id);
+    if (mappingModeSelect?.value === "parsed-text" && mappingSelectedUnitId) {
+      scrollMappingUnitIntoView(mappingSelectedUnitId);
+    } else {
+      scrollMappingBlockIntoView(block.id);
+    }
   }
   if (options.scrollPdf !== false) {
     mappingPdfStage?.scrollIntoView({ block: "nearest" });
@@ -1593,6 +2077,9 @@ async function selectMappingSection(section) {
   if (!section) return;
   mappingSelectedSectionKey = sectionKey(section);
   mappingSelectedBlockId = null;
+  mappingSelectedUnitId = null;
+  mappingSelectedPdfSpanId = null;
+  mappingMatchInfo = { score: 0, confidence: "fallback", reasons: ["section-page-fallback"] };
   const page = Number(section.pageStart) || 1;
   await renderMappingPage(page);
   renderMappingTextViewer();
@@ -1600,12 +2087,15 @@ async function selectMappingSection(section) {
   scrollMappingSectionIntoView();
 }
 
-function renderMappingDetails(block, section) {
+function renderMappingDetails(block, section, unit) {
   if (!mappingDetailsEl) return;
+  const confidence = mappingMatchInfo?.confidence || "none";
+  const reasonText = (mappingMatchInfo?.reasons || []).join(", ") || "n/a";
   if (section) {
     mappingDetailsEl.className = "mapping-details";
     mappingDetailsEl.innerHTML = `
       <dl>
+        <dt>confidence</dt><dd>${escapeHtml(confidence)}</dd>
         <dt>section</dt><dd>${escapeHtml(section.section || "n/a")}</dd>
         <dt>hsCode</dt><dd>${escapeHtml(section.hsCode || "n/a")}</dd>
         <dt>title</dt><dd>${escapeHtml(section.title || "n/a")}</dd>
@@ -1617,12 +2107,17 @@ function renderMappingDetails(block, section) {
   }
   if (!block) {
     mappingDetailsEl.className = "mapping-details muted";
-    mappingDetailsEl.textContent = "Click a PDF overlay or parsed block to inspect mapping metadata.";
+    mappingDetailsEl.textContent = mappingMatchInfo?.confidence === "none"
+      ? "No parsed text match found. Try block overlay fallback or a nearby text span."
+      : "Click a PDF text span, PDF block, or parsed text unit to inspect mapping metadata.";
     return;
   }
   mappingDetailsEl.className = "mapping-details";
   mappingDetailsEl.innerHTML = `
     <dl>
+      <dt>confidence</dt><dd>${escapeHtml(confidence)}</dd>
+      <dt>match reasons</dt><dd>${escapeHtml(reasonText)}</dd>
+      ${unit ? `<dt>unit</dt><dd>${escapeHtml(unit.id)} (${escapeHtml(unit.source)})</dd>` : ""}
       <dt>id</dt><dd>${escapeHtml(block.id)}</dd>
       <dt>page</dt><dd>${escapeHtml(block.pageNumber)}</dd>
       <dt>type</dt><dd>${escapeHtml(block.type)}</dd>
@@ -1663,10 +2158,35 @@ function scrollMappingBlockIntoView(blockId) {
   element?.scrollIntoView({ block: "center", behavior: "smooth" });
 }
 
+function scrollMappingUnitIntoView(unitId) {
+  const element = mappingTextViewerEl?.querySelector(`[data-unit-id="${cssEscape(unitId)}"]`);
+  element?.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
 function scrollMappingSectionIntoView() {
   if (!mappingSelectedSectionKey) return;
   const element = mappingTextViewerEl?.querySelector(`[data-mapping-section="${cssEscape(mappingSelectedSectionKey)}"]`);
   element?.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
+function scrollMappingMarkdownIntoView() {
+  const anchor = selectedMarkdownAnchor();
+  if (!anchor) return;
+  const element = mappingTextViewerEl?.querySelector(`[data-markdown-anchor="${cssEscape(anchor)}"]`);
+  element?.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
+function selectedMarkdownAnchor() {
+  const unit = mappingAlignmentIndex?.parsedTextUnits.find((candidate) => candidate.id === mappingSelectedUnitId);
+  if (unit?.markdownAnchor) return unit.markdownAnchor;
+  if (mappingSelectedSectionKey) return markdownAnchorForText(mappingSelectedSectionKey);
+  return "";
+}
+
+function markdownAnchorForText(text) {
+  return normalizeTextForAlignment(text)
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function setMappingStatus(message, warning = false) {
@@ -1866,9 +2386,12 @@ async function loadSettings() {
   }
   settings = payload;
   syncGeminiEnabledInputs();
+  const secretWriteNote = payload.localDemoSecretWriteEnabled === false
+    ? " Save disabled unless env variables are set outside the UI."
+    : "";
   pageIndexSettingsStatusEl.textContent = payload.hasPageIndexApiKey
-    ? `PageIndex key configured: yes (${payload.maskedPageIndexApiKey})`
-    : "PageIndex key configured: no";
+    ? `PageIndex key configured: yes (${payload.maskedPageIndexApiKey}).${secretWriteNote}`
+    : `PageIndex key configured: no.${secretWriteNote}`;
   geminiSettingsStatusEl.textContent = payload.hasGeminiApiKey
     ? `Gemini keys configured: ${payload.configuredGeminiKeyCount || 1} (${payload.maskedGeminiApiKey})`
     : "Gemini keys configured: no";

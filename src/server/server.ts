@@ -1,7 +1,8 @@
 import path from "node:path";
 import express from "express";
-import { loadEnvConfig } from "../config/env";
+import { localhostExposureWarning, loadEnvConfig } from "../config/env";
 import { createApiRouter } from "./routes";
+import { cleanupTmpDirectory } from "../utils/tempCleanup";
 
 const config = loadEnvConfig();
 const app = express();
@@ -19,8 +20,24 @@ app.get(/.*/, (_req, res) => {
   res.sendFile(path.join(uiDir, "index.html"));
 });
 
-const server = app.listen(config.port, () => {
-  console.log(`Local UI: http://localhost:${config.port}`);
+if (config.tmpCleanupOnStart) {
+  void cleanupTmpDirectory({ retentionHours: config.tmpRetentionHours })
+    .then((result) => {
+      console.log(
+        `Temp cleanup: removed ${result.removedDirs} dirs and ${result.removedFiles} files (${result.removedBytes} bytes), skipped ${result.skippedEntries}.`
+      );
+    })
+    .catch((error) => {
+      console.warn(`Temp cleanup skipped: ${error instanceof Error ? error.message : String(error)}`);
+    });
+}
+
+const server = app.listen(config.port, config.host, () => {
+  console.log(`Local UI: http://${config.host}:${config.port}`);
+  const warning = localhostExposureWarning(config.host);
+  if (warning) {
+    console.warn(warning);
+  }
 });
 
 server.on("error", (error: NodeJS.ErrnoException) => {

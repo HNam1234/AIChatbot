@@ -12,6 +12,7 @@ import {
 } from "../cache/cacheManifest";
 import {
   getApiSettingsStatus,
+  canWriteSecretsFromUi,
   isGeminiKeySlotName,
   loadEnvConfig,
   maskSecret,
@@ -45,6 +46,7 @@ import {
   hsCodesForSection,
   HS_CODE_PATTERN,
   normalizeSectionMetadata,
+  propagateGroupedSectionPageRanges,
   rankSectionsForQuestion,
   selectRelevantSections,
   selectAlternativeSections,
@@ -111,6 +113,32 @@ interface CachedTreeRetrievalResult {
   signals: QuerySignals;
   pageIndexResults: CandidateRelevance[];
   bm25Results: CandidateRelevance[];
+}
+
+type PublicIndexSource = "fresh_cached_tree" | "stale_cached_tree" | "local_sections" | "bm25_fallback" | "pageindex_live" | "unknown";
+type AnswerStyleOption = "class-eval" | "verbose";
+
+interface CacheFreshnessSummary {
+  fresh: string[];
+  stale: string[];
+  missing: string[];
+}
+
+type QaScopeMode = "all" | "selected";
+
+interface QaScopeSummary {
+  mode: QaScopeMode;
+  requestedDocuments: string[];
+  allowedDocuments: string[];
+  filteredOutCandidateCount: number;
+}
+
+interface QaScopeTracker {
+  mode: QaScopeMode;
+  requestedDocuments: string[];
+  allowedDocuments: string[];
+  allowedDocumentSet: Set<string>;
+  filteredOutCandidateCount: number;
 }
 
 interface CachedTreeDocument {
@@ -193,6 +221,10 @@ export function createApiRouter(): express.Router {
 
   router.post("/settings/pageindex-key", async (req, res) => {
     try {
+      if (!canWriteSecretsFromUi()) {
+        res.status(403).json({ error: "Secret write is disabled. Set env variables outside the UI." });
+        return;
+      }
       const apiKey = stringValue(req.body.apiKey);
       if (!apiKey) {
         res.status(400).json({ error: "PageIndex API key is required." });
@@ -208,6 +240,10 @@ export function createApiRouter(): express.Router {
 
   router.post("/settings/gemini-key", async (req, res) => {
     try {
+      if (!canWriteSecretsFromUi()) {
+        res.status(403).json({ error: "Secret write is disabled. Set env variables outside the UI." });
+        return;
+      }
       const apiKey = stringValue(req.body.apiKey);
       const slot = stringValue(req.body.slot);
       if (!apiKey) {
@@ -235,6 +271,10 @@ export function createApiRouter(): express.Router {
 
   router.post("/settings/gemini-key-enabled", async (req, res) => {
     try {
+      if (!canWriteSecretsFromUi()) {
+        res.status(403).json({ error: "Secret write is disabled. Set env variables outside the UI." });
+        return;
+      }
       const slot = stringValue(req.body.slot);
       if (!isGeminiKeySlotName(slot)) {
         res.status(400).json({ error: "Invalid Gemini key slot." });
@@ -292,6 +332,11 @@ export function createApiRouter(): express.Router {
       const files = (req.files ?? []) as Express.Multer.File[];
       const pdfFiles = files.filter((file) => file.fieldname === "pdf" || file.fieldname === "files" || file.fieldname === "files[]");
       const uploadedBytes = pdfFiles.reduce((sum, file) => sum + file.size, 0);
+      serverTrace("routes.runPipeline", "request started", {
+        fileCount: pdfFiles.length,
+        totalUploadBytes: uploadedBytes,
+        elapsedMs: Date.now() - startedAt
+      });
       const cachedFiles = parseCachedRunFiles(req.body.cachedFiles);
       const cachedInputFiles = await resolveCachedRunFiles(cachedFiles);
       if (uploadedBytes > MAX_UPLOAD_TOTAL_BYTES) {
@@ -300,6 +345,15 @@ export function createApiRouter(): express.Router {
       }
       if (pdfFiles.length + cachedInputFiles.length === 0) {
         res.status(400).json({ ok: false, error: "At least one PDF file is required." });
+        return;
+      }
+      const config = loadEnvConfig();
+      if (JobStore.activeCount() >= config.maxConcurrentJobs) {
+        serverTrace("routes.runPipeline", "request rejected by concurrency guard", {
+          activeJobs: JobStore.activeCount(),
+          maxConcurrentJobs: config.maxConcurrentJobs
+        });
+        res.status(429).json({ ok: false, error: "Another pipeline job is already running. Please wait or cancel it." });
         return;
       }
 
@@ -527,7 +581,8 @@ export function createApiRouter(): express.Router {
       if (requestScope === "all") {
         const cachedAnswer = await answerFromCachedTrees(question, {
           geminiApiKeys: requestGeminiApiKeys,
-          debug: booleanValue(req.body.debug)
+          debug: booleanValue(req.body.debug),
+          answerStyle: parseAnswerStyle(req.body.answerStyle)
         });
         serverTrace("routes.ask", "cached-tree answer sent", { elapsedMs: Date.now() - startedAt });
         res.json(cachedAnswer);
@@ -542,7 +597,8 @@ export function createApiRouter(): express.Router {
         const cachedAnswer = await answerFromCachedTrees(question, {
           geminiApiKeys: requestGeminiApiKeys,
           debug: booleanValue(req.body.debug),
-          cachedTreeDocuments: requestedCachedTreeDocuments
+          cachedTreeDocuments: requestedCachedTreeDocuments,
+          answerStyle: parseAnswerStyle(req.body.answerStyle)
         });
         serverTrace("routes.ask", "selected cached-tree answer sent", { elapsedMs: Date.now() - startedAt });
         res.json(cachedAnswer);
@@ -553,7 +609,8 @@ export function createApiRouter(): express.Router {
         const cachedAnswer = await answerFromCachedTrees(question, {
           geminiApiKeys: requestGeminiApiKeys,
           debug: booleanValue(req.body.debug),
-          localSectionDocuments: splitDocIds(stringValue(req.body.document))
+          localSectionDocuments: splitDocIds(stringValue(req.body.document)),
+          answerStyle: parseAnswerStyle(req.body.answerStyle)
         });
         serverTrace("routes.ask", "local-section answer sent", { elapsedMs: Date.now() - startedAt });
         res.json({ ...cachedAnswer, mode: "local-sections" });
@@ -596,12 +653,22 @@ export function createApiRouter(): express.Router {
       res.json({
         answer: chat.answer,
         docIds,
-        indexSource: {
+        scope: {
+          mode: docIds.length > 0 ? "selected" : "all",
+          requestedDocuments: requestedDocIds,
+          allowedDocuments: docIds,
+          filteredOutCandidateCount: 0
+        },
+        indexSource: "pageindex_live",
+        indexSourceDetails: {
           label: "Fresh PageIndex tree",
           source: "pageindex-chat",
           cachedDocumentCount: 0,
           documents: docIds.map((docId) => ({ docId, status: "remote-pageindex" }))
         },
+        cachedDocumentCount: 0,
+        cacheFreshness: { fresh: [], stale: [], missing: [] },
+        pageIndexUploadStatus: "fresh",
         validation
       });
     } catch (error) {
@@ -678,7 +745,7 @@ function sendUploadError(error: unknown, res: express.Response, elapsedMs: numbe
   }
 
   if (error instanceof multer.MulterError) {
-    serverTrace("sendUploadError", "multer/busboy error", {
+    serverTrace("sendUploadError", "multipart error", {
       code: error.code,
       elapsedMs
     });
@@ -686,7 +753,7 @@ function sendUploadError(error: unknown, res: express.Response, elapsedMs: numbe
     return;
   }
 
-  serverTrace("sendUploadError", "multer/busboy error", {
+  serverTrace("sendUploadError", "multipart error", {
     elapsedMs,
     error: error instanceof Error ? error.message : String(error)
   });
@@ -1326,16 +1393,81 @@ async function listCachedTreeDocuments(): Promise<CachedTreeDocument[]> {
   return documents.sort((left, right) => left.document.localeCompare(right.document));
 }
 
-async function answerFromCachedTrees(
+function createQaScope(requestedDocuments: string[]): QaScopeTracker {
+  const requested = uniqueStrings(requestedDocuments.filter(Boolean));
+  const mode: QaScopeMode = requested.length > 0 ? "selected" : "all";
+  return {
+    mode,
+    requestedDocuments: requested,
+    allowedDocuments: requested,
+    allowedDocumentSet: new Set(requested),
+    filteredOutCandidateCount: 0
+  };
+}
+
+function scopeAllowsDocument(scope: QaScopeTracker, document: string | undefined): boolean {
+  if (scope.mode === "all") {
+    return true;
+  }
+  if (document && scope.allowedDocumentSet.has(document)) {
+    return true;
+  }
+  scope.filteredOutCandidateCount += 1;
+  return false;
+}
+
+function scopeSnapshot(scope: QaScopeTracker, fallbackAllowedDocuments: string[] = []): QaScopeSummary {
+  const allowedDocuments = scope.mode === "selected"
+    ? scope.allowedDocuments
+    : uniqueStrings(fallbackAllowedDocuments);
+  return {
+    mode: scope.mode,
+    requestedDocuments: scope.requestedDocuments,
+    allowedDocuments,
+    filteredOutCandidateCount: scope.filteredOutCandidateCount
+  };
+}
+
+function scopedNotFoundMessage(scope: QaScopeTracker): string | undefined {
+  return scope.mode === "selected"
+    ? "Không tìm thấy ngữ cảnh phù hợp trong các tài liệu đã chọn."
+    : undefined;
+}
+
+function applyScopedNotFoundAnswer(routed: RoutedQaAnswer, scope: QaScopeTracker): RoutedQaAnswer {
+  if (scope.mode !== "selected") {
+    return routed;
+  }
+  const hasSelectedSection = Boolean(routed.selectedPrimary);
+  const hasSummaryDocument = Boolean(routed.documentSummary?.document);
+  if (hasSelectedSection || hasSummaryDocument) {
+    return routed;
+  }
+  return {
+    ...routed,
+    answer: scopedNotFoundMessage(scope) ?? routed.answer
+  };
+}
+
+export async function answerFromCachedTrees(
   question: string,
-  options: { geminiApiKeys?: string[]; debug?: boolean; cachedTreeDocuments?: string[]; localSectionDocuments?: string[] } = {}
+  options: {
+    geminiApiKeys?: string[];
+    debug?: boolean;
+    cachedTreeDocuments?: string[];
+    localSectionDocuments?: string[];
+    answerStyle?: AnswerStyleOption;
+  } = {}
 ): Promise<Record<string, unknown>> {
   const startedAt = Date.now();
   const detection = detectIntent(question);
+  const answerStyle = options.answerStyle ?? "class-eval";
   const selectedCachedTreeDocuments = uniqueStrings(options.cachedTreeDocuments ?? []);
   const localSectionDocuments = uniqueStrings(options.localSectionDocuments ?? []);
+  const scope = createQaScope([...selectedCachedTreeDocuments, ...localSectionDocuments]);
   serverTrace("answerFromCachedTrees", "started", {
     intent: detection.intent,
+    scope: scope.mode,
     overrideGeminiKeys: options.geminiApiKeys?.length ?? 0,
     selectedCachedTreeDocuments: selectedCachedTreeDocuments.length,
     localSectionDocuments: localSectionDocuments.length
@@ -1344,7 +1476,7 @@ async function answerFromCachedTrees(
   const cachedDocuments = forceLocalSections ? [] : await listCachedTreeDocuments();
   const selectedCachedTreeSet = new Set(selectedCachedTreeDocuments);
   const documents = selectedCachedTreeSet.size > 0
-    ? cachedDocuments.filter((document) => selectedCachedTreeSet.has(document.document))
+    ? cachedDocuments.filter((document) => selectedCachedTreeSet.has(document.document) && scopeAllowsDocument(scope, document.document))
     : cachedDocuments;
   const localFallbackDocuments = localSectionDocuments.length > 0 ? localSectionDocuments : selectedCachedTreeDocuments;
   serverTrace("answerFromCachedTrees", "cached tree documents loaded", {
@@ -1358,12 +1490,13 @@ async function answerFromCachedTrees(
   }
 
   const scopedDocumentNames = documents.length > 0
-    ? documents.map((document) => document.document)
+    ? uniqueStrings([...documents.map((document) => document.document), ...localSectionDocuments])
     : localFallbackDocuments;
   const [sectionMetadata, documentMetadata] = await Promise.all([
-    loadSectionMetadata(scopedDocumentNames),
+    loadSectionMetadata(scopedDocumentNames, scope),
     loadDocumentMetadata(scopedDocumentNames)
   ]);
+  const scopeInfo = scopeSnapshot(scope, scopedDocumentNames);
   const baseDebug = {
     detectedIntent: detection.intent,
     intentConfidence: detection.confidence,
@@ -1377,46 +1510,54 @@ async function answerFromCachedTrees(
       scopedDocumentNames,
       sectionMetadataCount: sectionMetadata.length,
       documentMetadataCount: documentMetadata.length
-    }
+    },
+    scope: scopeInfo
   };
+  const responseCacheInfo = buildCacheResponseFields(documents, documents.length > 0 ? "cached-pageindex-tree" : "local-sections");
 
   if (detection.intent === "exact_hscode_lookup") {
     const routed = handleExactHsCodeLookup(question, sectionMetadata, detection, baseDebug);
-    return finalizeRoutedAnswer(routed, {
+    return finalizeRoutedAnswer(applyScopedNotFoundAnswer(routed, scope), {
       mode: "cached-tree",
       documents,
       sourceDocuments: routed.selectedPrimary?.document ? [String(routed.selectedPrimary.document)] : [],
       retrieval: undefined,
-      debug: options.debug
+      debug: options.debug,
+      cacheInfo: responseCacheInfo,
+      scope
     });
   }
 
   if (detection.intent === "chapter_summary") {
     const routed = handleChapterSummary(question, sectionMetadata, documentMetadata, detection, baseDebug);
-    return finalizeRoutedAnswer(routed, {
+    return finalizeRoutedAnswer(applyScopedNotFoundAnswer(routed, scope), {
       mode: "cached-tree",
       documents,
       sourceDocuments: routed.documentSummary?.document ? [String(routed.documentSummary.document)] : [],
       retrieval: undefined,
-      debug: options.debug
+      debug: options.debug,
+      cacheInfo: responseCacheInfo,
+      scope
     });
   }
 
   if (detection.intent === "document_summary") {
     const routed = handleDocumentSummary(question, sectionMetadata, documentMetadata, detection, baseDebug);
-    return finalizeRoutedAnswer(routed, {
+    return finalizeRoutedAnswer(applyScopedNotFoundAnswer(routed, scope), {
       mode: "cached-tree",
       documents,
       sourceDocuments: routed.documentSummary?.document ? [String(routed.documentSummary.document)] : [],
       retrieval: undefined,
-      debug: options.debug
+      debug: options.debug,
+      cacheInfo: responseCacheInfo,
+      scope
     });
   }
 
   const searchStartedAt = Date.now();
   const retrieval = documents.length > 0
-    ? await searchCachedTreeDocuments(question, documents)
-    : await searchLocalSectionsOnly(question, localFallbackDocuments);
+    ? await searchCachedTreeDocuments(question, documents, scope)
+    : await searchLocalSectionsOnly(question, localFallbackDocuments, scope);
   const hits = retrieval.hits;
   const debugReport = createQaDebugReport(question, retrieval);
   serverTrace("answerFromCachedTrees", "cached tree search completed", {
@@ -1440,13 +1581,14 @@ async function answerFromCachedTrees(
           indexSource
         });
     const emptyResponse = {
-      answer: documents.length > 0
+      answer: scopedNotFoundMessage(scope) ?? (documents.length > 0
         ? "Không tìm thấy ngữ cảnh phù hợp trong các cached tree JSON."
-        : "Không tìm thấy ngữ cảnh phù hợp trong local sections cache.",
+        : "Không tìm thấy ngữ cảnh phù hợp trong local sections cache."),
+      scope: scopeSnapshot(scope, documents.map((document) => document.document)),
       docIds: [],
       documents: documents.map((document) => document.document),
       mode: "cached-tree",
-      indexSource,
+      indexSourceDetails: indexSource,
       retrieval: {
         source: retrieval.retrievalSource,
         bm25FallbackUsed: retrieval.bm25FallbackUsed,
@@ -1455,22 +1597,24 @@ async function answerFromCachedTrees(
         selectedSection: null,
         finalHsCodes: [],
         answerRepairApplied: false
-      }
+      },
+      ...buildCacheResponseFields(documents, retrieval.retrievalSource),
+      answerGeneration: "template"
     };
     return options.debug
       ? {
           ...emptyResponse,
           intent: routed.intent,
-          answer: routed.answer,
+          answer: emptyResponse.answer,
           selectedPrimary: null,
           documentSummary: null,
           citations: [],
-          debug: routed.debug
+          debug: { ...routed.debug, scope: emptyResponse.scope }
         }
       : {
           ...emptyResponse,
           intent: routed.intent,
-          answer: routed.answer,
+          answer: emptyResponse.answer,
           selectedPrimary: null,
           documentSummary: null,
           citations: []
@@ -1487,7 +1631,18 @@ async function answerFromCachedTrees(
   });
   let llmAnswer: string | undefined;
   let llmError: string | undefined;
+  const useTemplateFastPath = shouldUseTemplateFastPath(detection.intent, hits[0], answerStyle);
+  if (useTemplateFastPath) {
+    serverTrace("answerFromCachedTrees", "template fast path used", {
+      intent: detection.intent,
+      selectedSection: hits[0].section,
+      answerStyle
+    });
+  }
   try {
+    if (useTemplateFastPath) {
+      throw new TemplateFastPathSkip();
+    }
     const llm = new GeminiRoundRobinClient({ apiKeys: resolveGeminiApiKeys(options.geminiApiKeys ?? []) });
     const llmStartedAt = Date.now();
     serverTrace("answerFromCachedTrees", "gemini synthesis started", { keyCount: llm.keyCount });
@@ -1522,18 +1677,24 @@ async function answerFromCachedTrees(
       elapsedMs: Date.now() - llmStartedAt
     });
   } catch (error) {
+    if (error instanceof TemplateFastPathSkip) {
+      llmError = undefined;
+    } else {
     llmError = error instanceof Error ? error.message : String(error);
     serverTrace("answerFromCachedTrees", "gemini synthesis failed; using fallback formatter", { error: llmError });
+    }
   }
   const alternatives = selectAlternativeSections(hits, question);
   const routed = detection.intent === "definition"
     ? handleDefinition(question, hits[0], retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults, detection, {
         ...baseDebug,
-        ...debugReport
+        ...debugReport,
+        answerGeneration: useTemplateFastPath ? "template" : llmAnswer ? "llm" : "template-fallback"
       })
     : handleProductClassification(question, hits[0], alternatives, llmAnswer, retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults, detection, {
         ...baseDebug,
-        ...debugReport
+        ...debugReport,
+        answerGeneration: useTemplateFastPath ? "template" : llmAnswer ? "llm" : "template-fallback"
       });
   const answer = routed.answer;
   const finalHsCodes = Array.isArray(routed.debug.finalHsCodes) ? routed.debug.finalHsCodes as string[] : hsCodesForSection(hits[0]);
@@ -1543,16 +1704,28 @@ async function answerFromCachedTrees(
   serverTrace("answerFromCachedTrees", "completed", { elapsedMs: Date.now() - startedAt });
   const sourceDocuments = uniqueStrings(hits.map((hit) => hit.document));
   const indexSource = buildIndexSource(retrieval, documents, sourceDocuments);
+  const cacheInfo = buildCacheResponseFields(documents, retrieval.retrievalSource);
 
   const response = {
     intent: routed.intent,
+    answerMode: routed.answerMode,
+    answerConfidence: routed.answerConfidence,
+    confidenceReason: routed.debug.confidenceReason,
+    finalScore: routed.debug.finalScore,
+    strongSignals: routed.debug.strongSignals ?? [],
+    contradictions: routed.debug.contradictions ?? [],
     answer,
     selectedPrimary: routed.selectedPrimary,
     documentSummary: routed.documentSummary,
+    scope: scopeSnapshot(scope, documents.map((document) => document.document)),
     docIds: [],
     documents: sourceDocuments,
     mode: "cached-tree",
-    indexSource,
+    indexSource: cacheInfo.indexSource,
+    indexSourceDetails: indexSource,
+    cachedDocumentCount: cacheInfo.cachedDocumentCount,
+    cacheFreshness: cacheInfo.cacheFreshness,
+    pageIndexUploadStatus: cacheInfo.pageIndexUploadStatus,
     retrieval: {
       source: retrieval.retrievalSource,
       bm25FallbackUsed: retrieval.bm25FallbackUsed,
@@ -1565,27 +1738,30 @@ async function answerFromCachedTrees(
     citations: routed.citations,
     retrievedSections: topHits.slice(0, 5).map(publicSectionCitation),
     metadataWarnings: hits[0].metadataWarnings,
+    answerGeneration: useTemplateFastPath ? "template" : llmAnswer ? "llm" : "template-fallback",
     llmError,
     validation: {
       ...validation,
       markers: [marker12, marker13, ...validation.markers]
     }
   };
-  return options.debug ? { ...response, debug: routed.debug } : response;
+  return options.debug ? { ...response, debug: { ...routed.debug, scope: response.scope } } : response;
 }
 
 async function searchCachedTreeDocuments(
   question: string,
-  documents: CachedTreeDocument[]
+  documents: CachedTreeDocument[],
+  scope: QaScopeTracker
 ): Promise<CachedTreeRetrievalResult> {
   const contrast = detectContrastTerms(question);
   const signals = extractQuerySignals(question);
   const queryTokens = tokenizeForSearch(question);
   const scoringContext = { queryTokens, contrast };
-  const sectionMetadata = await loadSectionMetadata(documents.map((document) => document.document));
+  const scopedDocuments = documents.filter((document) => scopeAllowsDocument(scope, document.document));
+  const sectionMetadata = await loadSectionMetadata(scopedDocuments.map((document) => document.document), scope);
   const pageIndexHits: EnrichedRetrievedSection[] = [];
 
-  for (const document of documents) {
+  for (const document of scopedDocuments) {
     const treeJson = await readOptionalJson<Record<string, unknown>>(path.resolve(process.cwd(), document.treePath));
     const roots = normalizeTreeRoots(treeJson);
     for (const node of flattenCachedTreeNodes(roots)) {
@@ -1636,14 +1812,33 @@ async function searchCachedTreeDocuments(
   };
 }
 
-async function searchLocalSectionsOnly(question: string, documentNames: string[] = []): Promise<CachedTreeRetrievalResult> {
+export async function answerQuestionForEval(
+  question: string,
+  options: {
+    cachedTreeDocuments?: string[];
+    localSectionDocuments?: string[];
+    debug?: boolean;
+  } = {}
+): Promise<Record<string, unknown>> {
+  return await answerFromCachedTrees(question, {
+    ...options,
+    answerStyle: "class-eval",
+    geminiApiKeys: []
+  });
+}
+
+async function searchLocalSectionsOnly(
+  question: string,
+  documentNames: string[] = [],
+  scope: QaScopeTracker = createQaScope(documentNames)
+): Promise<CachedTreeRetrievalResult> {
   const contrast = detectContrastTerms(question);
   const signals = extractQuerySignals(question);
   const queryTokens = tokenizeForSearch(question);
   const scoringContext = { queryTokens, contrast };
   const allowedDocuments = new Set(documentNames);
-  const sectionMetadata = (await loadSectionMetadata(documentNames))
-    .filter((section) => allowedDocuments.size === 0 || allowedDocuments.has(section.document));
+  const sectionMetadata = (await loadSectionMetadata(documentNames, scope))
+    .filter((section) => (allowedDocuments.size === 0 || allowedDocuments.has(section.document)) && scopeAllowsDocument(scope, section.document));
   const bm25Candidates = rankRetrievedSectionsByUsability(searchLocalSectionMetadataFallback(scoringContext, sectionMetadata), question);
   const bm25Selection = selectRelevantSections(bm25Candidates, question, { requireHsMetadata: true });
   return {
@@ -1697,6 +1892,71 @@ function buildIndexSource(
   };
 }
 
+function buildCacheResponseFields(
+  cachedDocuments: CachedTreeDocument[],
+  retrievalSource: CachedTreeRetrievalResult["retrievalSource"] | "local-sections"
+): {
+  indexSource: PublicIndexSource;
+  cachedDocumentCount: number;
+  cacheFreshness: CacheFreshnessSummary;
+  pageIndexUploadStatus: string;
+} {
+  const cacheFreshness = summarizeCacheFreshness(cachedDocuments);
+  const indexSource = publicIndexSource(retrievalSource, cacheFreshness);
+  return {
+    indexSource,
+    cachedDocumentCount: cachedDocuments.length,
+    cacheFreshness,
+    pageIndexUploadStatus: summarizePageIndexUploadStatus(cachedDocuments)
+  };
+}
+
+function summarizeCacheFreshness(cachedDocuments: CachedTreeDocument[]): CacheFreshnessSummary {
+  return {
+    fresh: cachedDocuments.filter((document) => document.pageIndexCacheStatus === "fresh").map((document) => document.document),
+    stale: cachedDocuments.filter((document) => document.pageIndexCacheStatus === "stale").map((document) => document.document),
+    missing: cachedDocuments.filter((document) => !["fresh", "stale"].includes(document.pageIndexCacheStatus)).map((document) => document.document)
+  };
+}
+
+function publicIndexSource(
+  retrievalSource: CachedTreeRetrievalResult["retrievalSource"] | "local-sections",
+  freshness: CacheFreshnessSummary
+): PublicIndexSource {
+  if (retrievalSource === "local-sections") return "local_sections";
+  if (retrievalSource === "bm25-fallback") return "bm25_fallback";
+  if (retrievalSource === "pageindex-tree") return "pageindex_live";
+  if (retrievalSource === "cached-pageindex-tree") {
+    return freshness.stale.length > 0 ? "stale_cached_tree" : "fresh_cached_tree";
+  }
+  return "unknown";
+}
+
+function summarizePageIndexUploadStatus(cachedDocuments: CachedTreeDocument[]): string {
+  if (cachedDocuments.length === 0) return "missing";
+  if (cachedDocuments.some((document) => document.pageIndexCacheStatus === "failed")) return "failed";
+  if (cachedDocuments.some((document) => document.pageIndexCacheStatus === "stale")) return "stale";
+  if (cachedDocuments.every((document) => document.pageIndexCacheStatus === "fresh")) return "fresh";
+  return "skipped";
+}
+
+class TemplateFastPathSkip extends Error {}
+
+function shouldUseTemplateFastPath(intent: string, section: EnrichedRetrievedSection, answerStyle: AnswerStyleOption): boolean {
+  if (answerStyle === "verbose") {
+    return false;
+  }
+  const hasCodes = hsCodesForSection(section).length > 0;
+  const hasTitle = Boolean(section.title || section.section);
+  if (!hasCodes || !hasTitle) {
+    return false;
+  }
+  if (intent === "definition") {
+    return Boolean(section.text || section.captions.length > 0);
+  }
+  return intent === "product_classification";
+}
+
 function finalizeRoutedAnswer(
   routed: RoutedQaAnswer,
   options: {
@@ -1705,6 +1965,8 @@ function finalizeRoutedAnswer(
     sourceDocuments: string[];
     retrieval?: CachedTreeRetrievalResult;
     debug?: boolean;
+    cacheInfo?: ReturnType<typeof buildCacheResponseFields>;
+    scope?: QaScopeTracker;
   }
 ): Record<string, unknown> {
   const indexSource = options.retrieval
@@ -1721,15 +1983,30 @@ function finalizeRoutedAnswer(
         typeof routed.selectedPrimary.hsCode === "string" ? routed.selectedPrimary.hsCode : ""
       ].filter(Boolean))
     : [];
+  const cacheInfo = options.cacheInfo ?? buildCacheResponseFields(options.documents, options.retrieval?.retrievalSource ?? "local-sections");
+  const responseScope = options.scope
+    ? scopeSnapshot(options.scope, options.documents.map((document) => document.document))
+    : routed.debug.scope ?? null;
   const response = {
     intent: routed.intent,
+    answerMode: routed.answerMode,
+    answerConfidence: routed.answerConfidence,
+    confidenceReason: routed.debug.confidenceReason,
+    finalScore: routed.debug.finalScore,
+    strongSignals: routed.debug.strongSignals ?? [],
+    contradictions: routed.debug.contradictions ?? [],
     answer: routed.answer,
     selectedPrimary: routed.selectedPrimary,
     documentSummary: routed.documentSummary,
+    scope: responseScope,
     docIds: [],
     documents: options.sourceDocuments,
     mode: options.mode,
-    indexSource,
+    indexSource: cacheInfo.indexSource,
+    indexSourceDetails: indexSource,
+    cachedDocumentCount: cacheInfo.cachedDocumentCount,
+    cacheFreshness: cacheInfo.cacheFreshness,
+    pageIndexUploadStatus: cacheInfo.pageIndexUploadStatus,
     retrieval: {
       source: options.retrieval?.retrievalSource ?? "local-metadata",
       bm25FallbackUsed: options.retrieval?.bm25FallbackUsed ?? false,
@@ -1742,9 +2019,10 @@ function finalizeRoutedAnswer(
     citations: routed.citations,
     retrievedSections: [],
     metadataWarnings: [],
+    answerGeneration: "template",
     validation: QAValidator.validateResponse(routed.answer, { requireCitations: false })
   };
-  return options.debug ? { ...response, debug: routed.debug } : response;
+  return options.debug ? { ...response, debug: { ...routed.debug, scope: response.scope } } : response;
 }
 
 function publicCachedTreeDocument(document: CachedTreeDocument): Record<string, unknown> {
@@ -1817,15 +2095,25 @@ function scoreRetrievedCandidate(scoringContext: SearchScoringContext, title: st
   return positiveScore - baselinePenalty;
 }
 
-async function loadSectionMetadata(documentNames: string[]): Promise<SectionMetadata[]> {
+async function loadSectionMetadata(documentNames: string[], scope: QaScopeTracker = createQaScope(documentNames)): Promise<SectionMetadata[]> {
   const records: SectionMetadata[] = [];
   const seen = new Set<string>();
+  const allowedDocuments = new Set(documentNames);
   const append = (items: unknown[], fallbackDocument?: string) => {
     for (const item of items) {
       if (typeof item !== "object" || item === null) {
         continue;
       }
       const section = normalizeSectionMetadata(item as Record<string, unknown>, fallbackDocument);
+      if (allowedDocuments.size > 0 && !allowedDocuments.has(section.document)) {
+        if (scope.mode === "selected") {
+          scope.filteredOutCandidateCount += 1;
+        }
+        continue;
+      }
+      if (!scopeAllowsDocument(scope, section.document)) {
+        continue;
+      }
       const key = `${section.document}|${section.hsCode ?? ""}|${section.section ?? ""}`;
       if (!section.document || seen.has(key)) {
         continue;
@@ -1852,7 +2140,7 @@ async function loadSectionMetadata(documentNames: string[]): Promise<SectionMeta
     }
   }
 
-  return records;
+  return propagateGroupedSectionPageRanges(records);
 }
 
 async function loadDocumentMetadata(documentNames: string[]): Promise<QaDocumentMetadata[]> {
@@ -2189,6 +2477,10 @@ function booleanValue(value: unknown): boolean {
   return value === "true" || value === "on" || value === "1" || value === true;
 }
 
+function parseAnswerStyle(value: unknown): AnswerStyleOption {
+  return value === "verbose" ? "verbose" : "class-eval";
+}
+
 function relativePath(filePath: string | undefined): string | undefined {
   if (!filePath) {
     return undefined;
@@ -2254,6 +2546,9 @@ async function saveJobDebugLog(
 }
 
 function serverTrace(functionName: string, message: string, details: Record<string, unknown> = {}): void {
+  if (process.env.QA_EVAL_QUIET === "1") {
+    return;
+  }
   const suffix = formatTraceDetails(details);
   console.log(`[${new Date().toISOString()}] ${functionName}: ${message}${suffix}`);
 }
