@@ -796,6 +796,30 @@ figcaption {
   margin-top: 12px;
 }
 
+.retrieval-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 12px;
+  border: 1px solid #c8e6d2;
+  border-radius: 7px;
+  background: #f2fbf5;
+  color: #12643f;
+  padding: 9px 10px;
+  font-size: 13px;
+}
+
+.retrieval-status.warning {
+  border-color: #ecc970;
+  background: #fff8df;
+  color: #664500;
+}
+
+.retrieval-status span {
+  font-weight: 750;
+}
+
 .citation-card {
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -825,6 +849,55 @@ figcaption {
 .citation-card dd {
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+.debug-panel {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  padding: 10px;
+}
+
+.debug-panel summary {
+  cursor: pointer;
+  font-weight: 850;
+  color: var(--primary-strong);
+}
+
+.debug-panel dl {
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr);
+  gap: 8px 10px;
+  margin: 10px 0;
+  font-size: 13px;
+}
+
+.debug-panel pre {
+  max-height: 260px;
+  overflow: auto;
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.debug-candidates {
+  display: grid;
+  gap: 8px;
+}
+
+.debug-candidate {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #c8e6d2;
+  border-radius: 7px;
+  background: #f8fdf9;
+  padding: 8px;
+  font-size: 13px;
+}
+
+.debug-candidate.rejected {
+  border-color: #efc4c4;
+  background: #fff7f7;
 }
 
 a {

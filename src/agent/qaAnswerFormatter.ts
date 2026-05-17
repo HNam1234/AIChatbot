@@ -4,6 +4,7 @@ export interface SectionMetadata {
   document: string;
   chapter?: string;
   hsCode?: string;
+  groupedHsCodes?: string[];
   title?: string;
   section?: string;
   pageStart?: number;
@@ -26,6 +27,7 @@ export interface EnrichedRetrievedSection {
   document: string;
   chapter?: string;
   hsCode?: string;
+  groupedHsCodes?: string[];
   title?: string;
   section?: string;
   pageStart?: number;
@@ -41,6 +43,60 @@ export interface RenderedHsCodeAnswer {
   answer: string;
   citations: EnrichedRetrievedSection[];
   metadataWarnings: string[];
+  finalHsCodes: string[];
+  answerRepairApplied: boolean;
+}
+
+export interface ContrastDetection {
+  terms: string[];
+  baselineTokens: string[];
+}
+
+export interface QuerySignals {
+  domainTerms: string[];
+  productTerms: string[];
+  physicalAttributes: string[];
+  numericRanges: string[];
+  usageTerms: string[];
+  scientificNames: string[];
+  tradeForms: string[];
+  contrastTerms: string[];
+  queryTokens: string[];
+  queryPhrases: string[];
+  quotedTerms: string[];
+  capitalizedTerms: string[];
+}
+
+export interface CandidateRelevance {
+  document: string;
+  hsCode?: string;
+  groupedHsCodes: string[];
+  title?: string;
+  section?: string;
+  source?: string;
+  pageStart: number | null;
+  pageEnd: number | null;
+  matchedTerms: string[];
+  matchedNumericRanges: string[];
+  matchedAttributes: string[];
+  missingImportantTerms: string[];
+  contrastTermOnlyMatch: boolean;
+  relevanceScore: number;
+  queryTokens: string[];
+  queryPhrases: string[];
+  candidateMatchedTokens: string[];
+  candidateMatchedPhrases: string[];
+  numericMatches: string[];
+  contrastTerms: string[];
+  finalScore: number;
+  rejected: boolean;
+  rejectedReason: string | null;
+}
+
+export interface RelevanceSelection {
+  signals: QuerySignals;
+  ranked: EnrichedRetrievedSection[];
+  candidates: CandidateRelevance[];
 }
 
 export function normalizeSectionMetadata(raw: Record<string, unknown>, fallbackDocument?: string): SectionMetadata {
@@ -54,6 +110,11 @@ export function normalizeSectionMetadata(raw: Record<string, unknown>, fallbackD
     document,
     chapter: stringValue(raw.chapter),
     hsCode,
+    groupedHsCodes: groupedHsCodesFromUnknown(raw.groupedHsCodes) ?? extractGroupedHsCodes(
+      [stringValue(raw.text), stringValue(raw.textPreview), stringValue(raw.section), stringValue(raw.markdownHeading)]
+        .filter(Boolean)
+        .join("\n")
+    ),
     title: normalizeDisplayText(title),
     section,
     pageStart: numberValue(raw.pageStart),
@@ -78,6 +139,7 @@ export function enrichRetrievedHit(
   const metadata = findBestSectionMetadata(normalizedHit, sectionMetadata);
   const parsedHsCode = extractHsCode(`${normalizedHit.title}\n${normalizedHit.text}`);
   const hsCode = metadata?.hsCode ?? parsedHsCode;
+  const groupedHsCodes = metadata?.groupedHsCodes ?? extractGroupedHsCodes(`${normalizedHit.title}\n${normalizedHit.text}`);
   const title = metadata?.title ?? titleFromHeading(normalizedHit.title);
   const parsedSection = normalizeDisplayText([hsCode, title].filter(Boolean).join(" — "));
   const section = metadata?.section ?? (parsedSection || normalizedHit.title);
@@ -89,6 +151,7 @@ export function enrichRetrievedHit(
     document: metadata?.document || normalizedHit.document,
     chapter: metadata?.chapter,
     hsCode,
+    groupedHsCodes,
     title,
     section,
     pageStart: metadata?.pageStart,
@@ -104,12 +167,13 @@ export function enrichRetrievedHit(
 export function buildStructuredRetrievedContext(sections: EnrichedRetrievedSection[]): string {
   return sections.map((section, index) => {
     const fields = [
-      `Retrieved section ${index + 1}:`,
+      `[SECTION ${index + 1}]`,
       `- document: ${section.document}`,
       `- chapter: ${section.chapter ?? ""}`,
       `- pageStart: ${section.pageStart ?? ""}`,
       `- pageEnd: ${section.pageEnd ?? ""}`,
       `- hsCode: ${section.hsCode ?? ""}`,
+      `- groupedHsCodes: ${(section.groupedHsCodes ?? []).join(", ")}`,
       `- title: ${section.title ?? ""}`,
       `- section: ${section.section ?? ""}`,
       `- source: ${section.source ?? ""}`,
@@ -123,21 +187,26 @@ export function buildStructuredRetrievedContext(sections: EnrichedRetrievedSecti
 export function renderHsCodeAnswer(
   llmAnswer: string | undefined,
   topSection: EnrichedRetrievedSection,
-  alternatives: EnrichedRetrievedSection[] = []
+  alternatives: EnrichedRetrievedSection[] = [],
+  options: { question?: string } = {}
 ): RenderedHsCodeAnswer {
-  const directAnswer = cleanDirectAnswer(llmAnswer) || fallbackDirectAnswer(topSection);
+  const finalHsCodes = hsCodesForSection(topSection);
+  const directAnswer = stripDisallowedHsCodes(cleanDirectAnswer(llmAnswer), finalHsCodes) || fallbackDirectAnswer(topSection);
   const metadataWarnings = [...topSection.metadataWarnings];
-  const body = topSection.hsCode
-    ? `${ensureSentenceEnd(directAnswer)} HS Code: ${topSection.hsCode}.`
+  const body = finalHsCodes.length > 0
+    ? `${ensureSentenceEnd(directAnswer)} ${formatHsCodeLine(finalHsCodes, options.question)}`
     : `${ensureSentenceEnd(directAnswer)} Không tìm thấy HS Code trong metadata của section được retrieve.`;
   const alternativeLine = formatAlternativeSections(topSection, alternatives);
   const citation = formatCitation(topSection);
   const answer = [body, alternativeLine, citation].filter(Boolean).join("\n\n");
+  const answerRepairApplied = Boolean(llmAnswer) && finalHsCodes.some((code) => !(llmAnswer ?? "").includes(code));
 
   return {
     answer,
     citations: [topSection, ...alternatives],
-    metadataWarnings
+    metadataWarnings,
+    finalHsCodes,
+    answerRepairApplied
   };
 }
 
@@ -173,10 +242,10 @@ export function selectAlternativeSections(
   }
 
   const top = sections[0];
-  const seen = new Set([top?.hsCode, top?.section].filter(Boolean));
+  const seen = new Set([hsCodesForSection(top ?? {}).join("|"), top?.section].filter(Boolean));
   const alternatives: EnrichedRetrievedSection[] = [];
   for (const section of sections.slice(1)) {
-    const key = section.hsCode ?? section.section;
+    const key = hsCodesForSection(section).join("|") || section.section;
     if (!key || seen.has(key)) {
       continue;
     }
@@ -187,6 +256,239 @@ export function selectAlternativeSections(
     }
   }
   return alternatives;
+}
+
+export function detectContrastTerms(question: string): ContrastDetection {
+  const normalized = normalizeForSearch(question);
+  const patterns = [
+    "so voi",
+    "khac voi",
+    "khac",
+    "thay vi",
+    "khong phai",
+    "it hon",
+    "nhieu hon",
+    "dai hon",
+    "dang hon",
+    "hon",
+    "less than",
+    "more than",
+    "compared to",
+    "rather than",
+    "instead of",
+    "different from"
+  ];
+  const matchedTerms = patterns.filter((term) => includesNormalizedPhrase(normalized, term));
+  const terms = matchedTerms.filter((term) => !matchedTerms.some((other) => other !== term && other.includes(term)));
+  const baselineTokens = uniqueStrings([
+    ...terms.flatMap((term) => baselineTokensAfterTerm(normalized, term)),
+    ...baselineTokensFromComparativeThan(normalized)
+  ]);
+  return { terms, baselineTokens };
+}
+
+export function extractQuerySignals(question: string): QuerySignals {
+  const contrast = detectContrastTerms(question);
+  const contrastTokenSet = new Set(contrast.baselineTokens);
+  const quotedTerms = extractQuotedTerms(question);
+  const capitalizedTerms = extractCapitalizedTerms(question);
+  const queryTokens = uniqueStrings([
+    ...meaningfulTokens(question),
+    ...quotedTerms.flatMap(tokenizeForRanking),
+    ...capitalizedTerms.flatMap(tokenizeForRanking)
+  ]).filter((token) => !contrastTokenSet.has(token));
+  const queryPhrases = buildUsefulPhrases(queryTokens, question);
+  const numericRanges = extractNumericRanges(question);
+  const scientificNames = extractScientificNames(question);
+
+  return {
+    domainTerms: queryTokens,
+    productTerms: queryTokens,
+    physicalAttributes: [],
+    numericRanges,
+    usageTerms: [],
+    scientificNames,
+    tradeForms: [],
+    contrastTerms: uniqueStrings([...contrast.terms, ...contrast.baselineTokens]),
+    queryTokens,
+    queryPhrases,
+    quotedTerms,
+    capitalizedTerms
+  };
+}
+
+export function evaluateCandidateRelevance(
+  section: EnrichedRetrievedSection,
+  question: string,
+  signals: QuerySignals = extractQuerySignals(question)
+): CandidateRelevance {
+  const titleSource = `${section.title ?? ""} ${section.section ?? ""}`;
+  const bodySource = `${section.text} ${(section.captions ?? []).join(" ")}`;
+  const sourceSource = `${section.source ?? ""} ${section.chapter ?? ""} ${section.document}`;
+  const titleText = normalizeForSearch(titleSource);
+  const bodyText = normalizeForSearch(bodySource);
+  const sourceText = normalizeForSearch(sourceSource);
+  const allText = `${titleText} ${bodyText} ${sourceText}`;
+  const candidateTokens = new Set(meaningfulTokens(`${titleSource} ${bodySource} ${sourceSource}`));
+  const candidateTitleTokens = new Set(meaningfulTokens(titleSource));
+  const candidateBodyTokens = new Set(meaningfulTokens(bodySource));
+  const candidatePhrases = new Set([
+    ...buildUsefulPhrases([...candidateTitleTokens], titleSource),
+    ...buildUsefulPhrases([...candidateBodyTokens], bodySource)
+  ]);
+  const titleTokenMatches = signals.queryTokens.filter((token) => candidateTitleTokens.has(token));
+  const bodyTokenMatches = signals.queryTokens.filter((token) => !candidateTitleTokens.has(token) && candidateBodyTokens.has(token));
+  const sourceTokenMatches = signals.queryTokens.filter((token) => !candidateTitleTokens.has(token) && !candidateBodyTokens.has(token) && includesSignal(sourceText, token));
+  const phraseMatches = signals.queryPhrases.filter((phrase) => candidatePhrases.has(phrase) || includesSignal(allText, phrase));
+  const titlePhraseMatches = phraseMatches.filter((phrase) => includesSignal(titleText, phrase));
+  const rareTokenMatches = signals.queryTokens.filter((token) => candidateTokens.has(token) && isRareQueryToken(token));
+  const scientificMatches = signals.scientificNames.filter((term) => includesSignal(allText, term));
+  const numericMatches = signals.numericRanges.filter((range) => candidateMatchesNumericRange(section, range));
+  const contrastMatches = signals.contrastTerms.filter((term) => includesSignal(allText, term));
+  const hsCodeMatches = hsCodesForSection(section).filter((code) => normalizeForSearch(question).includes(code));
+  const matchedTerms = uniqueStrings([
+    ...hsCodeMatches,
+    ...titleTokenMatches,
+    ...bodyTokenMatches,
+    ...sourceTokenMatches,
+    ...scientificMatches,
+    ...rareTokenMatches
+  ]);
+  const importantTerms = uniqueStrings([...signals.queryTokens, ...signals.queryPhrases, ...signals.scientificNames, ...signals.numericRanges]);
+  const matchedImportant = new Set([
+    ...matchedTerms,
+    ...phraseMatches,
+    ...numericMatches
+  ]);
+  const missingImportantTerms = importantTerms.filter((term) => !matchedImportant.has(term) && !signals.contrastTerms.includes(term));
+
+  let relevanceScore = section.score;
+  relevanceScore += hsCodeMatches.length * 20;
+  relevanceScore += titlePhraseMatches.length * 12;
+  relevanceScore += phraseMatches.length * 9;
+  relevanceScore += titleTokenMatches.length * 7;
+  relevanceScore += numericMatches.length * 9;
+  relevanceScore += rareTokenMatches.length * 6;
+  relevanceScore += scientificMatches.length * 8;
+  relevanceScore += bodyTokenMatches.length * 3;
+  relevanceScore += sourceTokenMatches.length * 1;
+  relevanceScore += signals.queryTokens.filter((term) => section.captions.some((caption) => includesSignal(normalizeForSearch(caption), term))).length * 4;
+
+  const positiveEvidence =
+    hsCodeMatches.length +
+    titleTokenMatches.length +
+    bodyTokenMatches.length +
+    sourceTokenMatches.length +
+    phraseMatches.length +
+    scientificMatches.length +
+    numericMatches.length;
+  const contrastTermOnlyMatch = positiveEvidence === 0 && contrastMatches.length > 0;
+  const hasStrongMatch = hsCodeMatches.length + titlePhraseMatches.length + numericMatches.length + phraseMatches.length + rareTokenMatches.length + scientificMatches.length > 0;
+  const lowGenericOverlap = titleTokenMatches.length + bodyTokenMatches.length + phraseMatches.length + numericMatches.length === 0;
+
+  if (contrastTermOnlyMatch) {
+    relevanceScore -= 25;
+  }
+  if (contrastMatches.length > 0 && positiveEvidence <= contrastMatches.length) {
+    relevanceScore -= contrastMatches.length * 6;
+  }
+  if (lowGenericOverlap) {
+    relevanceScore -= 12;
+  }
+
+  let rejectedReason: string | null = null;
+  const minimumScore = hasStrongMatch ? 5 : 8;
+  if (contrastTermOnlyMatch) {
+    rejectedReason = "candidate only matches contrast baseline terms";
+  } else if (relevanceScore < minimumScore) {
+    rejectedReason = `relevance score below threshold ${minimumScore}`;
+  } else if (lowGenericOverlap) {
+    rejectedReason = "candidate has low generic token, phrase, and numeric overlap with query";
+  }
+
+  return {
+    document: section.document,
+    hsCode: section.hsCode,
+    groupedHsCodes: section.groupedHsCodes ?? [],
+    title: section.title,
+    section: section.section,
+    source: section.source,
+    pageStart: section.pageStart ?? null,
+    pageEnd: section.pageEnd ?? null,
+    matchedTerms,
+    matchedNumericRanges: numericMatches,
+    matchedAttributes: phraseMatches,
+    missingImportantTerms,
+    contrastTermOnlyMatch,
+    relevanceScore,
+    queryTokens: signals.queryTokens,
+    queryPhrases: signals.queryPhrases,
+    candidateMatchedTokens: matchedTerms,
+    candidateMatchedPhrases: phraseMatches,
+    numericMatches,
+    contrastTerms: contrastMatches,
+    finalScore: relevanceScore,
+    rejected: Boolean(rejectedReason),
+    rejectedReason
+  };
+}
+
+export function selectRelevantSections(
+  sections: EnrichedRetrievedSection[],
+  question: string,
+  options: { requireHsMetadata?: boolean } = {}
+): RelevanceSelection {
+  const signals = extractQuerySignals(question);
+  const evaluated = sections.map((section) => ({
+    section,
+    relevance: evaluateCandidateRelevance(section, question, signals)
+  }));
+  const ranked = evaluated
+    .sort((left, right) => {
+      if (left.relevance.rejected !== right.relevance.rejected) {
+        return left.relevance.rejected ? 1 : -1;
+      }
+      return right.relevance.relevanceScore - left.relevance.relevanceScore ||
+        right.section.score - left.section.score ||
+        left.section.document.localeCompare(right.section.document);
+    })
+    .filter((item) => !item.relevance.rejected)
+    .filter((item) => !options.requireHsMetadata || hasSectionHsMetadata(item.section))
+    .map((item) => ({ ...item.section, score: item.relevance.relevanceScore }));
+
+  return {
+    signals,
+    ranked,
+    candidates: evaluated
+      .sort((left, right) => right.relevance.relevanceScore - left.relevance.relevanceScore)
+      .map((item) => item.relevance)
+  };
+}
+
+export function rankSectionsForQuestion(
+  sections: EnrichedRetrievedSection[],
+  question: string
+): EnrichedRetrievedSection[] {
+  const contrast = detectContrastTerms(question);
+  const queryTokens = tokenizeForRanking(question);
+  const baselineTokens = new Set(contrast.baselineTokens);
+  const positiveTokens = queryTokens.filter((token) => !baselineTokens.has(token));
+
+  return sections
+    .map((section) => {
+      const titleText = normalizeForSearch(`${section.title ?? ""} ${section.section ?? ""}`);
+      const bodyText = normalizeForSearch(`${section.text} ${(section.captions ?? []).join(" ")}`);
+      const positiveTitleScore = positiveTokens.reduce((sum, token) => sum + countToken(titleText, token), 0) * 8;
+      const positiveBodyScore = positiveTokens.reduce((sum, token) => sum + countToken(bodyText, token), 0);
+      const baselineTitlePenalty = contrast.baselineTokens.reduce((sum, token) => sum + countToken(titleText, token), 0) * 7;
+      const metadataBoost = hsCodesForSection(section).length > 0 ? 3 : 0;
+      return {
+        section,
+        adjustedScore: section.score + positiveTitleScore + positiveBodyScore + metadataBoost - baselineTitlePenalty
+      };
+    })
+    .sort((left, right) => right.adjustedScore - left.adjustedScore || left.section.document.localeCompare(right.section.document))
+    .map((item) => ({ ...item.section, score: item.adjustedScore }));
 }
 
 function findBestSectionMetadata(hit: RetrievedTreeHit, sections: SectionMetadata[]): SectionMetadata | undefined {
@@ -216,14 +518,63 @@ function findBestSectionMetadata(hit: RetrievedTreeHit, sections: SectionMetadat
 }
 
 function formatAlternativeSections(topSection: EnrichedRetrievedSection, alternatives: EnrichedRetrievedSection[]): string {
-  const relevant = alternatives.filter((section) => section.hsCode && section.hsCode !== topSection.hsCode);
+  const topCodes = new Set(hsCodesForSection(topSection));
+  const relevant = alternatives
+    .map((section) => ({ section, codes: hsCodesForSection(section).filter((code) => !topCodes.has(code)) }))
+    .filter((item) => item.codes.length > 0);
   if (relevant.length === 0) {
     return "";
   }
 
   return `Mã liên quan: ${relevant
-    .map((section) => `HS Code: ${section.hsCode}, section "${section.section ?? section.title ?? "unknown"}"`)
+    .map(({ section, codes }) => `HS Code: ${codes.join(", ")}, section "${section.section ?? section.title ?? "unknown"}"`)
     .join("; ")}.`;
+}
+
+export function hsCodesForSection(section: Pick<EnrichedRetrievedSection, "hsCode" | "groupedHsCodes">): string[] {
+  return uniqueStrings([...(section.groupedHsCodes ?? []), section.hsCode].filter((code): code is string => Boolean(code)));
+}
+
+export function hasSectionHsMetadata(section: Pick<EnrichedRetrievedSection, "hsCode" | "groupedHsCodes">): boolean {
+  return hsCodesForSection(section).length > 0;
+}
+
+function formatHsCodeLine(codes: string[], question: string | undefined): string {
+  if (codes.length <= 1) {
+    return `HS Code: ${codes[0]}.`;
+  }
+
+  const joined = codes.length === 2
+    ? `${codes[0]} hoặc ${codes[1]}`
+    : `${codes.slice(0, -1).join(", ")} hoặc ${codes[codes.length - 1]}`;
+  const qualifier = question && questionSpecifiesState(question) ? "" : ", tùy trạng thái hàng hóa";
+  return `HS Code: ${joined}${qualifier}.`;
+}
+
+function stripDisallowedHsCodes(answer: string, allowedCodes: string[]): string {
+  if (allowedCodes.length === 0) {
+    return answer;
+  }
+
+  return answer.replace(HS_CODE_PATTERN, (code) => allowedCodes.includes(code) ? code : "").replace(/\s+/g, " ").trim();
+}
+
+function groupedHsCodesFromUnknown(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const codes = uniqueStrings(value.map((item) => String(item).match(HS_CODE_PATTERN)?.[0] ?? "").filter(Boolean));
+  return codes.length > 0 ? codes : undefined;
+}
+
+function extractGroupedHsCodes(value: string): string[] | undefined {
+  const normalized = normalizeDisplayText(value);
+  if (!/grouped hs code set/i.test(normalized)) {
+    return undefined;
+  }
+
+  const codes = uniqueStrings([...normalized.matchAll(new RegExp(HS_CODE_PATTERN.source, "g"))].map((match) => match[0]));
+  return codes.length > 1 ? codes : undefined;
 }
 
 function cleanDirectAnswer(answer: string | undefined): string {
@@ -290,6 +641,63 @@ function normalizeComparable(value: string | undefined): string {
     .toLowerCase();
 }
 
+function normalizeForSearch(value: string): string {
+  return normalizeDisplayText(value)
+    .replace(/[đĐ]/g, "d")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\bca\s+phe\b/g, "coffee");
+}
+
+function tokenizeForRanking(value: string): string[] {
+  return uniqueStrings(normalizeForSearch(value).split(/[^a-z0-9.]+/g).filter((token) => token.length >= 3));
+}
+
+function baselineTokensAfterTerm(normalizedQuestion: string, term: string): string[] {
+  const match = normalizedPhraseRegex(term).exec(normalizedQuestion);
+  if (!match) {
+    return [];
+  }
+  const after = normalizedQuestion.slice((match.index ?? 0) + match[0].length).trim();
+  return after.split(/[^a-z0-9.]+/g).filter((token) => token.length >= 3).slice(0, 4);
+}
+
+function baselineTokensFromComparativeThan(normalizedQuestion: string): string[] {
+  const tokens: string[] = [];
+  const comparativePattern = /\b(?:more|less|higher|lower|longer|shorter|bigger|smaller|stronger|weaker|sweeter|bitterer|milder|drier|fresher)\s+(?:[a-z0-9.]+\s+){0,4}?than\s+([a-z0-9.]+(?:\s+[a-z0-9.]+){0,3})/g;
+  for (const match of normalizedQuestion.matchAll(comparativePattern)) {
+    tokens.push(...match[1].split(/[^a-z0-9.]+/g).filter((token) => token.length >= 3).slice(0, 4));
+  }
+  return uniqueStrings(tokens);
+}
+
+function includesNormalizedPhrase(value: string, phrase: string): boolean {
+  return normalizedPhraseRegex(phrase).test(value);
+}
+
+function normalizedPhraseRegex(phrase: string): RegExp {
+  const pattern = phrase
+    .trim()
+    .split(/\s+/g)
+    .map(escapeRegExp)
+    .join("\\s+");
+  return new RegExp(`(?:^|[^a-z0-9])${pattern}(?=$|[^a-z0-9])`);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function countToken(text: string, token: string): number {
+  let count = 0;
+  const pattern = new RegExp(`(?:^|[^a-z0-9.])${escapeRegExp(token)}(?=$|[^a-z0-9.])`, "g");
+  for (const _match of text.matchAll(pattern)) {
+    count += 1;
+  }
+  return count;
+}
+
 function normalizeDisplayText(value: string | undefined): string {
   return (value ?? "")
     .replace(/â€”/g, "—")
@@ -300,12 +708,169 @@ function normalizeDisplayText(value: string | undefined): string {
 
 function isComparisonQuestion(question: string): boolean {
   const normalized = question.toLowerCase();
-  return /\b(vs|versus|compare|comparison|difference|different)\b/.test(normalized) || /khác|so sánh|phân biệt/.test(normalized);
+  return detectContrastTerms(question).terms.length > 0 ||
+    /\b(vs|versus|compare|comparison|difference|different)\b/.test(normalized) ||
+    /khác|so sánh|phân biệt/.test(normalized);
 }
 
 function ensureSentenceEnd(value: string): string {
   const trimmed = value.trim();
   return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+function questionSpecifiesState(question: string): boolean {
+  return /\b(fresh|frozen|dried|roasted|raw|processed|breeding|seedling|chips|powder)\b/i.test(question) ||
+    /tươi|đông lạnh|khô|rang|sống|chế biến|giống|cây con|mảnh|bột/i.test(question);
+}
+
+const QUERY_STOPWORDS = new Set([
+  "the",
+  "and",
+  "for",
+  "with",
+  "what",
+  "which",
+  "define",
+  "defined",
+  "definition",
+  "code",
+  "hscode",
+  "hang",
+  "hoa",
+  "san",
+  "pham",
+  "duoc",
+  "dinh",
+  "nghia",
+  "thuoc",
+  "loai",
+  "nao",
+  "cua",
+  "cho",
+  "trong",
+  "mot",
+  "cac",
+  "voi",
+  "hon",
+  "khac",
+  "thay",
+  "khong",
+  "phai",
+  "is",
+  "are",
+  "was",
+  "were",
+  "this",
+  "that"
+]);
+
+function extractScientificNames(question: string): string[] {
+  const names: string[] = [];
+  for (const match of question.matchAll(/\b([A-Z][a-z]{2,}\s+[a-z]{2,})(?:\s+[a-z]{2,})?\b/g)) {
+    names.push(match[1]);
+  }
+  for (const match of question.matchAll(/["'“”‘’]([^"'“”‘’]{3,40})["'“”‘’]/g)) {
+    names.push(match[1]);
+  }
+  return uniqueStrings(names.map((name) => normalizeForSearch(name)).filter((name) => {
+    const tokens = name.split(/[^a-z0-9.]+/g).filter(Boolean);
+    return tokens.length > 0 && tokens.some((token) => !QUERY_STOPWORDS.has(token));
+  }));
+}
+
+function extractQuotedTerms(value: string): string[] {
+  const terms: string[] = [];
+  for (const match of value.matchAll(/["'“”‘’]([^"'“”‘’]{2,80})["'“”‘’]/g)) {
+    terms.push(normalizeForSearch(match[1]));
+  }
+  return uniqueStrings(terms);
+}
+
+function extractCapitalizedTerms(value: string): string[] {
+  const terms: string[] = [];
+  for (const match of value.matchAll(/\b[A-Z][a-z]{2,}(?:\s+[A-Z]?[a-z]{2,}){0,2}\b/g)) {
+    const normalized = normalizeForSearch(match[0]);
+    const tokens = meaningfulTokens(normalized);
+    if (tokens.length > 0 && tokens.some((token) => !QUERY_STOPWORDS.has(token))) {
+      terms.push(normalized);
+    }
+  }
+  return uniqueStrings(terms);
+}
+
+function meaningfulTokens(value: string): string[] {
+  return uniqueStrings(
+    normalizeForSearch(value)
+      .split(/[^a-z0-9.]+/g)
+      .filter((token) => token.length >= 3 || /^\d+(?:\.\d+)?$/.test(token))
+      .filter((token) => !QUERY_STOPWORDS.has(token))
+  );
+}
+
+function buildUsefulPhrases(tokens: string[], sourceText: string): string[] {
+  const normalizedSource = normalizeForSearch(sourceText);
+  const phrases: string[] = [];
+  for (const size of [3, 2]) {
+    for (let index = 0; index <= tokens.length - size; index += 1) {
+      const phrase = tokens.slice(index, index + size).join(" ");
+      if (phrase.length >= 7 && normalizedSource.includes(phrase)) {
+        phrases.push(phrase);
+      }
+    }
+  }
+  return uniqueStrings(phrases);
+}
+
+function isRareQueryToken(token: string): boolean {
+  return token.length >= 6 || /\d/.test(token);
+}
+
+function extractNumericRanges(question: string): string[] {
+  const normalized = normalizeForSearch(question).replace(/,/g, ".");
+  const ranges: string[] = [];
+  const patterns = [
+    /\b\d+(?:\.\d+)?\s*(?:-|–|to|den|toi)\s*\d+(?:\.\d+)?\s*(?:%|cm|mm|m|kg|g|mg|ppm|do|degree|percent)?\b/g,
+    /\b(?:less than|more than|at least|at most|under|over|duoi|tren|hon|it hon|nhieu hon|toi thieu|toi da)\s+\d+(?:\.\d+)?\s*(?:%|cm|mm|m|kg|g|mg|ppm)?\b/g,
+    /\b\d+(?:\.\d+)?\s*(?:%|cm|mm|m|kg|g|mg|ppm)\b/g
+  ];
+  for (const pattern of patterns) {
+    for (const match of normalized.matchAll(pattern)) {
+      ranges.push(match[0].replace(/\s+/g, " ").trim());
+    }
+  }
+  return uniqueStrings(ranges);
+}
+
+function candidateMatchesNumericRange(section: EnrichedRetrievedSection, range: string): boolean {
+  const candidateText = normalizeForSearch(`${section.title ?? ""} ${section.section ?? ""} ${section.text} ${(section.captions ?? []).join(" ")}`);
+  if (includesSignal(candidateText, range)) {
+    return true;
+  }
+  const queryNumbers = numbersInText(range);
+  if (queryNumbers.length === 0) {
+    return false;
+  }
+  const candidateNumbers = numbersInText(candidateText);
+  return queryNumbers.some((queryNumber) =>
+    candidateNumbers.some((candidateNumber) => Math.abs(candidateNumber - queryNumber) < 0.0001)
+  );
+}
+
+function numbersInText(value: string): number[] {
+  return [...value.replace(/,/g, ".").matchAll(/\d+(?:\.\d+)?/g)]
+    .map((match) => Number(match[0]))
+    .filter((number) => Number.isFinite(number));
+}
+
+function includesSignal(text: string, term: string): boolean {
+  const normalizedTerm = normalizeForSearch(term);
+  if (!normalizedTerm) {
+    return false;
+  }
+  if (/^[a-z0-9.]+$/i.test(normalizedTerm)) {
+    return countToken(text, normalizedTerm) > 0;
+  }
+  return text.includes(normalizedTerm);
 }
 
 function stringValue(value: unknown): string | undefined {

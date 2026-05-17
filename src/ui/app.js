@@ -25,6 +25,7 @@ const askButton = document.querySelector("#ask");
 const questionInput = document.querySelector("#question");
 const questionAllDocsInput = document.querySelector("#question-all-docs");
 const questionDocIdInput = document.querySelector("#question-doc-id");
+const questionDebugInput = document.querySelector("#question-debug");
 const questionDocScopeEl = document.querySelector("#question-doc-scope");
 const answerEl = document.querySelector("#answer");
 const pageIndexKeyInput = document.querySelector("#pageindex-key");
@@ -255,7 +256,8 @@ askButton.addEventListener("click", async () => {
   const body = {
     question,
     docIds,
-    scope: questionAllDocsInput.checked ? "all" : "selected"
+    scope: questionAllDocsInput.checked ? "all" : "selected",
+    debug: Boolean(questionDebugInput?.checked)
   };
   if (temporaryPageIndexKeyInput.checked && pageIndexKeyInput.value.trim()) {
     body.temporaryPageIndexApiKey = pageIndexKeyInput.value.trim();
@@ -280,11 +282,15 @@ askButton.addEventListener("click", async () => {
   const answerScope = payload.mode === "cached-tree"
     ? `Scope: cached tree JSON (${(payload.documents || []).length} source PDF(s))`
     : `Scope: ${(payload.docIds || docIds).length} PageIndex document(s)`;
+  const retrievalStatus = renderRetrievalStatus(payload.retrieval);
   const citationCards = renderCitationCards(payload.citations || []);
+  const debugPanel = questionDebugInput?.checked ? renderDebugPanel(payload.debug) : "";
   answerEl.innerHTML = `
     <div class="answer-box">
       <div class="answer-text">${escapeHtml(payload.answer || "")}</div>
+      ${retrievalStatus}
       ${citationCards}
+      ${debugPanel}
       <p>${escapeHtml(answerScope)}</p>
       ${marker ? `<p>${escapeHtml(marker.message || "")}</p>` : ""}
     </div>
@@ -586,6 +592,7 @@ function renderCitationCards(citations) {
       <strong>${index === 0 ? "Primary citation" : "Related citation"}</strong>
       <dl>
         <dt>HS Code</dt><dd>${escapeHtml(citation.hsCode || "n/a")}</dd>
+        <dt>Grouped</dt><dd>${escapeHtml(Array.isArray(citation.groupedHsCodes) && citation.groupedHsCodes.length > 0 ? citation.groupedHsCodes.join(", ") : "n/a")}</dd>
         <dt>Title</dt><dd>${escapeHtml(citation.title || "n/a")}</dd>
         <dt>Document</dt><dd>${escapeHtml(citation.document || "n/a")}</dd>
         <dt>Page</dt><dd>${escapeHtml(formatCitationPage(citation.pageStart, citation.pageEnd))}</dd>
@@ -594,6 +601,82 @@ function renderCitationCards(citations) {
       </dl>
     </div>
   `).join("")}</div>`;
+}
+
+function renderRetrievalStatus(retrieval) {
+  if (!retrieval) {
+    return "";
+  }
+
+  const fallback = Boolean(retrieval.bm25FallbackUsed);
+  const codes = Array.isArray(retrieval.finalHsCodes) ? retrieval.finalHsCodes.join(", ") : "";
+  return `
+    <div class="retrieval-status ${fallback ? "warning" : ""}">
+      <strong>Retrieval: ${escapeHtml(retrieval.source || "unknown")}</strong>
+      ${fallback ? "<span>BM25 fallback used</span>" : "<span>PageIndex tree result used</span>"}
+      ${codes ? `<span>Final HS Code(s): ${escapeHtml(codes)}</span>` : ""}
+      ${retrieval.answerRepairApplied ? "<span>Answer repair applied</span>" : ""}
+    </div>
+  `;
+}
+
+function renderDebugPanel(debug) {
+  if (!debug) {
+    return "";
+  }
+
+  const selected = debug.selectedPrimary && Object.keys(debug.selectedPrimary).length > 0
+    ? renderDebugSelected(debug.selectedPrimary)
+    : "";
+  const candidates = Array.isArray(debug.candidates) ? debug.candidates : [];
+  return `
+    <details class="debug-panel" open>
+      <summary>Q&A debug</summary>
+      ${selected}
+      <dl>
+        <dt>Signals</dt><dd><pre>${escapeHtml(JSON.stringify(debug.extractedSignals || {}, null, 2))}</pre></dd>
+        <dt>Retrieval</dt><dd><pre>${escapeHtml(JSON.stringify(debug.retrieval || {}, null, 2))}</pre></dd>
+      </dl>
+      <div class="debug-candidates">
+        ${candidates.slice(0, 8).map(renderDebugCandidate).join("")}
+      </div>
+    </details>
+  `;
+}
+
+function renderDebugSelected(selected) {
+  return `
+    <div class="citation-card debug-selected">
+      <strong>Selected section</strong>
+      <dl>
+        <dt>HS Code</dt><dd>${escapeHtml(selected.hsCode || groupedCodesText(selected.groupedHsCodes) || "n/a")}</dd>
+        <dt>Title</dt><dd>${escapeHtml(selected.title || "n/a")}</dd>
+        <dt>Document</dt><dd>${escapeHtml(selected.document || "n/a")}</dd>
+        <dt>Page</dt><dd>${escapeHtml(formatCitationPage(selected.pageStart, selected.pageEnd))}</dd>
+        <dt>Section</dt><dd>${escapeHtml(selected.section || "n/a")}</dd>
+        <dt>Source</dt><dd>${escapeHtml(selected.source || "n/a")}</dd>
+      </dl>
+    </div>
+  `;
+}
+
+function renderDebugCandidate(candidate) {
+  const status = candidate.rejected ? `Rejected: ${candidate.rejectedReason || "relevance gate"}` : "Accepted";
+  return `
+    <div class="debug-candidate ${candidate.rejected ? "rejected" : ""}">
+      <strong>${escapeHtml(candidate.hsCode || groupedCodesText(candidate.groupedHsCodes) || "no HS metadata")} - ${escapeHtml(candidate.title || candidate.section || "unknown")}</strong>
+      <span>${escapeHtml(status)}</span>
+      <span>Final score: ${escapeHtml(String(Math.round((candidate.finalScore ?? candidate.relevanceScore ?? 0) * 100) / 100))}</span>
+      <span>Matched tokens: ${escapeHtml((candidate.candidateMatchedTokens || candidate.matchedTerms || []).join(", ") || "none")}</span>
+      <span>Matched phrases: ${escapeHtml((candidate.candidateMatchedPhrases || []).join(", ") || "none")}</span>
+      <span>Numeric: ${escapeHtml((candidate.numericMatches || candidate.matchedNumericRanges || []).join(", ") || "none")}</span>
+      <span>Contrast: ${escapeHtml((candidate.contrastTerms || []).join(", ") || "none")}</span>
+    </div>
+  `;
+}
+
+function groupedCodesText(codes) {
+  return Array.isArray(codes) && codes.length > 0 ? codes.join(", ") : "";
 }
 
 function formatCitationPage(pageStart, pageEnd) {
