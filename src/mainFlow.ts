@@ -1,6 +1,14 @@
-import { readdir, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { runAgenticQuery } from "./agent/hsCodeAgent";
+import {
+  inspectDocumentCache,
+  type PageIndexCacheAction,
+  type PageIndexCacheStatus,
+  type ParseCacheAction,
+  type ParseCacheStatus,
+  writeCacheManifestRecord
+} from "./cache/cacheManifest";
 import { askChatQuestion, startChatSession } from "./cli/repl";
 import { resolvePageIndexSettings } from "./config/env";
 import { resolveGeminiApiKeys } from "./config/gemini";
@@ -24,6 +32,8 @@ import {
 } from "./utils/paths";
 import { MarkdownValidator } from "./validators/markdownValidator";
 import { TreeValidator } from "./validators/treeValidator";
+
+const DEFAULT_OCR_LANGUAGE = "vie+eng";
 
 export interface ParsingPipelineResult {
   parsedBlocks: ParsedBlock[];
@@ -57,7 +67,16 @@ export async function runParsingPipeline(
 }
 
 export async function executePipeline(pdfPath: string, options: PipelineOptions = {}): Promise<PipelineResult> {
+  const effectiveOptions: PipelineOptions = {
+    ...options,
+    ocrLanguage: options.ocrLanguage ?? DEFAULT_OCR_LANGUAGE,
+    reuseParsedCache: options.reuseParsedCache ?? true,
+    reuseCachedPageIndexTree: options.reuseCachedPageIndexTree ?? true,
+    forceReparse: options.forceReparse ?? false,
+    forcePageIndexUpload: options.forcePageIndexUpload ?? false
+  };
   const resolvedPdfPath = path.resolve(pdfPath);
+  await assertReadableFile(resolvedPdfPath);
   const outputPath = options.outputPath ? path.resolve(options.outputPath) : defaultOutputPath(resolvedPdfPath);
   const blocksPath = options.blocksPath ? path.resolve(options.blocksPath) : defaultBlocksPath(resolvedPdfPath);
   const validationReportPath = options.validationReportPath
@@ -73,116 +92,260 @@ export async function executePipeline(pdfPath: string, options: PipelineOptions 
     ? path.resolve(options.treeValidationReportPath)
     : defaultTreeValidationReportPath(resolvedPdfPath);
 
-  logStep(options, "parse started");
-  const pipelineResult = await runParsingPipeline(resolvedPdfPath, options);
-  let parsedBlocks = pipelineResult.parsedBlocks;
-  const { layout, routingPlan } = pipelineResult;
+  const cacheBefore = await inspectDocumentCache(resolvedPdfPath);
+  const parseCacheStatusBefore = cacheBefore.parseStatus;
+  const pageIndexCacheStatusBefore = cacheBefore.pageIndexCacheStatus;
+  const forcedReparse = Boolean(effectiveOptions.forceReparse);
+  const forcedPageIndexUpload = Boolean(effectiveOptions.forcePageIndexUpload);
+  let parseAction: ParseCacheAction = "parsed";
+  let pageIndexAction: PageIndexCacheAction = effectiveOptions.uploadPageIndex ? "uploaded" : "skipped-disabled";
+  let pageIndexStatus: PipelineResult["pageIndexStatus"] = effectiveOptions.uploadPageIndex
+    ? pageIndexCacheStatusBefore
+    : "skipped";
+  let pageIndexCacheStatusAfter: PageIndexCacheStatus = pageIndexCacheStatusBefore;
+  let parsedBlocks: ParsedBlock[];
+  let layout: LayoutAnalysis;
+  let routingPlan: RoutingPlan;
+  let markdown: string;
+  let validation: PipelineResult["validation"];
+  let sectionMap: NonNullable<PipelineResult["sectionMap"]>;
   let assetsDirPath: string | undefined;
 
-  if (options.exportAssets) {
-    const assetsDir = options.assetsDir
-      ? path.resolve(options.assetsDir)
-      : path.resolve(path.dirname(outputPath), "assets");
-    assetsDirPath = path.resolve(assetsDir, path.basename(resolvedPdfPath, path.extname(resolvedPdfPath)));
-    logStep(options, "export assets started");
-    parsedBlocks = await ImageAssetExporter.exportAssets(resolvedPdfPath, parsedBlocks, {
-      assetsDir,
-      markdownDir: path.dirname(outputPath),
-      pythonCommand: options.pythonCommand,
-      timeoutMs: options.timeoutMs
+  try {
+    if (cacheBefore.parseStatus === "fresh" && effectiveOptions.reuseParsedCache !== false && !forcedReparse) {
+      logStep(effectiveOptions, "local parse cache fresh; skipping parse");
+      const cachedArtifacts = await loadCachedParseArtifacts(resolvedPdfPath, {
+        markdownPath: outputPath,
+        blocksPath,
+        validationReportPath,
+        sectionMapPath
+      });
+      markdown = cachedArtifacts.markdown;
+      parsedBlocks = cachedArtifacts.parsedBlocks;
+      layout = cachedArtifacts.layout;
+      routingPlan = cachedArtifacts.routingPlan;
+      validation = cachedArtifacts.validation;
+      sectionMap = cachedArtifacts.sectionMap;
+      assetsDirPath = cachedArtifacts.assetsDirPath;
+      parseAction = "skipped-cache";
+    } else {
+      logStep(effectiveOptions, "parse started");
+      const pipelineResult = await runParsingPipeline(resolvedPdfPath, effectiveOptions);
+      parsedBlocks = pipelineResult.parsedBlocks;
+      layout = pipelineResult.layout;
+      routingPlan = pipelineResult.routingPlan;
+
+      if (effectiveOptions.exportAssets) {
+        const assetsDir = effectiveOptions.assetsDir
+          ? path.resolve(effectiveOptions.assetsDir)
+          : path.resolve(path.dirname(outputPath), "assets");
+        assetsDirPath = path.resolve(assetsDir, path.basename(resolvedPdfPath, path.extname(resolvedPdfPath)));
+        logStep(effectiveOptions, "export assets started");
+        parsedBlocks = await ImageAssetExporter.exportAssets(resolvedPdfPath, parsedBlocks, {
+          assetsDir,
+          markdownDir: path.dirname(outputPath),
+          pythonCommand: effectiveOptions.pythonCommand,
+          timeoutMs: effectiveOptions.timeoutMs
+        });
+      }
+
+      markdown = HSCodeReconstructor.buildMarkdown(parsedBlocks, {
+        sourcePath: resolvedPdfPath,
+        ensureDocumentHeader: effectiveOptions.ensureDocumentHeader,
+        includePageMarkers: effectiveOptions.includePageMarkers
+      });
+      logStep(effectiveOptions, "validation started");
+      validation = MarkdownValidator.validatePhase1Detailed(markdown, parsedBlocks);
+
+      if (!validation.passed) {
+        console.error(`[MILESTONE 1 FAILED]\n${validation.errors.join("\n")}`);
+        await saveErrorLog(resolvedPdfPath, markdown, parsedBlocks, validation);
+        throw new Error(`Milestone 1 validation failed: ${validation.errors.join("; ")}`);
+      }
+
+      await writeJson(validationReportPath, validation);
+      await writeJson(blocksPath, parsedBlocks);
+      await writeText(outputPath, markdown);
+      logStep(effectiveOptions, "section map started");
+      sectionMap = SectionMapBuilder.build(markdown, parsedBlocks, resolvedPdfPath);
+      await writeJson(sectionMapPath, sectionMap);
+      logStep(effectiveOptions, "section map done");
+      MarkdownValidator.validatePhase1(markdown, parsedBlocks);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await writeCacheManifestRecord(resolvedPdfPath, {
+      parseStatus: "failed",
+      pageIndexStatus,
+      error: message,
+      parseCacheStatusBefore,
+      parseAction: "failed",
+      pageIndexCacheStatusBefore,
+      pageIndexAction,
+      pageIndexCacheStatusAfter,
+      forcedReparse,
+      forcedPageIndexUpload
     });
+    throw error;
   }
 
-  const markdown = HSCodeReconstructor.buildMarkdown(parsedBlocks, {
-    sourcePath: resolvedPdfPath,
-    ensureDocumentHeader: options.ensureDocumentHeader,
-    includePageMarkers: options.includePageMarkers
+  const afterParse = await inspectDocumentCache(resolvedPdfPath);
+  const parseCacheStatusAfter: ParseCacheStatus =
+    parseAction === "parsed" || afterParse.parseStatus === "failed" ? "fresh" : afterParse.parseStatus;
+  pageIndexCacheStatusAfter = afterParse.pageIndexCacheStatus;
+  await writeCacheManifestRecord(resolvedPdfPath, {
+    lastParsedAt: parseAction === "parsed" ? new Date().toISOString() : cacheBefore.record?.lastParsedAt ?? null,
+    parseStatus: parseCacheStatusAfter,
+    pageIndexStatus,
+    error: null,
+    parseCacheStatusBefore,
+    parseAction,
+    pageIndexCacheStatusBefore,
+    pageIndexAction,
+    pageIndexCacheStatusAfter,
+    forcedReparse,
+    forcedPageIndexUpload
   });
-  logStep(options, "validation started");
-  const validation = MarkdownValidator.validatePhase1Detailed(markdown, parsedBlocks);
-
-  if (!validation.passed) {
-    console.error(`[MILESTONE 1 FAILED]\n${validation.errors.join("\n")}`);
-    await saveErrorLog(resolvedPdfPath, markdown, parsedBlocks, validation);
-    throw new Error(`Milestone 1 validation failed: ${validation.errors.join("; ")}`);
-  }
-
-  await writeJson(validationReportPath, validation);
-  await writeJson(blocksPath, parsedBlocks);
-  await writeText(outputPath, markdown);
-  logStep(options, "section map started");
-  const sectionMap = SectionMapBuilder.build(markdown, parsedBlocks, resolvedPdfPath);
-  await writeJson(sectionMapPath, sectionMap);
-  logStep(options, "section map done");
-  MarkdownValidator.validatePhase1(markdown, parsedBlocks);
 
   let treeValidation: PipelineResult["treeValidation"];
   let pageIndexDocId: string | undefined;
-  if (options.uploadPageIndex) {
-    let treeBuild = options.forcePageIndexUpload ? undefined : await TreeBuilder.loadCached(outputPath, treeOutputPath);
+  if (effectiveOptions.uploadPageIndex) {
+    try {
+      const pageIndexDecisionStatus = (await inspectDocumentCache(resolvedPdfPath)).pageIndexCacheStatus;
+      pageIndexCacheStatusAfter = pageIndexDecisionStatus;
+      const canReusePageIndexTree =
+        pageIndexDecisionStatus === "fresh" &&
+        effectiveOptions.reuseCachedPageIndexTree !== false &&
+        !forcedPageIndexUpload;
+      let treeBuild: Awaited<ReturnType<typeof TreeBuilder.loadCached>>;
 
-    if (treeBuild) {
-      logStep(options, "pageindex cache hit");
-      logStep(options, "pageindex upload skipped (cached tree)");
-      logStep(options, "pageindex polling skipped (cached tree)");
-    } else {
-      if (options.forcePageIndexUpload) {
-        logStep(options, "pageindex cache bypassed");
+      if (canReusePageIndexTree) {
+        logStep(effectiveOptions, "PageIndex tree cache fresh; skipping upload");
+        logStep(effectiveOptions, "pageindex cache hit");
+        logStep(effectiveOptions, "pageindex upload skipped (cached tree)");
+        logStep(effectiveOptions, "pageindex polling skipped (cached tree)");
+        treeBuild = await TreeBuilder.loadCached(outputPath, treeOutputPath);
+        pageIndexAction = "skipped-cache";
       } else {
-        logStep(options, "pageindex cache miss");
+        if (forcedPageIndexUpload || effectiveOptions.reuseCachedPageIndexTree === false) {
+          logStep(effectiveOptions, "pageindex cache bypassed");
+        } else {
+          logStep(effectiveOptions, `pageindex cache ${pageIndexDecisionStatus}`);
+        }
+
+        const pageIndexSettings = resolvePageIndexSettings({
+          apiKey: effectiveOptions.pageIndexApiKey,
+          baseUrl: effectiveOptions.pageIndexBaseUrl,
+          pollIntervalMs: effectiveOptions.pageIndexPollIntervalMs,
+          pollMaxAttempts: effectiveOptions.pageIndexPollMaxAttempts
+        });
+
+        logStep(effectiveOptions, "pageindex upload started");
+        logStep(effectiveOptions, "pageindex polling started");
+        treeBuild = await TreeBuilder.buildAndWait(outputPath, {
+          apiKey: pageIndexSettings.pageIndexApiKey,
+          outputPath: treeOutputPath,
+          baseUrl: pageIndexSettings.pageIndexBaseUrl,
+          pollIntervalMs: pageIndexSettings.pageIndexPollIntervalMs,
+          pollMaxAttempts: pageIndexSettings.pageIndexPollMaxAttempts,
+          timeoutMs: effectiveOptions.pageIndexTimeoutMs
+        });
+        pageIndexAction = "uploaded";
       }
 
-      const pageIndexSettings = resolvePageIndexSettings({
-        apiKey: options.pageIndexApiKey,
-        baseUrl: options.pageIndexBaseUrl,
-        pollIntervalMs: options.pageIndexPollIntervalMs,
-        pollMaxAttempts: options.pageIndexPollMaxAttempts
-      });
+      if (!treeBuild) {
+        throw new Error(`PageIndex tree cache was expected but not readable: ${treeOutputPath}`);
+      }
 
-      logStep(options, "pageindex upload started");
-      logStep(options, "pageindex polling started");
-      treeBuild = await TreeBuilder.buildAndWait(outputPath, {
-        apiKey: pageIndexSettings.pageIndexApiKey,
-        outputPath: treeOutputPath,
-        baseUrl: pageIndexSettings.pageIndexBaseUrl,
-        pollIntervalMs: pageIndexSettings.pageIndexPollIntervalMs,
-        pollMaxAttempts: pageIndexSettings.pageIndexPollMaxAttempts,
-        timeoutMs: options.pageIndexTimeoutMs
+      pageIndexDocId = treeBuild.docId;
+      logStep(effectiveOptions, "tree validation started");
+      treeValidation = TreeValidator.validate(markdown, treeBuild.treeData, {
+        docId: treeBuild.docId,
+        sectionMap
       });
-    }
-    pageIndexDocId = treeBuild.docId;
-    logStep(options, "tree validation started");
-    treeValidation = TreeValidator.validate(markdown, treeBuild.treeData, {
-      docId: treeBuild.docId,
-      sectionMap
-    });
-    if (treeBuild.fromCache) {
-      treeValidation.warnings = [
-        ...(treeValidation.warnings ?? []),
-        `Reused cached PageIndex tree: ${treeOutputPath}`,
-        ...(treeBuild.cacheWarnings ?? [])
-      ];
-      treeValidation.markers[0] = {
-        ...treeValidation.markers[0],
-        details: {
-          ...(treeValidation.markers[0]?.details ?? {}),
-          pageIndexCacheHit: true,
-          pageIndexCachePath: treeOutputPath,
-          pageIndexCacheWarnings: treeBuild.cacheWarnings ?? []
-        }
-      };
-    }
-    await writeJson(treeValidationReportPath, treeValidation);
-    logStep(options, "tree validation done");
-    if (!treeValidation.passed) {
-      console.error(`[MILESTONE 2 FAILED]\n${treeValidation.errors.join("\n")}`);
-      throw new Error(`Milestone 2 validation failed: ${treeValidation.errors.join("; ")}`);
-    }
+      if (treeBuild.fromCache) {
+        treeValidation.warnings = [
+          ...(treeValidation.warnings ?? []),
+          `Reused cached PageIndex tree: ${treeOutputPath}`,
+          ...(treeBuild.cacheWarnings ?? [])
+        ];
+        treeValidation.markers[0] = {
+          ...treeValidation.markers[0],
+          details: {
+            ...(treeValidation.markers[0]?.details ?? {}),
+            pageIndexCacheHit: true,
+            pageIndexCachePath: treeOutputPath,
+            pageIndexCacheWarnings: treeBuild.cacheWarnings ?? []
+          }
+        };
+      }
+      await writeJson(treeValidationReportPath, treeValidation);
+      logStep(effectiveOptions, "tree validation done");
+      const afterTree = await inspectDocumentCache(resolvedPdfPath);
+      pageIndexCacheStatusAfter = afterTree.pageIndexCacheStatus;
+      pageIndexStatus = treeValidation.passed && pageIndexCacheStatusAfter === "fresh" ? "fresh" : "failed";
+      await writeCacheManifestRecord(resolvedPdfPath, {
+        lastParsedAt: parseAction === "parsed" ? new Date().toISOString() : cacheBefore.record?.lastParsedAt ?? null,
+        lastPageIndexUploadedAt:
+          pageIndexAction === "uploaded" ? new Date().toISOString() : cacheBefore.record?.lastPageIndexUploadedAt ?? null,
+        parseStatus: parseCacheStatusAfter,
+        pageIndexStatus,
+        error: treeValidation.passed ? null : treeValidation.errors.join("; "),
+        parseCacheStatusBefore,
+        parseAction,
+        pageIndexCacheStatusBefore,
+        pageIndexAction,
+        pageIndexCacheStatusAfter,
+        forcedReparse,
+        forcedPageIndexUpload
+      });
+      if (!treeValidation.passed) {
+        console.error(`[MILESTONE 2 FAILED]\n${treeValidation.errors.join("\n")}`);
+        throw new Error(`Milestone 2 validation failed: ${treeValidation.errors.join("; ")}`);
+      }
 
-    console.log(treeValidation.markers[0]?.message ?? "[Marker 10 Passed] Tree Generated Successfully.");
+      console.log(treeValidation.markers[0]?.message ?? "[Marker 10 Passed] Tree Generated Successfully.");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const afterFailure = await inspectDocumentCache(resolvedPdfPath);
+      pageIndexAction = "failed";
+      pageIndexStatus = "failed";
+      pageIndexCacheStatusAfter = afterFailure.pageIndexCacheStatus;
+      await writeCacheManifestRecord(resolvedPdfPath, {
+        lastParsedAt: parseAction === "parsed" ? new Date().toISOString() : cacheBefore.record?.lastParsedAt ?? null,
+        parseStatus: parseCacheStatusAfter,
+        pageIndexStatus,
+        error: message,
+        parseCacheStatusBefore,
+        parseAction,
+        pageIndexCacheStatusBefore,
+        pageIndexAction,
+        pageIndexCacheStatusAfter,
+        forcedReparse,
+        forcedPageIndexUpload
+      });
+      throw error;
+    }
   } else {
-    logStep(options, "pageindex upload skipped");
-    logStep(options, "pageindex polling skipped");
+    pageIndexAction = "skipped-disabled";
+    pageIndexStatus = "skipped";
+    logStep(effectiveOptions, "pageindex upload skipped");
+    logStep(effectiveOptions, "pageindex polling skipped");
+    const afterSkip = await inspectDocumentCache(resolvedPdfPath);
+    pageIndexCacheStatusAfter = afterSkip.pageIndexCacheStatus;
+    await writeCacheManifestRecord(resolvedPdfPath, {
+      lastParsedAt: parseAction === "parsed" ? new Date().toISOString() : cacheBefore.record?.lastParsedAt ?? null,
+      parseStatus: parseCacheStatusAfter,
+      pageIndexStatus,
+      error: null,
+      parseCacheStatusBefore,
+      parseAction,
+      pageIndexCacheStatusBefore,
+      pageIndexAction,
+      pageIndexCacheStatusAfter,
+      forcedReparse,
+      forcedPageIndexUpload
+    });
   }
 
   return {
@@ -198,9 +361,18 @@ export async function executePipeline(pdfPath: string, options: PipelineOptions 
     validationReportPath,
     assetsDirPath,
     sectionMapPath,
-    treeOutputPath: options.uploadPageIndex ? treeOutputPath : undefined,
-    treeValidationReportPath: options.uploadPageIndex ? treeValidationReportPath : undefined,
-    pageIndexDocId
+    treeOutputPath: effectiveOptions.uploadPageIndex ? treeOutputPath : undefined,
+    treeValidationReportPath: effectiveOptions.uploadPageIndex ? treeValidationReportPath : undefined,
+    pageIndexDocId,
+    parseCacheStatusBefore,
+    parseCacheStatusAfter,
+    parseAction,
+    pageIndexCacheStatusBefore,
+    pageIndexCacheStatusAfter,
+    pageIndexStatus,
+    pageIndexAction,
+    forcedReparse,
+    forcedPageIndexUpload
   };
 }
 
@@ -210,6 +382,62 @@ function logStep(options: PipelineOptions, message: string): void {
   if (!options.onLog) {
     console.log(`[Pipeline] ${line}`);
   }
+}
+
+async function loadCachedParseArtifacts(
+  pdfPath: string,
+  paths: {
+    markdownPath: string;
+    blocksPath: string;
+    validationReportPath: string;
+    sectionMapPath: string;
+  }
+): Promise<{
+  markdown: string;
+  parsedBlocks: ParsedBlock[];
+  layout: LayoutAnalysis;
+  routingPlan: RoutingPlan;
+  validation: PipelineResult["validation"];
+  sectionMap: NonNullable<PipelineResult["sectionMap"]>;
+  assetsDirPath: string;
+}> {
+  const [markdown, parsedBlocks, validation, sectionMap] = await Promise.all([
+    readFile(paths.markdownPath, "utf8"),
+    readJsonFile<ParsedBlock[]>(paths.blocksPath),
+    readJsonFile<PipelineResult["validation"]>(paths.validationReportPath),
+    readJsonFile<NonNullable<PipelineResult["sectionMap"]>>(paths.sectionMapPath)
+  ]);
+  const pageNumbers = parsedBlocks
+    .map((block) => block.pageNumber)
+    .filter((pageNumber) => Number.isInteger(pageNumber) && pageNumber > 0);
+
+  return {
+    markdown,
+    parsedBlocks,
+    validation,
+    sectionMap,
+    layout: {
+      pdfPath,
+      pageCount: pageNumbers.length > 0 ? Math.max(...pageNumbers) : 0,
+      pages: []
+    },
+    routingPlan: {
+      routes: [],
+      fastPages: [],
+      accuratePages: []
+    },
+    assetsDirPath: path.resolve(
+      process.cwd(),
+      "data",
+      "converted",
+      "assets",
+      path.basename(pdfPath, path.extname(pdfPath))
+    )
+  };
+}
+
+async function readJsonFile<T>(filePath: string): Promise<T> {
+  return JSON.parse(await readFile(filePath, "utf8")) as T;
 }
 
 async function saveErrorLog(
@@ -251,7 +479,13 @@ interface CliArgs {
 }
 
 function parseCliArgs(argv: string[]): CliArgs {
-  const options: PipelineOptions = {};
+  const options: PipelineOptions = {
+    ocrLanguage: DEFAULT_OCR_LANGUAGE,
+    reuseParsedCache: true,
+    reuseCachedPageIndexTree: true,
+    forceReparse: false,
+    forcePageIndexUpload: false
+  };
   let pdfPath: string | undefined;
   let batch = false;
   let help = false;
@@ -304,6 +538,15 @@ function parseCliArgs(argv: string[]): CliArgs {
       case "--ocr-lang":
         options.ocrLanguage = next();
         break;
+      case "--reuse-parsed-cache":
+        options.reuseParsedCache = true;
+        break;
+      case "--no-reuse-parsed-cache":
+        options.reuseParsedCache = false;
+        break;
+      case "--force-reparse":
+        options.forceReparse = true;
+        break;
       case "--allow-fallback":
         options.allowPyMuPDFFallback = true;
         break;
@@ -324,6 +567,14 @@ function parseCliArgs(argv: string[]): CliArgs {
         break;
       case "--upload-pageindex":
         options.uploadPageIndex = true;
+        break;
+      case "--reuse-cached-pageindex-tree":
+      case "--reuse-pageindex-tree":
+        options.reuseCachedPageIndexTree = true;
+        break;
+      case "--no-reuse-cached-pageindex-tree":
+      case "--no-reuse-pageindex-tree":
+        options.reuseCachedPageIndexTree = false;
         break;
       case "--force-pageindex-upload":
         options.forcePageIndexUpload = true;
@@ -382,15 +633,18 @@ Options:
   --timeout-ms <number>         Parser timeout per tool process
   --docling-batch-size <number> Number of accurate pages per Docling batch
   --docling-threads <number>    Docling CPU threads
-  --ocr-lang <lang>             OCR language, for example eng or vie
+  --ocr-lang <lang>             OCR language, default vie+eng
   --allow-fallback              Use PyMuPDF when Docling fails
   --no-header                   Do not synthesize a document H1
   --page-markers                Include HTML page comments in Markdown
   --noise-tolerance <number>    Pixel tolerance for watermark/logo filtering
   --export-assets               Export non-decorative image crops and link them in Markdown
   --assets-dir <path>           Asset output directory, default data/converted/assets
+  --no-reuse-parsed-cache       Re-run local parsing even when Markdown/sections cache is fresh
+  --force-reparse               Alias for forcing local parse
   --batch                       Process every PDF in the input directory sequentially
-  --upload-pageindex            Upload Markdown to PageIndex and write <file>.tree.json
+  --upload-pageindex            Upload Markdown to PageIndex only when tree cache is missing/stale
+  --no-reuse-cached-pageindex-tree Upload even when the cached tree is fresh
   --force-pageindex-upload      Ignore existing <file>.tree.json cache and upload again
   --pageindex-api-key <key>     PageIndex API key, defaults to PAGEINDEX_API_KEY or .env
   --pageindex-base-url <url>    PageIndex API base URL
@@ -753,6 +1007,13 @@ interface BatchDocumentSummary {
   hsSectionCount: number;
   imageCount: number;
   hasTree: boolean;
+  parseCacheStatusBefore?: ParseCacheStatus;
+  parseAction?: ParseCacheAction;
+  pageIndexCacheStatusBefore?: PageIndexCacheStatus;
+  pageIndexAction?: PageIndexCacheAction;
+  pageIndexCacheStatusAfter?: PageIndexCacheStatus;
+  forcedReparse?: boolean;
+  forcedPageIndexUpload?: boolean;
   error: string | null;
 }
 
@@ -796,22 +1057,37 @@ async function executeBatchPipeline(inputDir: string, options: PipelineOptions):
         hsSectionCount: sections.length,
         imageCount,
         hasTree: Boolean(result.treeOutputPath),
+        parseCacheStatusBefore: result.parseCacheStatusBefore,
+        parseAction: result.parseAction,
+        pageIndexCacheStatusBefore: result.pageIndexCacheStatusBefore,
+        pageIndexAction: result.pageIndexAction,
+        pageIndexCacheStatusAfter: result.pageIndexCacheStatusAfter,
+        forcedReparse: result.forcedReparse,
+        forcedPageIndexUpload: result.forcedPageIndexUpload,
         error: null
       };
       documents.push(summary);
-      manifestDocuments.push(buildManifestRecord(pdfFile, options.uploadPageIndex, "passed", null, result.assetsDirPath));
+      manifestDocuments.push(buildManifestRecord(pdfFile, "passed", null, result, result.assetsDirPath));
       printPipelineSummary(pdfFile, result);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const cacheRecord = (await inspectDocumentCache(pdfFile)).record;
       documents.push({
         document: path.basename(pdfFile),
         status: "failed",
         hsSectionCount: 0,
         imageCount: 0,
         hasTree: false,
+        parseCacheStatusBefore: cacheRecord?.parseCacheStatusBefore,
+        parseAction: cacheRecord?.parseAction,
+        pageIndexCacheStatusBefore: cacheRecord?.pageIndexCacheStatusBefore,
+        pageIndexAction: cacheRecord?.pageIndexAction,
+        pageIndexCacheStatusAfter: cacheRecord?.pageIndexCacheStatusAfter,
+        forcedReparse: cacheRecord?.forcedReparse,
+        forcedPageIndexUpload: cacheRecord?.forcedPageIndexUpload,
         error: message
       });
-      manifestDocuments.push(buildManifestRecord(pdfFile, options.uploadPageIndex, "failed", message));
+      manifestDocuments.push(buildManifestRecord(pdfFile, "failed", message, undefined, undefined, cacheRecord));
       console.error(`[Batch] ${path.basename(pdfFile)} failed: ${message}`);
     }
   }
@@ -834,10 +1110,11 @@ async function executeBatchPipeline(inputDir: string, options: PipelineOptions):
 
 function buildManifestRecord(
   pdfFile: string,
-  uploadPageIndex: boolean | undefined,
   status: "passed" | "failed",
   error: string | null,
-  assetsDirPath?: string
+  result?: PipelineResult,
+  assetsDirPath?: string,
+  cacheRecord?: Awaited<ReturnType<typeof inspectDocumentCache>>["record"]
 ): Record<string, unknown> {
   return {
     input: relativePath(pdfFile),
@@ -847,8 +1124,15 @@ function buildManifestRecord(
     validation: relativePath(defaultValidationReportPath(pdfFile)),
     assetsDir: assetsDirPath ? relativePath(assetsDirPath) : relativePath(path.resolve(process.cwd(), "data", "converted", "assets", path.basename(pdfFile, path.extname(pdfFile)))),
     sections: relativePath(defaultSectionMapPath(pdfFile)),
-    tree: uploadPageIndex ? relativePath(defaultTreePath(pdfFile)) : undefined,
-    treeValidation: uploadPageIndex ? relativePath(defaultTreeValidationReportPath(pdfFile)) : undefined,
+    tree: result?.treeOutputPath ? relativePath(defaultTreePath(pdfFile)) : cacheRecord?.treePath,
+    treeValidation: result?.treeValidationReportPath ? relativePath(defaultTreeValidationReportPath(pdfFile)) : cacheRecord?.treeValidationPath,
+    parseCacheStatusBefore: result?.parseCacheStatusBefore ?? cacheRecord?.parseCacheStatusBefore,
+    parseAction: result?.parseAction ?? cacheRecord?.parseAction,
+    pageIndexCacheStatusBefore: result?.pageIndexCacheStatusBefore ?? cacheRecord?.pageIndexCacheStatusBefore,
+    pageIndexAction: result?.pageIndexAction ?? cacheRecord?.pageIndexAction,
+    pageIndexCacheStatusAfter: result?.pageIndexCacheStatusAfter ?? cacheRecord?.pageIndexCacheStatusAfter,
+    forcedReparse: result?.forcedReparse ?? cacheRecord?.forcedReparse ?? false,
+    forcedPageIndexUpload: result?.forcedPageIndexUpload ?? cacheRecord?.forcedPageIndexUpload ?? false,
     error
   };
 }

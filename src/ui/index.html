@@ -91,7 +91,7 @@
               </label>
               <label>
                 OCR language
-                <input name="ocrLanguage" type="text" value="vie" />
+                <input name="ocrLanguage" type="text" value="vie+eng" />
               </label>
               <label>
                 Docling threads
@@ -101,12 +101,16 @@
 
             <div class="checks">
               <label><input name="exportAssets" type="checkbox" checked /> Export image assets</label>
-              <label><input id="upload-pageindex" name="uploadPageIndex" type="checkbox" /> Upload to PageIndex</label>
-              <label><input id="reuse-pageindex-cache" name="reusePageIndexCache" type="checkbox" checked /> Reuse cached PageIndex tree</label>
+              <label><input id="reuse-parsed-cache" name="reuseParsedCache" type="checkbox" checked /> Reuse parsed cache</label>
+              <label><input id="reuse-pageindex-cache" name="reuseCachedPageIndexTree" type="checkbox" checked /> Reuse cached PageIndex tree</label>
+              <label><input id="force-reparse" name="forceReparse" type="checkbox" /> Force reparse</label>
+              <label><input id="upload-pageindex" name="uploadPageIndex" type="checkbox" /> Upload to PageIndex if missing/stale</label>
+              <label><input id="force-pageindex-upload" name="forcePageIndexUpload" type="checkbox" /> Force PageIndex re-upload</label>
               <label><input name="sequential" type="checkbox" checked disabled /> Run files sequentially</label>
               <label><input name="failFast" type="checkbox" /> Stop on first failure</label>
             </div>
             <div id="pageindex-warning" class="warning hidden">PageIndex key is only required when no cached tree exists or cache reuse is disabled.</div>
+            <div id="cache-status-summary" class="cache-summary muted">Select PDFs to inspect cache status.</div>
             <div id="selected-files" class="selected-files muted">No files selected.</div>
           </form>
         </section>

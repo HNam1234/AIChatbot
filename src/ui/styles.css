@@ -285,6 +285,13 @@ button:active {
   transform: translateY(1px);
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+  box-shadow: none;
+  transform: none;
+}
+
 button.secondary {
   background: #f5f7f9;
   color: #2f3f52;
@@ -331,6 +338,19 @@ button.tab.active {
   border-radius: 7px;
   padding: 10px 11px;
   margin-bottom: 12px;
+}
+
+.cache-summary {
+  border: 1px dashed var(--line-strong);
+  border-radius: 7px;
+  background: var(--surface-soft);
+  padding: 10px 11px;
+  margin-bottom: 10px;
+  line-height: 1.4;
+}
+
+.cache-summary.warning {
+  border-style: solid;
 }
 
 .hidden {
@@ -397,6 +417,7 @@ button.tab.active {
 .status-chip.completed,
 .status-chip.passed,
 .status-chip.yes,
+.status-chip.fresh,
 .status-chip.uploaded,
 .pill.passed {
   background: #e7f5ec;
@@ -414,10 +435,17 @@ button.tab.active {
 }
 
 .status-chip.none,
-.status-chip.skipped {
+.status-chip.skipped,
+.status-chip.missing {
   background: #f4f1ea;
   color: #6f5b2f;
   border-color: #e1d6bd;
+}
+
+.status-chip.stale {
+  background: #fff8df;
+  color: #664500;
+  border-color: #ecc970;
 }
 
 .status-card {

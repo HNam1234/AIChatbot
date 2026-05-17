@@ -3,6 +3,12 @@ import path from "node:path";
 import express from "express";
 import multer from "multer";
 import {
+  getCacheManifestRecord,
+  inspectDocumentCache,
+  sha256File,
+  type PageIndexCacheStatus
+} from "../cache/cacheManifest";
+import {
   getApiSettingsStatus,
   isGeminiKeySlotName,
   loadEnvConfig,
@@ -54,6 +60,9 @@ const uploadsDir = path.resolve(process.cwd(), "data", "uploads");
 const convertedDir = path.resolve(process.cwd(), "data", "converted");
 const assetsRoot = path.resolve(process.cwd(), "data", "converted", "assets");
 const tmpDir = path.resolve(process.cwd(), "data", "tmp");
+const MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024;
+const MAX_UPLOAD_TOTAL_BYTES = 500 * 1024 * 1024;
+const MAX_UPLOAD_FILES = 50;
 const SEARCH_STOPWORDS = new Set([
   "the",
   "and",
@@ -84,13 +93,22 @@ const SEARCH_STOPWORDS = new Set([
 
 interface CachedTreeRetrievalResult {
   hits: EnrichedRetrievedSection[];
-  retrievalSource: "pageindex-tree" | "bm25-fallback";
+  retrievalSource: "pageindex-tree" | "cached-pageindex-tree" | "local-sections" | "bm25-fallback";
   bm25FallbackUsed: boolean;
   pageIndexResultCount: number;
   contrastTerms: string[];
   signals: QuerySignals;
   pageIndexResults: CandidateRelevance[];
   bm25Results: CandidateRelevance[];
+}
+
+interface CachedTreeDocument {
+  document: string;
+  docId?: string;
+  treePath: string;
+  pageIndexCacheStatus: PageIndexCacheStatus;
+  treeSourceMarkdownHash?: string | null;
+  markdownHash?: string | null;
 }
 
 const upload = multer({
@@ -106,11 +124,18 @@ const upload = multer({
   }),
   fileFilter: (_req, file, callback) => {
     const isPdf = path.extname(file.originalname).toLowerCase() === ".pdf";
-    callback(null, isPdf);
+    if (!isPdf) {
+      callback(new Error("Only .pdf files are accepted."));
+      return;
+    }
+    callback(null, true);
   },
   limits: {
-    files: 25,
-    fileSize: 100 * 1024 * 1024
+    files: MAX_UPLOAD_FILES,
+    fileSize: MAX_UPLOAD_FILE_BYTES,
+    fields: 100,
+    fieldSize: 5 * 1024 * 1024,
+    parts: MAX_UPLOAD_FILES + 100
   }
 });
 const runPipelineUpload = upload.any();
@@ -179,67 +204,140 @@ export function createApiRouter(): express.Router {
     }
   });
 
-  router.post("/run-pipeline", handleRunPipelineUpload, (req, res) => {
+  router.post("/cache-status", async (req, res) => {
+    try {
+      const files = parseCacheStatusFiles(req.body.files);
+      const documents = [];
+      for (const file of files) {
+        const document = safePdfFileName(file.name);
+        const inputPath = path.join(uploadsDir, document);
+        const inspection = await inspectDocumentCache(inputPath, {
+          inputHash: file.inputHash,
+          inputSize: file.size,
+          inputModifiedAt: file.lastModified ? new Date(file.lastModified).toISOString() : undefined
+        });
+        documents.push({
+          document,
+          originalName: file.name,
+          size: file.size,
+          inputHash: inspection.inputHash,
+          inputPath: inspection.inputPath,
+          canReuseUploadedInput: inspection.canReuseUploadedInput,
+          parseCacheStatus: inspection.parseStatus,
+          pageIndexCacheStatus: inspection.pageIndexCacheStatus,
+          treeStatus: inspection.treeStatus,
+          assets: inspection.imageCount,
+          sections: inspection.hsSectionCount,
+          hasMarkdown: inspection.hasMarkdown,
+          hasSections: inspection.hasSections,
+          hasTree: inspection.hasTree,
+          markdownHash: inspection.markdownHash,
+          treeSourceMarkdownHash: inspection.treeSourceMarkdownHash,
+          error: inspection.record?.error ?? null
+        });
+      }
+      res.json({ ok: true, documents });
+    } catch (error) {
+      res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  router.post("/run-pipeline", handleRunPipelineUpload, async (req, res) => {
     const startedAt = Date.now();
-    const files = (req.files ?? []) as Express.Multer.File[];
-    const pdfFiles = files.filter((file) => file.fieldname === "pdf" || file.fieldname === "files" || file.fieldname === "files[]");
-    if (pdfFiles.length === 0) {
-      res.status(400).json({ error: "At least one PDF file is required." });
-      return;
-    }
+    try {
+      const files = (req.files ?? []) as Express.Multer.File[];
+      const pdfFiles = files.filter((file) => file.fieldname === "pdf" || file.fieldname === "files" || file.fieldname === "files[]");
+      const uploadedBytes = pdfFiles.reduce((sum, file) => sum + file.size, 0);
+      const cachedFiles = parseCachedRunFiles(req.body.cachedFiles);
+      const cachedInputFiles = await resolveCachedRunFiles(cachedFiles);
+      if (uploadedBytes > MAX_UPLOAD_TOTAL_BYTES) {
+        res.status(400).json({ ok: false, error: `PDF upload is too large. Max total upload size is ${formatBytes(MAX_UPLOAD_TOTAL_BYTES)}.` });
+        return;
+      }
+      if (pdfFiles.length + cachedInputFiles.length === 0) {
+        res.status(400).json({ ok: false, error: "At least one PDF file is required." });
+        return;
+      }
 
-    const inputFiles = pdfFiles.map((file) => file.path);
-    const job = JobStore.create(inputFiles);
-    JobStore.addTrace(job.id, "routes.runPipeline", "upload accepted", {
-      fileCount: pdfFiles.length,
-      totalBytes: pdfFiles.reduce((sum, file) => sum + file.size, 0),
-      elapsedMs: Date.now() - startedAt
-    });
-    for (const file of pdfFiles) {
-      JobStore.addTrace(job.id, "routes.runPipeline", "file saved", {
-        filename: file.filename,
-        bytes: file.size,
-        path: relativePath(file.path)
+      const inputFiles = uniqueStrings([...pdfFiles.map((file) => file.path), ...cachedInputFiles]);
+      const job = JobStore.create(inputFiles);
+      JobStore.addTrace(job.id, "routes.runPipeline", "request accepted", {
+        uploadedFileCount: pdfFiles.length,
+        cachedFileCount: cachedInputFiles.length,
+        fileCount: inputFiles.length,
+        uploadedBytes,
+        elapsedMs: Date.now() - startedAt
       });
-      JobStore.setFileStep(job.id, file.filename, "file saved");
+      for (const file of pdfFiles) {
+        JobStore.addTrace(job.id, "routes.runPipeline", "file saved", {
+          filename: file.filename,
+          bytes: file.size,
+          path: relativePath(file.path)
+        });
+        JobStore.setFileStep(job.id, file.filename, "file saved");
+      }
+      for (const inputFile of cachedInputFiles) {
+        JobStore.addTrace(job.id, "routes.runPipeline", "cached input reused", {
+          filename: path.basename(inputFile),
+          path: relativePath(inputFile)
+        });
+        JobStore.setFileStep(job.id, path.basename(inputFile), "cached input reused");
+      }
+      const reuseCachedPageIndexTree =
+        req.body.reuseCachedPageIndexTree !== undefined
+          ? booleanValue(req.body.reuseCachedPageIndexTree)
+          : req.body.reusePageIndexCache !== undefined
+            ? booleanValue(req.body.reusePageIndexCache)
+            : true;
+      const options = {
+        ocrLanguage: stringValue(req.body.ocrLang) ?? stringValue(req.body.ocrLanguage) ?? "vie+eng",
+        doclingThreads: numberValue(req.body.doclingThreads) ?? 4,
+        exportAssets: booleanValue(req.body.exportAssets),
+        uploadPageIndex: booleanValue(req.body.uploadPageIndex),
+        reuseParsedCache: req.body.reuseParsedCache === undefined ? true : booleanValue(req.body.reuseParsedCache),
+        reuseCachedPageIndexTree,
+        forceReparse: booleanValue(req.body.forceReparse),
+        forcePageIndexUpload: booleanValue(req.body.forcePageIndexUpload),
+        failFast: booleanValue(req.body.failFast),
+        pageIndexApiKey: stringValue(req.body.temporaryPageIndexApiKey) ?? stringValue(req.body.pageIndexApiKey),
+        geminiApiKey: firstStringValue(
+          req.body.temporaryGeminiApiKey1,
+          req.body.temporaryGeminiApiKey2,
+          req.body.temporaryGeminiApiKey3,
+          req.body.temporaryGeminiApiKey,
+          req.body.geminiApiKey
+        )
+      };
+
+      JobStore.addTrace(job.id, "routes.runPipeline", "options resolved", {
+        ocrLanguage: options.ocrLanguage,
+        doclingThreads: options.doclingThreads,
+        exportAssets: options.exportAssets,
+        uploadPageIndex: options.uploadPageIndex,
+        reuseParsedCache: options.reuseParsedCache,
+        reuseCachedPageIndexTree: options.reuseCachedPageIndexTree,
+        forceReparse: options.forceReparse,
+        forcePageIndexUpload: Boolean(options.forcePageIndexUpload),
+        failFast: options.failFast,
+        hasTemporaryPageIndexKey: Boolean(options.pageIndexApiKey),
+        hasTemporaryGeminiKey: Boolean(options.geminiApiKey)
+      });
+
+      void runJob(job.id, inputFiles, options);
+      JobStore.addTrace(job.id, "routes.runPipeline", "response sent", { jobId: job.id });
+      res.json({
+        ok: true,
+        jobId: job.id,
+        pageIndexKey: options.pageIndexApiKey ? maskSecret(options.pageIndexApiKey) : undefined,
+        geminiKey: options.geminiApiKey ? maskSecret(options.geminiApiKey) : undefined
+      });
+    } catch (error) {
+      serverTrace("routes.runPipeline", "request rejected", {
+        elapsedMs: Date.now() - startedAt,
+        error: error instanceof Error ? error.message : String(error)
+      });
+      res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) });
     }
-    const options = {
-      ocrLanguage: stringValue(req.body.ocrLang) ?? stringValue(req.body.ocrLanguage) ?? "vie",
-      doclingThreads: numberValue(req.body.doclingThreads) ?? 4,
-      exportAssets: booleanValue(req.body.exportAssets),
-      uploadPageIndex: booleanValue(req.body.uploadPageIndex),
-      forcePageIndexUpload:
-        booleanValue(req.body.forcePageIndexUpload) ||
-        (req.body.reusePageIndexCache !== undefined && !booleanValue(req.body.reusePageIndexCache)),
-      failFast: booleanValue(req.body.failFast),
-      pageIndexApiKey: stringValue(req.body.temporaryPageIndexApiKey) ?? stringValue(req.body.pageIndexApiKey),
-      geminiApiKey: firstStringValue(
-        req.body.temporaryGeminiApiKey1,
-        req.body.temporaryGeminiApiKey2,
-        req.body.temporaryGeminiApiKey3,
-        req.body.temporaryGeminiApiKey,
-        req.body.geminiApiKey
-      )
-    };
-
-    JobStore.addTrace(job.id, "routes.runPipeline", "options resolved", {
-      ocrLanguage: options.ocrLanguage,
-      doclingThreads: options.doclingThreads,
-      exportAssets: options.exportAssets,
-      uploadPageIndex: options.uploadPageIndex,
-      forcePageIndexUpload: Boolean(options.forcePageIndexUpload),
-      failFast: options.failFast,
-      hasTemporaryPageIndexKey: Boolean(options.pageIndexApiKey),
-      hasTemporaryGeminiKey: Boolean(options.geminiApiKey)
-    });
-
-    void runJob(job.id, inputFiles, options);
-    JobStore.addTrace(job.id, "routes.runPipeline", "response sent", { jobId: job.id });
-    res.json({
-      jobId: job.id,
-      pageIndexKey: options.pageIndexApiKey ? maskSecret(options.pageIndexApiKey) : undefined,
-      geminiKey: options.geminiApiKey ? maskSecret(options.geminiApiKey) : undefined
-    });
   });
 
   router.get("/status/:jobId", (req, res) => {
@@ -341,13 +439,25 @@ export function createApiRouter(): express.Router {
         cachedDocIds: cachedDocIds.length,
         overrideGeminiKeys: requestGeminiApiKeys.length
       });
-      if (stringValue(req.body.scope) === "all") {
+      const requestScope = stringValue(req.body.scope) ?? "selected";
+      if (requestScope === "all") {
         const cachedAnswer = await answerFromCachedTrees(question, {
           geminiApiKeys: requestGeminiApiKeys,
           debug: booleanValue(req.body.debug)
         });
         serverTrace("routes.ask", "cached-tree answer sent", { elapsedMs: Date.now() - startedAt });
         res.json(cachedAnswer);
+        return;
+      }
+
+      if (requestScope === "local-sections") {
+        const cachedAnswer = await answerFromCachedTrees(question, {
+          geminiApiKeys: requestGeminiApiKeys,
+          debug: booleanValue(req.body.debug),
+          localSectionDocuments: splitDocIds(stringValue(req.body.document))
+        });
+        serverTrace("routes.ask", "local-section answer sent", { elapsedMs: Date.now() - startedAt });
+        res.json({ ...cachedAnswer, mode: "local-sections" });
         return;
       }
 
@@ -387,6 +497,12 @@ export function createApiRouter(): express.Router {
       res.json({
         answer: chat.answer,
         docIds,
+        indexSource: {
+          label: "Fresh PageIndex tree",
+          source: "pageindex-chat",
+          cachedDocumentCount: 0,
+          documents: docIds.map((docId) => ({ docId, status: "remote-pageindex" }))
+        },
         validation
       });
     } catch (error) {
@@ -407,13 +523,34 @@ function handleRunPipelineUpload(
   next: express.NextFunction
 ): void {
   const startedAt = Date.now();
+  let uploadFinished = false;
   serverTrace("handleRunPipelineUpload", "upload started", {
     contentLength: req.headers["content-length"] ?? "unknown"
+  });
+  req.on("aborted", () => {
+    serverTrace("handleRunPipelineUpload", "request aborted", {
+      elapsedMs: Date.now() - startedAt
+    });
+  });
+  req.on("close", () => {
+    const requestState = req as express.Request & { readableAborted?: boolean; aborted?: boolean };
+    if (!uploadFinished && !res.writableEnded && (requestState.readableAborted || requestState.aborted)) {
+      serverTrace("handleRunPipelineUpload", "client disconnected", {
+        elapsedMs: Date.now() - startedAt
+      });
+    }
+  });
+  req.on("error", (error) => {
+    serverTrace("handleRunPipelineUpload", "request stream error", {
+      elapsedMs: Date.now() - startedAt,
+      error: error.message
+    });
   });
   runPipelineUpload(req, res, (error: unknown) => {
     if (!error) {
       const files = Array.isArray(req.files) ? req.files as Express.Multer.File[] : [];
-      serverTrace("handleRunPipelineUpload", "upload completed", {
+      uploadFinished = true;
+      serverTrace("handleRunPipelineUpload", "upload finished", {
         fileCount: files.length,
         totalBytes: files.reduce((sum, file) => sum + file.size, 0),
         elapsedMs: Date.now() - startedAt
@@ -422,6 +559,7 @@ function handleRunPipelineUpload(
       return;
     }
 
+    uploadFinished = true;
     sendUploadError(error, res, Date.now() - startedAt);
   });
 }
@@ -434,25 +572,26 @@ function sendUploadError(error: unknown, res: express.Response, elapsedMs: numbe
   if (isRequestAbortedError(error)) {
     serverTrace("sendUploadError", "request aborted before all files were received", { elapsedMs });
     res.status(499).json({
+      ok: false,
       error: "Upload request was aborted before the server finished receiving files. Keep the tab open and retry."
     });
     return;
   }
 
   if (error instanceof multer.MulterError) {
-    serverTrace("sendUploadError", "multer rejected upload", {
+    serverTrace("sendUploadError", "multer/busboy error", {
       code: error.code,
       elapsedMs
     });
-    res.status(400).json({ error: uploadMulterErrorMessage(error) });
+    res.status(400).json({ ok: false, error: uploadMulterErrorMessage(error) });
     return;
   }
 
-  serverTrace("sendUploadError", "upload failed", {
+  serverTrace("sendUploadError", "multer/busboy error", {
     elapsedMs,
     error: error instanceof Error ? error.message : String(error)
   });
-  res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) });
 }
 
 function isRequestAbortedError(error: unknown): boolean {
@@ -462,10 +601,10 @@ function isRequestAbortedError(error: unknown): boolean {
 
 function uploadMulterErrorMessage(error: multer.MulterError): string {
   if (error.code === "LIMIT_FILE_SIZE") {
-    return "PDF upload is too large. Max file size is 100 MB per file.";
+    return `PDF upload is too large. Max file size is ${formatBytes(MAX_UPLOAD_FILE_BYTES)} per file.`;
   }
   if (error.code === "LIMIT_FILE_COUNT") {
-    return "Too many PDFs selected. Max is 25 files per run.";
+    return `Too many PDFs selected. Max is ${MAX_UPLOAD_FILES} files per run.`;
   }
   return error.message;
 }
@@ -478,6 +617,9 @@ async function runJob(
     doclingThreads: number;
     exportAssets: boolean;
     uploadPageIndex: boolean;
+    reuseParsedCache: boolean;
+    reuseCachedPageIndexTree: boolean;
+    forceReparse: boolean;
     forcePageIndexUpload?: boolean;
     failFast: boolean;
     pageIndexApiKey?: string;
@@ -618,6 +760,8 @@ async function buildDocumentBundle(
   const sectionMap = await readOptionalJson<SectionMapJson>(sectionMapPath);
   const treeValidation = await readOptionalJson<ValidationJson>(treeValidationPath);
   const treeJson = await readOptionalJson<{ docId?: string; tree?: unknown[] }>(treePath);
+  const cacheInspection = await inspectDocumentCache(inputFile);
+  const cacheRecord = await getCacheManifestRecord(path.basename(inputFile));
   const imageFiles = await listPngAssets(assetDir);
   const validationMarkers = (validation?.markers ?? []).map((marker) => ({
     marker: marker.marker,
@@ -642,6 +786,20 @@ async function buildDocumentBundle(
     imagesExported: imageFiles.length,
     imageCount: imageFiles.length,
     hasTree: Boolean(treeJson),
+    parseCacheStatus: cacheInspection.parseStatus,
+    pageIndexCacheStatus: cacheInspection.pageIndexCacheStatus,
+    pageIndexStatus: cacheRecord?.pageIndexStatus ?? (uploadPageIndex ? cacheInspection.pageIndexCacheStatus : "skipped"),
+    treeStatus: cacheInspection.treeStatus,
+    parseCacheStatusBefore: cacheRecord?.parseCacheStatusBefore,
+    parseAction: cacheRecord?.parseAction,
+    pageIndexCacheStatusBefore: cacheRecord?.pageIndexCacheStatusBefore,
+    pageIndexAction: cacheRecord?.pageIndexAction,
+    pageIndexCacheStatusAfter: cacheRecord?.pageIndexCacheStatusAfter ?? cacheInspection.pageIndexCacheStatus,
+    forcedReparse: cacheRecord?.forcedReparse ?? false,
+    forcedPageIndexUpload: cacheRecord?.forcedPageIndexUpload ?? false,
+    markdownHash: cacheInspection.markdownHash,
+    treeSourceMarkdownHash: cacheInspection.treeSourceMarkdownHash,
+    cacheManifest: cacheRecord,
     validation: {
       passed: validation?.passed ?? false,
       markers: validationMarkers
@@ -693,6 +851,16 @@ async function buildBatchOutputs(documentOutputs: Record<string, unknown>[]): Pr
     imageCount: output.imageCount,
     hasTree: output.hasTree,
     pageIndex: output.pageIndex,
+    parseCacheStatus: output.parseCacheStatus,
+    pageIndexCacheStatus: output.pageIndexCacheStatus,
+    treeStatus: output.treeStatus,
+    parseCacheStatusBefore: output.parseCacheStatusBefore,
+    parseAction: output.parseAction,
+    pageIndexCacheStatusBefore: output.pageIndexCacheStatusBefore,
+    pageIndexAction: output.pageIndexAction,
+    pageIndexCacheStatusAfter: output.pageIndexCacheStatusAfter,
+    forcedReparse: output.forcedReparse,
+    forcedPageIndexUpload: output.forcedPageIndexUpload,
     pageIndexDocId: output.pageIndexDocId,
     error: output.error ?? null
   }));
@@ -710,6 +878,13 @@ async function buildBatchOutputs(documentOutputs: Record<string, unknown>[]): Pr
       tree: output.paths && typeof output.paths === "object" ? (output.paths as Record<string, unknown>).tree : undefined,
       treeValidation: output.paths && typeof output.paths === "object" ? (output.paths as Record<string, unknown>).treeValidation : undefined,
       pageIndexDocId: output.pageIndexDocId,
+      parseCacheStatusBefore: output.parseCacheStatusBefore,
+      parseAction: output.parseAction,
+      pageIndexCacheStatusBefore: output.pageIndexCacheStatusBefore,
+      pageIndexAction: output.pageIndexAction,
+      pageIndexCacheStatusAfter: output.pageIndexCacheStatusAfter,
+      forcedReparse: output.forcedReparse ?? false,
+      forcedPageIndexUpload: output.forcedPageIndexUpload ?? false,
       error: output.error ?? null
     }))
   };
@@ -756,14 +931,14 @@ function documentSummaries(outputs: Record<string, unknown> | undefined): Array<
   return Array.isArray(documents) ? documents as Array<{ document?: unknown }> : [];
 }
 
-async function listCachedTreeDocuments(): Promise<Array<{ document: string; docId?: string; treePath: string }>> {
+async function listCachedTreeDocuments(): Promise<CachedTreeDocument[]> {
   const exists = await stat(convertedDir).then((item) => item.isDirectory()).catch(() => false);
   if (!exists) {
     return [];
   }
 
   const entries = await readdir(convertedDir, { withFileTypes: true });
-  const documents: Array<{ document: string; docId?: string; treePath: string }> = [];
+  const documents: CachedTreeDocument[] = [];
 
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith(".tree.json")) {
@@ -773,11 +948,16 @@ async function listCachedTreeDocuments(): Promise<Array<{ document: string; docI
     const treePath = path.join(convertedDir, entry.name);
     const treeJson = await readOptionalJson<Record<string, unknown>>(treePath);
     const docId = extractCachedDocId(treeJson);
+    const document = entry.name.replace(/\.tree\.json$/i, ".pdf");
+    const cacheInspection = await inspectDocumentCache(path.join(uploadsDir, document));
 
     documents.push({
-      document: entry.name.replace(/\.tree\.json$/i, ".pdf"),
+      document,
       docId,
-      treePath: relativePath(treePath) ?? treePath
+      treePath: relativePath(treePath) ?? treePath,
+      pageIndexCacheStatus: cacheInspection.pageIndexCacheStatus,
+      treeSourceMarkdownHash: cacheInspection.treeSourceMarkdownHash,
+      markdownHash: cacheInspection.markdownHash
     });
   }
 
@@ -786,23 +966,28 @@ async function listCachedTreeDocuments(): Promise<Array<{ document: string; docI
 
 async function answerFromCachedTrees(
   question: string,
-  options: { geminiApiKeys?: string[]; debug?: boolean } = {}
+  options: { geminiApiKeys?: string[]; debug?: boolean; localSectionDocuments?: string[] } = {}
 ): Promise<Record<string, unknown>> {
   const startedAt = Date.now();
   serverTrace("answerFromCachedTrees", "started", {
     overrideGeminiKeys: options.geminiApiKeys?.length ?? 0
   });
-  const documents = await listCachedTreeDocuments();
+  const forceLocalSections = (options.localSectionDocuments?.length ?? 0) > 0;
+  const documents = forceLocalSections ? [] : await listCachedTreeDocuments();
   serverTrace("answerFromCachedTrees", "cached tree documents loaded", {
     documentCount: documents.length,
     elapsedMs: Date.now() - startedAt
   });
   if (documents.length === 0) {
-    throw new Error("No cached tree JSON found in data/converted. Run parse with Upload to PageIndex once.");
+    serverTrace("answerFromCachedTrees", "no cached tree JSON; using local sections fallback", {
+      elapsedMs: Date.now() - startedAt
+    });
   }
 
   const searchStartedAt = Date.now();
-  const retrieval = await searchCachedTreeDocuments(question, documents);
+  const retrieval = documents.length > 0
+    ? await searchCachedTreeDocuments(question, documents)
+    : await searchLocalSectionsOnly(question, options.localSectionDocuments);
   const hits = retrieval.hits;
   const debugReport = createQaDebugReport(question, retrieval);
   serverTrace("answerFromCachedTrees", "cached tree search completed", {
@@ -813,11 +998,15 @@ async function answerFromCachedTrees(
     elapsedMs: Date.now() - searchStartedAt
   });
   if (hits.length === 0) {
+    const indexSource = buildIndexSource(retrieval, documents, []);
     const emptyResponse = {
-      answer: "Không tìm thấy ngữ cảnh phù hợp trong các cached tree JSON.",
+      answer: documents.length > 0
+        ? "Không tìm thấy ngữ cảnh phù hợp trong các cached tree JSON."
+        : "Không tìm thấy ngữ cảnh phù hợp trong local sections cache.",
       docIds: [],
       documents: documents.map((document) => document.document),
       mode: "cached-tree",
+      indexSource,
       retrieval: {
         source: retrieval.retrievalSource,
         bm25FallbackUsed: retrieval.bm25FallbackUsed,
@@ -888,12 +1077,15 @@ async function answerFromCachedTrees(
   const marker13 = TokenValidator.validateOutputSize(answer, { maxWords: 180 });
   const validation = QAValidator.validateResponse(answer, { requireCitations: false });
   serverTrace("answerFromCachedTrees", "completed", { elapsedMs: Date.now() - startedAt });
+  const sourceDocuments = uniqueStrings(hits.map((hit) => hit.document));
+  const indexSource = buildIndexSource(retrieval, documents, sourceDocuments);
 
   const response = {
     answer,
     docIds: [],
-    documents: uniqueStrings(hits.map((hit) => hit.document)),
+    documents: sourceDocuments,
     mode: "cached-tree",
+    indexSource,
     retrieval: {
       source: retrieval.retrievalSource,
       bm25FallbackUsed: retrieval.bm25FallbackUsed,
@@ -917,7 +1109,7 @@ async function answerFromCachedTrees(
 
 async function searchCachedTreeDocuments(
   question: string,
-  documents: Array<{ document: string; treePath: string }>
+  documents: CachedTreeDocument[]
 ): Promise<CachedTreeRetrievalResult> {
   const contrast = detectContrastTerms(question);
   const signals = extractQuerySignals(question);
@@ -949,7 +1141,7 @@ async function searchCachedTreeDocuments(
   if (usablePageIndexHits.length > 0) {
     return {
       hits: usablePageIndexHits,
-      retrievalSource: "pageindex-tree",
+      retrievalSource: "cached-pageindex-tree",
       bm25FallbackUsed: false,
       pageIndexResultCount: rankedPageIndexHits.length,
       contrastTerms: contrast.terms,
@@ -974,6 +1166,76 @@ async function searchCachedTreeDocuments(
     signals,
     pageIndexResults: pageIndexSelection.candidates,
     bm25Results: bm25Selection.candidates
+  };
+}
+
+async function searchLocalSectionsOnly(question: string, documentNames: string[] = []): Promise<CachedTreeRetrievalResult> {
+  const contrast = detectContrastTerms(question);
+  const signals = extractQuerySignals(question);
+  const queryTokens = tokenizeForSearch(question);
+  const scoringContext = { queryTokens, contrast };
+  const allowedDocuments = new Set(documentNames);
+  const sectionMetadata = (await loadSectionMetadata(documentNames))
+    .filter((section) => allowedDocuments.size === 0 || allowedDocuments.has(section.document));
+  const bm25Candidates = rankRetrievedSectionsByUsability(searchLocalSectionMetadataFallback(scoringContext, sectionMetadata), question);
+  const bm25Selection = selectRelevantSections(bm25Candidates, question, { requireHsMetadata: true });
+  return {
+    hits: bm25Selection.ranked,
+    retrievalSource: "local-sections",
+    bm25FallbackUsed: true,
+    pageIndexResultCount: 0,
+    contrastTerms: contrast.terms,
+    signals,
+    pageIndexResults: [],
+    bm25Results: bm25Selection.candidates
+  };
+}
+
+function buildIndexSource(
+  retrieval: CachedTreeRetrievalResult,
+  cachedDocuments: CachedTreeDocument[],
+  sourceDocuments: string[]
+): Record<string, unknown> {
+  if (retrieval.retrievalSource === "local-sections") {
+    return {
+      label: "Local sections only",
+      source: "local-sections",
+      cachedDocumentCount: 0,
+      documents: sourceDocuments.map((document) => ({ document, status: "local-sections" }))
+    };
+  }
+
+  if (retrieval.retrievalSource === "bm25-fallback") {
+    return {
+      label: "BM25 fallback",
+      source: "bm25-fallback",
+      cachedDocumentCount: cachedDocuments.length,
+      documents: cachedDocuments.map(publicCachedTreeDocument),
+      warning: cachedDocuments.some((document) => document.pageIndexCacheStatus === "stale")
+        ? "Cached tree may be stale; re-upload PageIndex to sync with latest Markdown."
+        : undefined
+    };
+  }
+
+  const hasStale = cachedDocuments.some((document) => document.pageIndexCacheStatus === "stale");
+  const hasFailed = cachedDocuments.some((document) => document.pageIndexCacheStatus === "failed");
+  const status = hasFailed ? "failed" : hasStale ? "stale" : "fresh";
+  return {
+    label: status === "fresh" ? "Cached PageIndex tree" : "Stale cached PageIndex tree",
+    source: "cached-pageindex-tree",
+    cachedDocumentCount: cachedDocuments.length,
+    cacheStatus: status,
+    documents: cachedDocuments.map(publicCachedTreeDocument),
+    warning: status === "stale" ? "Cached tree may be stale; re-upload PageIndex to sync with latest Markdown." : undefined
+  };
+}
+
+function publicCachedTreeDocument(document: CachedTreeDocument): Record<string, unknown> {
+  return {
+    document: document.document,
+    docId: document.docId ?? null,
+    treePath: document.treePath,
+    status: document.pageIndexCacheStatus
   };
 }
 
@@ -1206,6 +1468,75 @@ function pageNumberFromAssetName(fileName: string): number | undefined {
   }
   const page = Number(match[1]);
   return Number.isFinite(page) ? page : undefined;
+}
+
+interface CacheStatusFile {
+  name: string;
+  size?: number;
+  lastModified?: number;
+  inputHash?: string;
+}
+
+function parseCacheStatusFiles(value: unknown): CacheStatusFile[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.map((item) => {
+    if (typeof item !== "object" || item === null) {
+      throw new Error("Invalid cache status file payload.");
+    }
+    const record = item as Record<string, unknown>;
+    const name = stringValue(record.name);
+    if (!name || path.extname(name).toLowerCase() !== ".pdf") {
+      throw new Error("Cache status only accepts .pdf files.");
+    }
+    return {
+      name,
+      size: numberValue(record.size),
+      lastModified: numberValue(record.lastModified),
+      inputHash: stringValue(record.inputHash)
+    };
+  });
+}
+
+function parseCachedRunFiles(value: unknown): CacheStatusFile[] {
+  const text = Array.isArray(value) ? stringValue(value[0]) : stringValue(value);
+  if (!text) {
+    return [];
+  }
+  const parsed = JSON.parse(text) as unknown;
+  return parseCacheStatusFiles(Array.isArray(parsed) ? parsed : []);
+}
+
+async function resolveCachedRunFiles(files: CacheStatusFile[]): Promise<string[]> {
+  const inputFiles: string[] = [];
+  for (const file of files) {
+    const document = safePdfFileName(file.name);
+    const inputPath = path.resolve(uploadsDir, document);
+    if (!inputPath.startsWith(`${uploadsDir}${path.sep}`)) {
+      throw new Error(`Invalid cached PDF filename: ${file.name}`);
+    }
+    const fileStat = await stat(inputPath).catch(() => undefined);
+    if (!fileStat?.isFile()) {
+      throw new Error(`Cached input ${document} is not available on the server. Upload the PDF and retry.`);
+    }
+    if (file.inputHash) {
+      const currentHash = await sha256File(inputPath);
+      if (currentHash !== file.inputHash.toLowerCase()) {
+        throw new Error(`Cached input ${document} no longer matches the selected PDF. Upload the PDF and retry.`);
+      }
+    }
+    inputFiles.push(inputPath);
+  }
+  return inputFiles;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) {
+    return `${Math.round(bytes / 1024)} KB`;
+  }
+  return `${Math.round(bytes / (1024 * 1024))} MB`;
 }
 
 function safePdfFileName(fileName: string): string {

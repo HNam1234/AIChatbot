@@ -42,6 +42,11 @@ const togglePageIndexKeyButton = document.querySelector("#toggle-pageindex-key")
 const toggleGeminiKeyButtons = [...document.querySelectorAll("[data-toggle-gemini-key]")];
 const saveGeminiKeyButtons = [...document.querySelectorAll("[data-save-gemini-key]")];
 const pageIndexWarningEl = document.querySelector("#pageindex-warning");
+const cacheStatusSummaryEl = document.querySelector("#cache-status-summary");
+const runButton = document.querySelector("[form='pipeline-form'][type='submit']");
+const reuseParsedCacheInput = document.querySelector("#reuse-parsed-cache");
+const forceReparseInput = document.querySelector("#force-reparse");
+const forcePageIndexUploadInput = document.querySelector("#force-pageindex-upload");
 
 let activeJobId = null;
 let pollTimer = null;
@@ -51,6 +56,9 @@ let indexedDocuments = [];
 let currentPdfUrl = "";
 let currentPage = 1;
 let clientLogs = [];
+let selectedCacheRows = [];
+let cacheStatusRequestId = 0;
+let uploadInProgress = false;
 let settings = {
   hasPageIndexApiKey: false,
   maskedPageIndexApiKey: null,
@@ -70,10 +78,15 @@ document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => activateTab(tab.dataset.tab));
 });
 
-fileInput.addEventListener("change", renderSelectedFiles);
+fileInput.addEventListener("change", () => {
+  void refreshSelectedCacheStatus();
+});
 pageIndexKeyInput.addEventListener("input", updatePageIndexWarning);
 uploadPageIndexInput.addEventListener("change", updatePageIndexWarning);
 reusePageIndexCacheInput.addEventListener("change", updatePageIndexWarning);
+reuseParsedCacheInput.addEventListener("change", updatePageIndexWarning);
+forceReparseInput.addEventListener("change", updatePageIndexWarning);
+forcePageIndexUploadInput.addEventListener("change", updatePageIndexWarning);
 questionAllDocsInput.addEventListener("change", updateAgentScope);
 questionDocIdInput.addEventListener("input", updateAgentScope);
 prevPageButton.addEventListener("click", () => setPdfPage(Math.max(1, currentPage - 1)));
@@ -153,10 +166,14 @@ geminiKeyEnabledInputs.forEach((input) => {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (uploadInProgress) return;
+  setRunButtonDisabled(true);
   clearInterval(pollTimer);
   resetResult();
 
-  const body = new FormData(form);
+  const cacheRows = await ensureSelectedCacheStatus();
+  const selectedFiles = [...fileInput.files];
+  const body = buildPipelineFormData(selectedFiles, cacheRows);
   if (temporaryPageIndexKeyInput.checked && pageIndexKeyInput.value.trim()) {
     body.set("temporaryPageIndexApiKey", pageIndexKeyInput.value.trim());
   } else {
@@ -178,7 +195,8 @@ form.addEventListener("submit", async (event) => {
     body.delete("temporaryGeminiApiKey3");
   }
 
-  const uploadFiles = [...fileInput.files];
+  const uploadFiles = selectedFiles.filter((file) => !cacheRowForFile(file, cacheRows)?.canReuseUploadedInput);
+  const cachedFiles = selectedFiles.filter((file) => cacheRowForFile(file, cacheRows)?.canReuseUploadedInput);
   const uploadBytes = uploadFiles.reduce((sum, file) => sum + file.size, 0);
   let lastUploadLogPercent = -10;
 
@@ -186,6 +204,7 @@ form.addEventListener("submit", async (event) => {
   renderSelectedFiles("uploading");
   appendUiLog(traceLine("ui.formSubmit", "upload started", {
     fileCount: uploadFiles.length,
+    cachedFileCount: cachedFiles.length,
     totalBytes: uploadBytes,
     files: uploadFiles.map((file) => file.name)
   }));
@@ -205,13 +224,15 @@ form.addEventListener("submit", async (event) => {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    setTopStatus({ status: "failed", currentStep: "Upload request was interrupted", progressPercent: 0 });
+    setRunButtonDisabled(false);
+    setTopStatus({ status: "failed", currentStep: message, progressPercent: 0 });
     appendUiLog(traceLine("ui.uploadFormData", "upload interrupted", { error: message }));
     return;
   }
 
   const payload = uploadResult.payload;
   if (!uploadResult.ok) {
+    setRunButtonDisabled(false);
     setTopStatus({ status: "failed", currentStep: payload.error || "Failed to start pipeline", progressPercent: 0 });
     appendUiLog(traceLine("ui.uploadFormData", "upload rejected", {
       status: uploadResult.status,
@@ -244,7 +265,8 @@ askButton.addEventListener("click", async () => {
     answerEl.textContent = "Enter a question first.";
     return;
   }
-  if (docIds.length === 0 && !questionAllDocsInput.checked) {
+  const canUseSelectedLocalSections = Boolean(selectedBundle?.document && Array.isArray(selectedBundle.sections) && selectedBundle.sections.length > 0);
+  if (docIds.length === 0 && !questionAllDocsInput.checked && !canUseSelectedLocalSections) {
     answerEl.className = "warning";
     answerEl.textContent = "No PageIndex docs are available. Run Upload to PageIndex once, keep cached tree files, or paste doc_id manually.";
     return;
@@ -252,11 +274,14 @@ askButton.addEventListener("click", async () => {
   answerEl.className = "muted";
   answerEl.textContent = questionAllDocsInput.checked
     ? `Searching cached tree JSON across ${indexedDocuments.length} PDF(s)...`
-    : `Asking PageIndex Chat across ${docIds.length} document(s)...`;
+    : docIds.length > 0
+      ? `Asking PageIndex Chat across ${docIds.length} document(s)...`
+      : `Searching local sections for ${selectedBundle.document}...`;
   const body = {
     question,
     docIds,
-    scope: questionAllDocsInput.checked ? "all" : "selected",
+    scope: questionAllDocsInput.checked ? "all" : docIds.length > 0 ? "selected" : "local-sections",
+    document: selectedBundle?.document,
     debug: Boolean(questionDebugInput?.checked)
   };
   if (temporaryPageIndexKeyInput.checked && pageIndexKeyInput.value.trim()) {
@@ -281,8 +306,11 @@ askButton.addEventListener("click", async () => {
   const marker = payload.validation?.markers?.[0];
   const answerScope = payload.mode === "cached-tree"
     ? `Scope: cached tree JSON (${(payload.documents || []).length} source PDF(s))`
-    : `Scope: ${(payload.docIds || docIds).length} PageIndex document(s)`;
-  const retrievalStatus = renderRetrievalStatus(payload.retrieval);
+    : payload.mode === "local-sections"
+      ? `Scope: local sections (${(payload.documents || []).length} source PDF(s))`
+      : `Scope: ${(payload.docIds || docIds).length} PageIndex document(s)`;
+  const indexSource = payload.indexSource || selectedIndexSource();
+  const retrievalStatus = renderRetrievalStatus(payload.retrieval, indexSource);
   const citationCards = renderCitationCards(payload.citations || []);
   const debugPanel = questionDebugInput?.checked ? renderDebugPanel(payload.debug) : "";
   answerEl.innerHTML = `
@@ -320,6 +348,7 @@ async function pollStatus() {
 
   if (job.status === "completed" || job.status === "failed") {
     clearInterval(pollTimer);
+    setRunButtonDisabled(false);
     await loadResult();
   }
 }
@@ -380,13 +409,32 @@ function renderSelectedFiles(status = "waiting") {
     return;
   }
   selectedFilesEl.className = "selected-files";
-  selectedFilesEl.innerHTML = files.map((file) => `
-    <div class="file-row">
-      <span>${escapeHtml(file.name)}</span>
-      <span>${formatBytes(file.size)}</span>
-      ${statusChip(status)}
-    </div>
-  `).join("");
+  const hasCacheRows = selectedCacheRows.length > 0 && selectedCacheRows.some((row) => row.parseCacheStatus);
+  if (!hasCacheRows) {
+    selectedFilesEl.innerHTML = files.map((file) => `
+      <div class="file-row">
+        <span>${escapeHtml(file.name)}</span>
+        <span>${formatBytes(file.size)}</span>
+        ${statusChip(status)}
+      </div>
+    `).join("");
+    return;
+  }
+
+  selectedFilesEl.innerHTML = batchTableMarkup(files.map((file) => {
+    const row = cacheRowForFile(file, selectedCacheRows) || {};
+    return {
+      document: row.document || file.name,
+      progressPercent: status === "uploaded" ? 100 : status === "uploading" ? 30 : 0,
+      parseCache: row.parseCacheStatus || "checking",
+      pageIndexCache: row.pageIndexCacheStatus || "checking",
+      assets: Number.isFinite(row.assets) ? row.assets : "",
+      sections: Number.isFinite(row.sections) ? row.sections : "",
+      tree: row.treeStatus || "checking",
+      action: plannedAction(row, status),
+      error: row.error || ""
+    };
+  }), true);
 }
 
 function renderBatchStatus(files) {
@@ -396,13 +444,12 @@ function renderBatchStatus(files) {
     document: file.filename,
     status: file.status,
     progressPercent: file.progressPercent,
-    parse: file.status,
-    assets: "",
-    sections: "",
-    pageIndex: "",
-    treeValidation: "",
-    hsSectionCount: "",
-    imageCount: "",
+    parseCache: file.outputs?.parseCacheStatus || file.status,
+    pageIndexCache: file.outputs?.pageIndexCacheStatus || "",
+    assets: file.outputs?.imageCount ?? "",
+    sections: file.outputs?.hsSectionCount ?? "",
+    tree: file.outputs?.treeStatus || "",
+    action: file.currentStep || "",
     error: file.error || ""
   })), true);
 }
@@ -421,13 +468,12 @@ function renderBatchOutputs(outputs) {
     document: output.document,
     status: output.status,
     progressPercent: 100,
-    parse: output.status,
-    assets: output.imagesExported > 0 ? "yes" : "none",
-    sections: output.hsSections > 0 ? "yes" : "none",
-    pageIndex: output.pageIndex || "skipped",
-    treeValidation: output.treeValidation?.passed === true ? "passed" : output.treeValidation ? "failed" : "skipped",
-    hsSectionCount: output.hsSections ?? 0,
-    imageCount: output.imagesExported ?? 0,
+    parseCache: output.parseCacheStatus || output.parseCacheStatusAfter || output.status,
+    pageIndexCache: output.pageIndexCacheStatus || output.pageIndexCacheStatusAfter || output.pageIndex || "skipped",
+    assets: output.imagesExported ?? output.imageCount ?? 0,
+    sections: output.hsSections ?? output.hsSectionCount ?? 0,
+    tree: output.treeStatus || (output.hasTree ? "cached" : "missing"),
+    action: renderOutputAction(output),
     error: output.error || ""
   })), false);
 
@@ -441,8 +487,8 @@ function batchTableMarkup(rows, live) {
     <table>
       <thead>
         <tr>
-          <th>Document</th><th>Parse</th><th>Assets</th><th>Sections</th><th>PageIndex</th>
-          <th>Tree Validation</th><th>HS Sections</th><th>Images</th><th>Error</th>
+          <th>Document</th><th>Parse Cache</th><th>PageIndex Cache</th><th>Assets</th>
+          <th>Sections</th><th>Tree</th><th>Action</th><th>Error</th>
         </tr>
       </thead>
       <tbody>
@@ -452,13 +498,12 @@ function batchTableMarkup(rows, live) {
               <strong>${escapeHtml(row.document)}</strong>
               <div class="mini-progress"><span style="width:${Number(row.progressPercent || 0)}%"></span></div>
             </td>
-            <td>${statusChip(row.parse || row.status)}</td>
+            <td>${statusChip(row.parseCache || row.status)}</td>
+            <td>${statusChip(row.pageIndexCache || "n/a")}</td>
             <td>${plainOrChip(row.assets)}</td>
             <td>${plainOrChip(row.sections)}</td>
-            <td>${plainOrChip(row.pageIndex)}</td>
-            <td>${plainOrChip(row.treeValidation)}</td>
-            <td>${escapeHtml(row.hsSectionCount)}</td>
-            <td>${escapeHtml(row.imageCount)}</td>
+            <td>${plainOrChip(row.tree)}</td>
+            <td>${escapeHtml(row.action)}</td>
             <td class="error-cell">${escapeHtml(row.error)}</td>
           </tr>
         `).join("")}
@@ -603,19 +648,23 @@ function renderCitationCards(citations) {
   `).join("")}</div>`;
 }
 
-function renderRetrievalStatus(retrieval) {
-  if (!retrieval) {
+function renderRetrievalStatus(retrieval, indexSource) {
+  if (!retrieval && !indexSource) {
     return "";
   }
 
-  const fallback = Boolean(retrieval.bm25FallbackUsed);
-  const codes = Array.isArray(retrieval.finalHsCodes) ? retrieval.finalHsCodes.join(", ") : "";
+  const fallback = Boolean(retrieval?.bm25FallbackUsed || indexSource?.source === "bm25-fallback" || indexSource?.source === "local-sections");
+  const codes = Array.isArray(retrieval?.finalHsCodes) ? retrieval.finalHsCodes.join(", ") : "";
+  const sourceLabel = formatIndexSource(indexSource, retrieval);
+  const documentDetails = renderIndexSourceDocuments(indexSource);
   return `
     <div class="retrieval-status ${fallback ? "warning" : ""}">
-      <strong>Retrieval: ${escapeHtml(retrieval.source || "unknown")}</strong>
-      ${fallback ? "<span>BM25 fallback used</span>" : "<span>PageIndex tree result used</span>"}
+      <strong>Index source: ${escapeHtml(sourceLabel)}</strong>
+      ${fallback ? "<span>BM25/local fallback used</span>" : "<span>PageIndex tree result used</span>"}
       ${codes ? `<span>Final HS Code(s): ${escapeHtml(codes)}</span>` : ""}
-      ${retrieval.answerRepairApplied ? "<span>Answer repair applied</span>" : ""}
+      ${retrieval?.answerRepairApplied ? "<span>Answer repair applied</span>" : ""}
+      ${indexSource?.warning ? `<span>${escapeHtml(indexSource.warning)}</span>` : ""}
+      ${documentDetails}
     </div>
   `;
 }
@@ -727,6 +776,213 @@ function resetResult() {
   updateAgentScope(null);
 }
 
+async function refreshSelectedCacheStatus() {
+  const requestId = ++cacheStatusRequestId;
+  const files = [...fileInput.files];
+  selectedCacheRows = [];
+  if (files.length === 0) {
+    renderSelectedFiles();
+    updatePageIndexWarning();
+    return [];
+  }
+
+  renderSelectedFiles("checking cache");
+  try {
+    const records = [];
+    for (const file of files) {
+      records.push({
+        name: file.name,
+        size: file.size,
+        lastModified: file.lastModified,
+        inputHash: await hashFile(file)
+      });
+    }
+    if (requestId !== cacheStatusRequestId) {
+      return selectedCacheRows;
+    }
+    const response = await fetch("/api/cache-status", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ files: records })
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      selectedCacheRows = records.map((record) => ({
+        document: record.name,
+        originalName: record.name,
+        inputHash: record.inputHash,
+        parseCacheStatus: "missing",
+        pageIndexCacheStatus: "missing",
+        treeStatus: "missing",
+        error: payload.error || "Could not inspect cache."
+      }));
+    } else {
+      selectedCacheRows = payload.documents || [];
+    }
+  } catch (error) {
+    selectedCacheRows = files.map((file) => ({
+      document: file.name,
+      originalName: file.name,
+      parseCacheStatus: "missing",
+      pageIndexCacheStatus: "missing",
+      treeStatus: "missing",
+      error: error instanceof Error ? error.message : String(error)
+    }));
+  }
+  renderSelectedFiles();
+  updatePageIndexWarning();
+  return selectedCacheRows;
+}
+
+async function ensureSelectedCacheStatus() {
+  const files = [...fileInput.files];
+  if (files.length === 0) {
+    return [];
+  }
+  const hasAllRows = files.every((file) => cacheRowForFile(file, selectedCacheRows));
+  return hasAllRows ? selectedCacheRows : await refreshSelectedCacheStatus();
+}
+
+function buildPipelineFormData(files, cacheRows) {
+  const body = new FormData();
+  const ocrLanguage = form.elements.ocrLanguage?.value?.trim() || "vie+eng";
+  body.set("ocrLanguage", ocrLanguage);
+  body.set("doclingThreads", form.elements.doclingThreads?.value || "4");
+  appendChecked(body, "exportAssets", form.elements.exportAssets);
+  appendChecked(body, "reuseParsedCache", reuseParsedCacheInput);
+  appendChecked(body, "reuseCachedPageIndexTree", reusePageIndexCacheInput);
+  appendChecked(body, "forceReparse", forceReparseInput);
+  appendChecked(body, "uploadPageIndex", uploadPageIndexInput);
+  appendChecked(body, "forcePageIndexUpload", forcePageIndexUploadInput);
+  appendChecked(body, "failFast", form.elements.failFast);
+
+  const cachedFiles = [];
+  for (const file of files) {
+    const row = cacheRowForFile(file, cacheRows);
+    if (row?.canReuseUploadedInput) {
+      cachedFiles.push({
+        name: file.name,
+        size: file.size,
+        lastModified: file.lastModified,
+        inputHash: row.inputHash
+      });
+    } else {
+      body.append("files", file, file.name);
+    }
+  }
+  if (cachedFiles.length > 0) {
+    body.set("cachedFiles", JSON.stringify(cachedFiles));
+  }
+  return body;
+}
+
+function appendChecked(body, name, input) {
+  if (input?.checked) {
+    body.set(name, "true");
+  }
+}
+
+function cacheRowForFile(file, rows) {
+  return rows.find((row) => row.originalName === file.name || row.document === file.name);
+}
+
+function plannedAction(row, status = "waiting") {
+  if (status === "uploading") return row.canReuseUploadedInput ? "using cached PDF" : "uploading PDF";
+  if (status === "uploaded") return "queued";
+  if (!row || !row.parseCacheStatus) return status;
+  const parseAction = forceReparseInput.checked
+    ? "parse: force"
+    : reuseParsedCacheInput.checked && row.parseCacheStatus === "fresh"
+      ? "parse: skip cache"
+      : "parse: run";
+  let pageIndexAction = "PageIndex: disabled";
+  if (uploadPageIndexInput.checked) {
+    pageIndexAction = forcePageIndexUploadInput.checked
+      ? "PageIndex: force upload"
+      : reusePageIndexCacheInput.checked && row.pageIndexCacheStatus === "fresh"
+        ? "PageIndex: reuse tree"
+        : "PageIndex: upload if needed";
+  }
+  return `${parseAction}; ${pageIndexAction}`;
+}
+
+function renderOutputAction(output) {
+  const parts = [];
+  if (output.parseAction) parts.push(`parse: ${output.parseAction}`);
+  if (output.pageIndexAction) parts.push(`PageIndex: ${output.pageIndexAction}`);
+  return parts.join("; ") || output.pageIndex || output.status || "";
+}
+
+function selectedIndexSource() {
+  if (!selectedBundle) {
+    return { label: "Local sections only", source: "local-sections" };
+  }
+  const status = selectedBundle.pageIndexCacheStatus || selectedBundle.pageIndexStatus;
+  if (status === "fresh") {
+    return {
+      label: selectedBundle.pageIndexDocId ? "Fresh PageIndex tree" : "Cached PageIndex tree",
+      source: "cached-pageindex-tree",
+      cachedDocumentCount: 1,
+      cacheStatus: "fresh",
+      documents: [{ document: selectedBundle.document, status: "fresh" }]
+    };
+  }
+  if (selectedBundle.hasTree) {
+    return {
+      label: "Stale cached PageIndex tree",
+      source: "cached-pageindex-tree",
+      cachedDocumentCount: 1,
+      cacheStatus: "stale",
+      warning: "Cached tree may be stale; re-upload PageIndex to sync with latest Markdown.",
+      documents: [{ document: selectedBundle.document, status: status || "stale" }]
+    };
+  }
+  return {
+    label: selectedBundle.sections?.length ? "Local sections only" : "BM25 fallback",
+    source: selectedBundle.sections?.length ? "local-sections" : "bm25-fallback",
+    cachedDocumentCount: 0,
+    documents: selectedBundle.document ? [{ document: selectedBundle.document, status: "local-sections" }] : []
+  };
+}
+
+function formatIndexSource(indexSource, retrieval) {
+  if (indexSource?.label) {
+    const count = Number(indexSource.cachedDocumentCount);
+    const status = indexSource.cacheStatus ? `, ${indexSource.cacheStatus}` : "";
+    return Number.isFinite(count) && count > 0
+      ? `${indexSource.label} (${count} documents${status})`
+      : indexSource.label;
+  }
+  if (retrieval?.source === "bm25-fallback") return "BM25 fallback";
+  if (retrieval?.source === "local-sections") return "Local sections only";
+  return retrieval?.source || "unknown";
+}
+
+function renderIndexSourceDocuments(indexSource) {
+  if (!Array.isArray(indexSource?.documents) || indexSource.documents.length === 0) {
+    return "";
+  }
+  const details = indexSource.documents
+    .slice(0, 12)
+    .map((document) => `${document.document || document.docId}: ${document.status}`)
+    .join(" | ");
+  return `<span>${escapeHtml(details)}</span>`;
+}
+
+function setRunButtonDisabled(disabled) {
+  uploadInProgress = disabled;
+  if (runButton) {
+    runButton.disabled = disabled;
+    runButton.textContent = disabled ? "Running..." : "Run Pipeline";
+  }
+}
+
+async function hashFile(file) {
+  const buffer = await file.arrayBuffer();
+  const digest = await crypto.subtle.digest("SHA-256", buffer);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function updateAgentScope(bundle) {
   if (Array.isArray(bundle)) {
     indexedDocuments = bundle;
@@ -748,12 +1004,17 @@ function updateAgentScope(bundle) {
   }
 
   if (selectedDocId) {
-    questionDocScopeEl.textContent = `Scope: selected document ${selectedBundle.document} (${selectedDocId}).`;
+    questionDocScopeEl.textContent = `Scope: selected document ${selectedBundle.document} (${selectedDocId}). Index source: ${selectedIndexSource().label}.`;
     return;
   }
 
   if (selectedBundle?.document) {
-    questionDocScopeEl.textContent = `Selected: ${selectedBundle.document}, but no PageIndex doc_id is available.`;
+    const source = selectedBundle.hasTree
+      ? selectedIndexSource().label
+      : selectedBundle.sections?.length
+        ? "Local sections only"
+        : "No cached index";
+    questionDocScopeEl.textContent = `Selected: ${selectedBundle.document}. Index source: ${source}.`;
     return;
   }
 
@@ -971,12 +1232,45 @@ function renderGeminiSettingsStatus() {
 
 function updatePageIndexWarning() {
   const hasTemporaryKey = pageIndexKeyInput.value.trim().length > 0;
+  const uploadMayRun = uploadPageIndexInput.checked && (
+    forcePageIndexUploadInput.checked ||
+    !reusePageIndexCacheInput.checked ||
+    selectedCacheRows.length === 0 ||
+    selectedCacheRows.some((row) => row.pageIndexCacheStatus !== "fresh")
+  );
   const shouldWarn =
     uploadPageIndexInput.checked &&
     !settings.hasPageIndexApiKey &&
     !hasTemporaryKey &&
-    !reusePageIndexCacheInput.checked;
+    uploadMayRun;
   pageIndexWarningEl.classList.toggle("hidden", !shouldWarn);
+  renderCacheSummary();
+}
+
+function renderCacheSummary() {
+  if (!cacheStatusSummaryEl) return;
+  const messages = [];
+  if (uploadPageIndexInput.checked) {
+    const freshCount = selectedCacheRows.filter((row) => row.pageIndexCacheStatus === "fresh").length;
+    if (freshCount > 0 && reusePageIndexCacheInput.checked && !forcePageIndexUploadInput.checked) {
+      messages.push("PageIndex tree already exists and matches current Markdown. It will be reused unless Force re-upload is enabled.");
+    }
+  } else {
+    messages.push("PageIndex upload disabled. Q&A may use existing cached tree if available.");
+  }
+
+  const cachedRows = selectedCacheRows.filter((row) => row.hasTree || row.treeStatus === "fresh" || row.treeStatus === "stale" || row.treeStatus === "cached");
+  if (cachedRows.length > 0) {
+    const stale = cachedRows.filter((row) => row.pageIndexCacheStatus === "stale").length;
+    const fresh = cachedRows.filter((row) => row.pageIndexCacheStatus === "fresh").length;
+    if (fresh > 0) messages.push(`Cached PageIndex tree: fresh (${fresh}).`);
+    if (stale > 0) messages.push(`Cached PageIndex tree: stale; Markdown changed since tree generation (${stale}).`);
+  }
+
+  cacheStatusSummaryEl.className = messages.some((message) => message.includes("stale") || message.includes("disabled"))
+    ? "cache-summary warning"
+    : "cache-summary muted";
+  cacheStatusSummaryEl.textContent = messages.join(" ") || "Select PDFs to inspect cache status.";
 }
 
 function togglePasswordInput(input, button) {
@@ -994,7 +1288,7 @@ function statusChip(value) {
 function plainOrChip(value) {
   const text = String(value ?? "");
   if (!text) return "";
-  if (/^(passed|failed|completed|queued|running|waiting|yes|none|skipped)$/i.test(text)) {
+  if (/^(passed|failed|completed|queued|running|waiting|yes|none|skipped|fresh|stale|missing|cached|uploaded)$/i.test(text)) {
     return statusChip(text);
   }
   return escapeHtml(text);

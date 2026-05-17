@@ -149,6 +149,9 @@ export interface PipelineOptions extends ToolRuntimeOptions {
   exportAssets?: boolean;
   assetsDir?: string;
   uploadPageIndex?: boolean;
+  reuseParsedCache?: boolean;
+  reuseCachedPageIndexTree?: boolean;
+  forceReparse?: boolean;
   forcePageIndexUpload?: boolean;
   pageIndexApiKey?: string;
   pageIndexBaseUrl?: string;
@@ -208,4 +211,13 @@ export interface PipelineResult {
   treeOutputPath?: string;
   treeValidationReportPath?: string;
   pageIndexDocId?: string;
+  parseCacheStatusBefore?: "missing" | "fresh" | "stale" | "failed";
+  parseCacheStatusAfter?: "missing" | "fresh" | "stale" | "failed";
+  parseAction?: "skipped-cache" | "parsed" | "failed";
+  pageIndexCacheStatusBefore?: "missing" | "fresh" | "stale" | "failed";
+  pageIndexCacheStatusAfter?: "missing" | "fresh" | "stale" | "failed";
+  pageIndexStatus?: "missing" | "fresh" | "stale" | "skipped" | "failed";
+  pageIndexAction?: "skipped-disabled" | "skipped-cache" | "uploaded" | "failed";
+  forcedReparse?: boolean;
+  forcedPageIndexUpload?: boolean;
 }

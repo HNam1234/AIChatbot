@@ -8,6 +8,9 @@ export interface PipelineProcessOptions {
   doclingThreads: number;
   exportAssets: boolean;
   uploadPageIndex: boolean;
+  reuseParsedCache?: boolean;
+  reuseCachedPageIndexTree?: boolean;
+  forceReparse?: boolean;
   forcePageIndexUpload?: boolean;
   pageIndexApiKey?: string;
   geminiApiKey?: string;
@@ -36,6 +39,9 @@ export async function runPipelineProcess(options: PipelineProcessOptions): Promi
       timeoutMs: options.timeoutMs,
       exportAssets: options.exportAssets,
       uploadPageIndex: options.uploadPageIndex,
+      reuseParsedCache: options.reuseParsedCache !== false,
+      reuseCachedPageIndexTree: options.reuseCachedPageIndexTree !== false,
+      forceReparse: Boolean(options.forceReparse),
       forcePageIndexUpload: Boolean(options.forcePageIndexUpload),
       hasTemporaryPageIndexKey: Boolean(options.pageIndexApiKey),
       hasTemporaryGeminiKey: Boolean(options.geminiApiKey)
@@ -133,8 +139,17 @@ function buildParseArgs(options: PipelineProcessOptions): string[] {
   if (options.exportAssets) {
     args.push("--export-assets");
   }
+  if (options.reuseParsedCache === false) {
+    args.push("--no-reuse-parsed-cache");
+  }
+  if (options.forceReparse) {
+    args.push("--force-reparse");
+  }
   if (options.uploadPageIndex) {
     args.push("--upload-pageindex");
+  }
+  if (options.reuseCachedPageIndexTree === false) {
+    args.push("--no-reuse-cached-pageindex-tree");
   }
   if (options.forcePageIndexUpload) {
     args.push("--force-pageindex-upload");
@@ -164,6 +179,9 @@ function inferStep(line: string): string | undefined {
   if (normalized.includes("layout analysis started")) {
     return "layout analysis started";
   }
+  if (normalized.includes("local parse cache fresh; skipping parse")) {
+    return "local parse cache hit";
+  }
   if (normalized.includes("layout/docling routing started")) {
     return "layout/docling started";
   }
@@ -183,6 +201,9 @@ function inferStep(line: string): string | undefined {
     return "pageindex upload started";
   }
   if (normalized.includes("pageindex cache hit")) {
+    return "pageindex cache hit";
+  }
+  if (normalized.includes("pageindex tree cache fresh; skipping upload")) {
     return "pageindex cache hit";
   }
   if (normalized.includes("pageindex cache miss")) {
