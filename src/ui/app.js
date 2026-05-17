@@ -25,7 +25,6 @@ const askButton = document.querySelector("#ask");
 const questionInput = document.querySelector("#question");
 const questionAllDocsInput = document.querySelector("#question-all-docs");
 const questionDocIdInput = document.querySelector("#question-doc-id");
-const questionDebugInput = document.querySelector("#question-debug");
 const questionDocScopeEl = document.querySelector("#question-doc-scope");
 const answerEl = document.querySelector("#answer");
 const pageIndexKeyInput = document.querySelector("#pageindex-key");
@@ -338,7 +337,7 @@ askButton.addEventListener("click", async () => {
     scope: selectedScope,
     cachedTreeDocuments,
     document: localSectionDocuments.join(","),
-    debug: Boolean(questionDebugInput?.checked)
+    debug: true
   };
   if (temporaryPageIndexKeyInput.checked && pageIndexKeyInput.value.trim()) {
     body.temporaryPageIndexApiKey = pageIndexKeyInput.value.trim();
@@ -367,12 +366,7 @@ askButton.addEventListener("click", async () => {
     : `Index source: ${formatIndexSource(indexSource, payload.retrieval)}`;
   const retrievalStatus = renderRetrievalStatus(payload.retrieval, indexSource);
   const citationCards = renderCitationCards(payload.citations || []);
-  renderDebugOutput(
-    questionDebugInput?.checked
-      ? renderDebugPanel(payload.debug)
-      : renderDebugSummary(indexSource, payload.retrieval),
-    !questionDebugInput?.checked
-  );
+  renderDebugOutput(renderDebugPanel(payload.debug, indexSource, payload.retrieval));
   answerEl.innerHTML = `
     <div class="answer-box">
       <div class="answer-text">${escapeHtml(payload.answer || "")}</div>
@@ -736,9 +730,9 @@ function renderRetrievalStatus(retrieval, indexSource) {
   `;
 }
 
-function renderDebugPanel(debug) {
+function renderDebugPanel(debug, indexSource, retrieval) {
   if (!debug) {
-    return "Debug payload is empty. Run the question again with Debug retrieval enabled.";
+    return renderDebugSummary(indexSource, retrieval);
   }
 
   const selected = debug.selectedPrimary && Object.keys(debug.selectedPrimary).length > 0
@@ -763,7 +757,7 @@ function renderDebugPanel(debug) {
 function renderDebugSummary(indexSource, retrieval) {
   return `
     <div class="debug-summary">
-      <strong>Debug retrieval is off</strong>
+      <strong>Debug payload is empty</strong>
       <span>Index source: ${escapeHtml(formatIndexSource(indexSource, retrieval))}</span>
       ${retrieval?.source ? `<span>Retrieval source: ${escapeHtml(retrieval.source)}</span>` : ""}
       ${retrieval?.bm25FallbackUsed ? "<span>BM25/local fallback used</span>" : ""}
@@ -840,7 +834,7 @@ function resetResult() {
   clientLogs = [];
   answerEl.className = "chat-thread muted";
   answerEl.textContent = "Ask a question about the selected document, all cached trees, or local sections.";
-  renderDebugOutput(escapeHtml("Enable Debug retrieval, ask a question, then inspect candidates here."), true);
+  renderDebugOutput(escapeHtml("Ask a question, then inspect retrieval candidates here."), true);
   markdownEl.textContent = "No Markdown yet.";
   markdownEl.className = "markdown muted";
   renderedEl.textContent = "No rendered preview yet.";
