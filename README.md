@@ -47,8 +47,11 @@ Tạo `.env` từ `.env.example`:
 PAGEINDEX_API_KEY=your_key_here
 GEMINI_API_KEY=your_gemini_key_here
 GEMINI_KEY_1=your_first_gemini_key
+GEMINI_KEY_1_ENABLED=true
 GEMINI_KEY_2=your_second_gemini_key
+GEMINI_KEY_2_ENABLED=true
 GEMINI_KEY_3=your_third_gemini_key
+GEMINI_KEY_3_ENABLED=true
 PAGEINDEX_API_BASE_URL=https://api.pageindex.ai
 PAGEINDEX_MCP_URL=https://api.pageindex.ai/mcp
 PAGEINDEX_POLL_INTERVAL_MS=5000
@@ -71,6 +74,7 @@ Mở `http://localhost:3000`, nhập key vào panel `API Settings`.
 
 - PageIndex key: dùng cho `--upload-pageindex`.
 - Gemini keys: UI hỗ trợ 3 slot `GEMINI_KEY_1`, `GEMINI_KEY_2`, `GEMINI_KEY_3` cho Milestone 4 Round-Robin failover; `GEMINI_API_KEY` vẫn là fallback legacy.
+- Mỗi Gemini slot có checkbox `Use`; bỏ tick slot bị ban để lưu `GEMINI_KEY_N_ENABLED=false` vào `.env`. Round-Robin tự bỏ qua key lỗi quota, 401/403, permission denied, forbidden, invalid key hoặc banned và thử key đang bật tiếp theo.
 - Temporary key mode: tick `Use ... key only for this run`; key chỉ được truyền cho job hiện tại qua environment, không lưu disk.
 - Save key mode: bấm `Save ... Key to .env`; backend chỉ set/replace key tương ứng và giữ các biến `.env` khác.
 - UI/API chỉ hiện masked key dạng `********...abcd`; raw key không được trả về, không log ra terminal, không ghi job logs, không lưu localStorage.
@@ -210,6 +214,8 @@ npm run chat -- --doc-id "doc_id_from_milestone_2"
 
 Milestone 3 is intentionally vectorless: it reuses PageIndex Chat API and inline citations instead of building a separate local vector database. In the UI, Agent Console defaults to all cached PageIndex docs found in `data/converted/*.tree.json`, so one question can search across every PDF that has already been uploaded once.
 
+Cached-tree Q&A joins tree hits back to local `*.sections.json` / `all.sections.json` metadata. Final answers are rendered with a required `HS Code: <code>` and a full citation (`document`, page/page range, section) when the retrieved section has HS metadata; the UI also shows the same metadata in a citation card.
+
 ## Milestone 4: MCP Round-Robin Agent Plan
 
 Milestone 4 will add a custom low-token agent that uses PageIndex MCP tools for targeted retrieval and a Gemini Round-Robin client for final answer synthesis across multiple configured keys.
@@ -277,6 +283,8 @@ Documents: 16/16 passed
 npm run dev
 ```
 
+`npm run dev` chạy server ổn định để tránh restart giữa lúc upload. Nếu chỉ sửa code và không upload file lớn, có thể dùng `npm run dev:watch`.
+
 Mở:
 
 ```text
@@ -293,6 +301,8 @@ http://localhost:3000
 6. Optional: bỏ tick `Reuse cached PageIndex tree` nếu muốn force regenerate, hoặc tick `Stop on first failure`; files run sequentially by default.
 7. Bấm `Run Pipeline`.
 8. Watch the top progress bar, current file, current step, elapsed time, per-file mini progress, and live logs.
+
+The top progress bar includes the browser upload phase before parsing starts. Runtime logs include ISO timestamp, elapsed job time, function/phase name, and selected metadata such as filename, bytes, exit code, cache status, and validation/build durations. Raw API keys are not logged.
 
 The UI uses a two-panel debugger layout:
 

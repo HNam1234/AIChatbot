@@ -1,11 +1,12 @@
 export function resolveGeminiApiKeys(overrides: string[] = []): string[] {
-  const keys = [
-    ...overrides,
-    process.env.GEMINI_KEY_1,
-    process.env.GEMINI_KEY_2,
-    process.env.GEMINI_KEY_3,
-    process.env.GEMINI_API_KEY
-  ];
+  const keys = overrides.length > 0
+    ? overrides
+    : [
+        enabledEnvKey("GEMINI_KEY_1", "GEMINI_KEY_1_ENABLED"),
+        enabledEnvKey("GEMINI_KEY_2", "GEMINI_KEY_2_ENABLED"),
+        enabledEnvKey("GEMINI_KEY_3", "GEMINI_KEY_3_ENABLED"),
+        process.env.GEMINI_API_KEY
+      ];
   const seen = new Set<string>();
   const resolved: string[] = [];
 
@@ -22,4 +23,13 @@ export function resolveGeminiApiKeys(overrides: string[] = []): string[] {
   }
 
   return resolved;
+}
+
+function enabledEnvKey(keyName: string, enabledName: string): string | undefined {
+  return isEnabled(process.env[enabledName]) ? process.env[keyName] : undefined;
+}
+
+function isEnabled(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase();
+  return normalized !== "false" && normalized !== "0" && normalized !== "off" && normalized !== "no";
 }

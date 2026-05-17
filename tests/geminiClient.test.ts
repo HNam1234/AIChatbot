@@ -29,6 +29,28 @@ describe("GeminiRoundRobinClient", () => {
     expect(calls).toEqual(["key-1", "key-2"]);
   });
 
+  it("fails over when a configured key is banned or unauthorized", async () => {
+    const calls: string[] = [];
+    const generator: GeminiTextGenerator = {
+      async generateText({ apiKey }) {
+        calls.push(apiKey);
+        if (apiKey === "banned-key") {
+          const error = new Error("API key not valid. Permission denied.");
+          (error as Error & { status?: number }).status = 403;
+          throw error;
+        }
+        return "0102.29.11 - OXEN";
+      }
+    };
+    const client = new GeminiRoundRobinClient({
+      apiKeys: ["banned-key", "healthy-key"],
+      generator
+    });
+
+    await expect(client.synthesizeAnswer("OXEN", "oxen")).resolves.toContain("0102.29.11");
+    expect(calls).toEqual(["banned-key", "healthy-key"]);
+  });
+
   it("does not retry non-retryable errors", async () => {
     const calls: string[] = [];
     const generator: GeminiTextGenerator = {
@@ -51,7 +73,8 @@ describe("GeminiRoundRobinClient", () => {
   it("detects retryable Gemini quota and transient failures", () => {
     expect(isRetryableGeminiError(Object.assign(new Error("quota exceeded"), { status: 429 }))).toBe(true);
     expect(isRetryableGeminiError(Object.assign(new Error("server error"), { status: 503 }))).toBe(true);
-    expect(isRetryableGeminiError(Object.assign(new Error("invalid key"), { status: 401 }))).toBe(false);
+    expect(isRetryableGeminiError(Object.assign(new Error("invalid key"), { status: 401 }))).toBe(true);
+    expect(isRetryableGeminiError(Object.assign(new Error("Bad request"), { status: 400 }))).toBe(false);
   });
 
   it("builds a grounded HS Code prompt", () => {

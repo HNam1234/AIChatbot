@@ -9,6 +9,7 @@ import {
   maskSecret,
   resolvePageIndexSettings,
   saveGeminiApiKeyToEnv,
+  saveGeminiKeySlotEnabledToEnv,
   saveGeminiKeySlotToEnv,
   savePageIndexApiKeyToEnv
 } from "../config/env";
@@ -26,6 +27,16 @@ import { JobStore } from "./jobStore";
 import { runPipelineProcess } from "./pipelineProcessRunner";
 import { QAValidator } from "../validators/qaValidator";
 import { GeminiRoundRobinClient } from "../agent/geminiClient";
+import {
+  buildStructuredRetrievedContext,
+  enrichRetrievedHit,
+  normalizeSectionMetadata,
+  renderHsCodeAnswer,
+  selectAlternativeSections,
+  type EnrichedRetrievedSection,
+  type RetrievedTreeHit,
+  type SectionMetadata
+} from "../agent/qaAnswerFormatter";
 import { resolveGeminiApiKeys } from "../config/gemini";
 import { TokenValidator } from "../validators/tokenValidator";
 
@@ -33,6 +44,29 @@ const uploadsDir = path.resolve(process.cwd(), "data", "uploads");
 const convertedDir = path.resolve(process.cwd(), "data", "converted");
 const assetsRoot = path.resolve(process.cwd(), "data", "converted", "assets");
 const tmpDir = path.resolve(process.cwd(), "data", "tmp");
+const SEARCH_STOPWORDS = new Set([
+  "the",
+  "and",
+  "are",
+  "for",
+  "with",
+  "what",
+  "which",
+  "define",
+  "defined",
+  "definition",
+  "duoc",
+  "dinh",
+  "nghia",
+  "gi",
+  "la",
+  "cua",
+  "cho",
+  "thuoc",
+  "trong",
+  "mot",
+  "cac"
+]);
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -54,6 +88,7 @@ const upload = multer({
     fileSize: 100 * 1024 * 1024
   }
 });
+const runPipelineUpload = upload.any();
 
 export function createApiRouter(): express.Router {
   const router = express.Router();
@@ -104,7 +139,23 @@ export function createApiRouter(): express.Router {
     }
   });
 
-  router.post("/run-pipeline", upload.any(), (req, res) => {
+  router.post("/settings/gemini-key-enabled", async (req, res) => {
+    try {
+      const slot = stringValue(req.body.slot);
+      if (!isGeminiKeySlotName(slot)) {
+        res.status(400).json({ error: "Invalid Gemini key slot." });
+        return;
+      }
+
+      const result = await saveGeminiKeySlotEnabledToEnv(slot, booleanValue(req.body.enabled));
+      res.json({ ok: true, slotName: result.slotName, enabled: result.enabled });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  router.post("/run-pipeline", handleRunPipelineUpload, (req, res) => {
+    const startedAt = Date.now();
     const files = (req.files ?? []) as Express.Multer.File[];
     const pdfFiles = files.filter((file) => file.fieldname === "pdf" || file.fieldname === "files" || file.fieldname === "files[]");
     if (pdfFiles.length === 0) {
@@ -114,9 +165,17 @@ export function createApiRouter(): express.Router {
 
     const inputFiles = pdfFiles.map((file) => file.path);
     const job = JobStore.create(inputFiles);
-    JobStore.addLog(job.id, "upload received");
+    JobStore.addTrace(job.id, "routes.runPipeline", "upload accepted", {
+      fileCount: pdfFiles.length,
+      totalBytes: pdfFiles.reduce((sum, file) => sum + file.size, 0),
+      elapsedMs: Date.now() - startedAt
+    });
     for (const file of pdfFiles) {
-      JobStore.addLog(job.id, `file saved: ${relativePath(file.path)}`);
+      JobStore.addTrace(job.id, "routes.runPipeline", "file saved", {
+        filename: file.filename,
+        bytes: file.size,
+        path: relativePath(file.path)
+      });
       JobStore.setFileStep(job.id, file.filename, "file saved");
     }
     const options = {
@@ -138,7 +197,19 @@ export function createApiRouter(): express.Router {
       )
     };
 
+    JobStore.addTrace(job.id, "routes.runPipeline", "options resolved", {
+      ocrLanguage: options.ocrLanguage,
+      doclingThreads: options.doclingThreads,
+      exportAssets: options.exportAssets,
+      uploadPageIndex: options.uploadPageIndex,
+      forcePageIndexUpload: Boolean(options.forcePageIndexUpload),
+      failFast: options.failFast,
+      hasTemporaryPageIndexKey: Boolean(options.pageIndexApiKey),
+      hasTemporaryGeminiKey: Boolean(options.geminiApiKey)
+    });
+
     void runJob(job.id, inputFiles, options);
+    JobStore.addTrace(job.id, "routes.runPipeline", "response sent", { jobId: job.id });
     res.json({
       jobId: job.id,
       pageIndexKey: options.pageIndexApiKey ? maskSecret(options.pageIndexApiKey) : undefined,
@@ -220,8 +291,10 @@ export function createApiRouter(): express.Router {
   });
 
   router.post("/ask", async (req, res) => {
+    const startedAt = Date.now();
     try {
       const question = stringValue(req.body.question);
+      const requestGeminiApiKeys = stringListValue(req.body.geminiApiKeys);
       const requestedDocIds = uniqueStrings([
         ...stringListValue(req.body.docIds),
         ...splitDocIds(stringValue(req.body.docId))
@@ -237,8 +310,15 @@ export function createApiRouter(): express.Router {
         res.status(400).json({ error: "Question is required." });
         return;
       }
+      serverTrace("routes.ask", "request accepted", {
+        scope: stringValue(req.body.scope) ?? "selected",
+        requestedDocIds: requestedDocIds.length,
+        cachedDocIds: cachedDocIds.length,
+        overrideGeminiKeys: requestGeminiApiKeys.length
+      });
       if (stringValue(req.body.scope) === "all") {
-        const cachedAnswer = await answerFromCachedTrees(question);
+        const cachedAnswer = await answerFromCachedTrees(question, { geminiApiKeys: requestGeminiApiKeys });
+        serverTrace("routes.ask", "cached-tree answer sent", { elapsedMs: Date.now() - startedAt });
         res.json(cachedAnswer);
         return;
       }
@@ -271,6 +351,10 @@ export function createApiRouter(): express.Router {
         ]
       });
       const validation = QAValidator.validateResponse(chat.answer);
+      serverTrace("routes.ask", "pageindex chat answer sent", {
+        docIds: docIds.length,
+        elapsedMs: Date.now() - startedAt
+      });
 
       res.json({
         answer: chat.answer,
@@ -278,11 +362,84 @@ export function createApiRouter(): express.Router {
         validation
       });
     } catch (error) {
+      serverTrace("routes.ask", "request failed", {
+        elapsedMs: Date.now() - startedAt,
+        error: error instanceof Error ? error.message : String(error)
+      });
       res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
     }
   });
 
   return router;
+}
+
+function handleRunPipelineUpload(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+): void {
+  const startedAt = Date.now();
+  serverTrace("handleRunPipelineUpload", "upload started", {
+    contentLength: req.headers["content-length"] ?? "unknown"
+  });
+  runPipelineUpload(req, res, (error: unknown) => {
+    if (!error) {
+      const files = Array.isArray(req.files) ? req.files as Express.Multer.File[] : [];
+      serverTrace("handleRunPipelineUpload", "upload completed", {
+        fileCount: files.length,
+        totalBytes: files.reduce((sum, file) => sum + file.size, 0),
+        elapsedMs: Date.now() - startedAt
+      });
+      next();
+      return;
+    }
+
+    sendUploadError(error, res, Date.now() - startedAt);
+  });
+}
+
+function sendUploadError(error: unknown, res: express.Response, elapsedMs: number): void {
+  if (res.headersSent || res.writableEnded) {
+    return;
+  }
+
+  if (isRequestAbortedError(error)) {
+    serverTrace("sendUploadError", "request aborted before all files were received", { elapsedMs });
+    res.status(499).json({
+      error: "Upload request was aborted before the server finished receiving files. Keep the tab open and retry."
+    });
+    return;
+  }
+
+  if (error instanceof multer.MulterError) {
+    serverTrace("sendUploadError", "multer rejected upload", {
+      code: error.code,
+      elapsedMs
+    });
+    res.status(400).json({ error: uploadMulterErrorMessage(error) });
+    return;
+  }
+
+  serverTrace("sendUploadError", "upload failed", {
+    elapsedMs,
+    error: error instanceof Error ? error.message : String(error)
+  });
+  res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+}
+
+function isRequestAbortedError(error: unknown): boolean {
+  const record = error as { code?: unknown; message?: unknown };
+  return record.code === "ECONNABORTED" || record.code === "ECONNRESET" || record.message === "Request aborted";
+}
+
+function uploadMulterErrorMessage(error: multer.MulterError): string {
+  if (error.code === "LIMIT_FILE_SIZE") {
+    return "PDF upload is too large. Max file size is 100 MB per file.";
+  }
+  if (error.code === "LIMIT_FILE_COUNT") {
+    return "Too many PDFs selected. Max is 25 files per run.";
+  }
+  return error.message;
 }
 
 async function runJob(
@@ -301,24 +458,44 @@ async function runJob(
 ): Promise<void> {
   const documentOutputs: Record<string, unknown>[] = [];
   let lastCommand: string | undefined;
+  const jobStartedAt = Date.now();
   try {
     const config = loadEnvConfig();
+    JobStore.addTrace(jobId, "runJob", "job started", {
+      totalFiles: inputFiles.length,
+      timeoutMs: config.uiPipelineTimeoutMs
+    });
     JobStore.setRunning(jobId, "parse started");
 
-    for (const inputFile of inputFiles) {
+    for (const [index, inputFile] of inputFiles.entries()) {
       const filename = path.basename(inputFile);
       let command: string | undefined;
+      const fileStartedAt = Date.now();
       try {
+        JobStore.addTrace(jobId, "runJob", "file started", {
+          index: index + 1,
+          totalFiles: inputFiles.length,
+          filename
+        });
         JobStore.startFile(jobId, filename, "parse started");
         const result = await runPipelineProcess({
           inputFile,
           ...options,
           timeoutMs: config.uiPipelineTimeoutMs,
           onLog: (message) => JobStore.addLog(jobId, `${filename}: ${message}`),
-          onStep: (step) => JobStore.setFileStep(jobId, filename, step)
+          onStep: (step) => {
+            JobStore.addTrace(jobId, "runPipelineProcess.onStep", "step inferred", { filename, step });
+            JobStore.setFileStep(jobId, filename, step);
+          }
         });
         command = result.command;
         lastCommand = command;
+        JobStore.addTrace(jobId, "runJob", "process finished", {
+          filename,
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          elapsedMs: Date.now() - fileStartedAt
+        });
 
         if (result.timedOut) {
           throw new Error(`UI pipeline job timed out after ${config.uiPipelineTimeoutMs}ms. Child process was killed.`);
@@ -328,31 +505,68 @@ async function runJob(
           throw new Error(`Pipeline command failed with exit code ${result.exitCode}.`);
         }
 
+        const bundleStartedAt = Date.now();
+        JobStore.addTrace(jobId, "buildDocumentBundle", "started", { filename, status: "passed" });
         const outputs = await buildDocumentBundle(inputFile, options.uploadPageIndex, "passed");
+        JobStore.addTrace(jobId, "buildDocumentBundle", "completed", {
+          filename,
+          hsSections: outputs.hsSectionCount,
+          images: outputs.imageCount,
+          hasTree: outputs.hasTree,
+          pageIndex: outputs.pageIndex,
+          elapsedMs: Date.now() - bundleStartedAt
+        });
         documentOutputs.push(outputs);
         JobStore.completeFile(jobId, filename, outputs);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        JobStore.addTrace(jobId, "runJob", "file failed", {
+          filename,
+          elapsedMs: Date.now() - fileStartedAt,
+          error: message
+        });
         await saveJobDebugLog(jobId, inputFile, command, message);
+        const bundleStartedAt = Date.now();
+        JobStore.addTrace(jobId, "buildDocumentBundle", "started", { filename, status: "failed" });
         const outputs = await buildDocumentBundle(inputFile, options.uploadPageIndex, "failed", message);
+        JobStore.addTrace(jobId, "buildDocumentBundle", "completed", {
+          filename,
+          hsSections: outputs.hsSectionCount,
+          images: outputs.imageCount,
+          hasTree: outputs.hasTree,
+          pageIndex: outputs.pageIndex,
+          elapsedMs: Date.now() - bundleStartedAt
+        });
         documentOutputs.push(outputs);
         JobStore.failFile(jobId, filename, message, outputs);
         if (options.failFast) {
+          JobStore.addTrace(jobId, "runJob", "failFast stopping batch", { filename });
           break;
         }
       }
     }
 
+    const batchStartedAt = Date.now();
+    JobStore.addTrace(jobId, "buildBatchOutputs", "started", { documentCount: documentOutputs.length });
     const outputs = await buildBatchOutputs(documentOutputs);
+    JobStore.addTrace(jobId, "buildBatchOutputs", "completed", {
+      documentCount: documentOutputs.length,
+      elapsedMs: Date.now() - batchStartedAt
+    });
     JobStore.setOutputs(jobId, outputs);
     const hasFailure = documentOutputs.some((document) => document.status === "failed");
     if (hasFailure && options.failFast) {
       JobStore.fail(jobId, "Batch stopped on first failure.");
       return;
     }
+    JobStore.addTrace(jobId, "runJob", "job completed", { elapsedMs: Date.now() - jobStartedAt });
     JobStore.complete(jobId, outputs);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    JobStore.addTrace(jobId, "runJob", "job failed", {
+      elapsedMs: Date.now() - jobStartedAt,
+      error: message
+    });
     await saveJobDebugLog(jobId, inputFiles[0] ?? "batch", lastCommand, message);
     JobStore.fail(jobId, message);
   }
@@ -542,13 +756,29 @@ async function listCachedTreeDocuments(): Promise<Array<{ document: string; docI
   return documents.sort((left, right) => left.document.localeCompare(right.document));
 }
 
-async function answerFromCachedTrees(question: string): Promise<Record<string, unknown>> {
+async function answerFromCachedTrees(
+  question: string,
+  options: { geminiApiKeys?: string[] } = {}
+): Promise<Record<string, unknown>> {
+  const startedAt = Date.now();
+  serverTrace("answerFromCachedTrees", "started", {
+    overrideGeminiKeys: options.geminiApiKeys?.length ?? 0
+  });
   const documents = await listCachedTreeDocuments();
+  serverTrace("answerFromCachedTrees", "cached tree documents loaded", {
+    documentCount: documents.length,
+    elapsedMs: Date.now() - startedAt
+  });
   if (documents.length === 0) {
     throw new Error("No cached tree JSON found in data/converted. Run parse with Upload to PageIndex once.");
   }
 
+  const searchStartedAt = Date.now();
   const hits = await searchCachedTreeDocuments(question, documents);
+  serverTrace("answerFromCachedTrees", "cached tree search completed", {
+    hitCount: hits.length,
+    elapsedMs: Date.now() - searchStartedAt
+  });
   if (hits.length === 0) {
     return {
       answer: "Không tìm thấy ngữ cảnh phù hợp trong các cached tree JSON.",
@@ -558,29 +788,54 @@ async function answerFromCachedTrees(question: string): Promise<Record<string, u
     };
   }
 
-  const context = hits
-    .slice(0, 10)
-    .map((hit, index) => [
-      `Result ${index + 1}`,
-      `Document: ${hit.document}`,
-      hit.title ? `Title: ${hit.title}` : undefined,
-      hit.text
-    ].filter(Boolean).join("\n"))
-    .join("\n\n---\n\n");
+  const topHits = hits.slice(0, 10);
+  const context = buildStructuredRetrievedContext(topHits);
   const marker12 = TokenValidator.validateContextSize(context.slice(0, 12000), { maxChars: 12000 });
-  const llm = new GeminiRoundRobinClient({ apiKeys: resolveGeminiApiKeys() });
-  const answer = await llm.synthesizeAnswer(
-    context.slice(0, 12000),
-    `${question}\nTrả lời dựa trên cached tree JSON. Luôn trích dẫn nguồn dạng <doc=TenFile.pdf>.`
-  );
+  serverTrace("answerFromCachedTrees", "context prepared", {
+    contextChars: context.length,
+    truncatedChars: context.slice(0, 12000).length,
+    sourceDocuments: uniqueStrings(hits.map((hit) => hit.document)).length
+  });
+  let llmAnswer: string | undefined;
+  let llmError: string | undefined;
+  try {
+    const llm = new GeminiRoundRobinClient({ apiKeys: resolveGeminiApiKeys(options.geminiApiKeys ?? []) });
+    const llmStartedAt = Date.now();
+    serverTrace("answerFromCachedTrees", "gemini synthesis started", { keyCount: llm.keyCount });
+    llmAnswer = await llm.synthesizeAnswer(
+      context.slice(0, 12000),
+      [
+        question,
+        "",
+        "Use the retrieved section metadata. If hsCode is present, final answer must include HS Code.",
+        "Citation must include document, page/page range, and section.",
+        "Do not invent HS Code. Prefer metadata for hsCode/title/citation."
+      ].join("\n")
+    );
+    serverTrace("answerFromCachedTrees", "gemini synthesis completed", {
+      answerChars: llmAnswer.length,
+      elapsedMs: Date.now() - llmStartedAt
+    });
+  } catch (error) {
+    llmError = error instanceof Error ? error.message : String(error);
+    serverTrace("answerFromCachedTrees", "gemini synthesis failed; using fallback formatter", { error: llmError });
+  }
+  const alternatives = selectAlternativeSections(hits, question);
+  const rendered = renderHsCodeAnswer(llmAnswer, hits[0], alternatives);
+  const answer = rendered.answer;
   const marker13 = TokenValidator.validateOutputSize(answer, { maxWords: 180 });
   const validation = QAValidator.validateResponse(answer, { requireCitations: false });
+  serverTrace("answerFromCachedTrees", "completed", { elapsedMs: Date.now() - startedAt });
 
   return {
     answer,
     docIds: [],
     documents: uniqueStrings(hits.map((hit) => hit.document)),
     mode: "cached-tree",
+    citations: rendered.citations.map(publicSectionCitation),
+    retrievedSections: topHits.slice(0, 5).map(publicSectionCitation),
+    metadataWarnings: rendered.metadataWarnings,
+    llmError,
     validation: {
       ...validation,
       markers: [marker12, marker13, ...validation.markers]
@@ -591,28 +846,94 @@ async function answerFromCachedTrees(question: string): Promise<Record<string, u
 async function searchCachedTreeDocuments(
   question: string,
   documents: Array<{ document: string; treePath: string }>
-): Promise<Array<{ document: string; title: string; text: string; score: number }>> {
+): Promise<EnrichedRetrievedSection[]> {
   const queryTokens = tokenizeForSearch(question);
-  const hits: Array<{ document: string; title: string; text: string; score: number }> = [];
+  const sectionMetadata = await loadSectionMetadata(documents.map((document) => document.document));
+  const hits: EnrichedRetrievedSection[] = [];
 
   for (const document of documents) {
     const treeJson = await readOptionalJson<Record<string, unknown>>(path.resolve(process.cwd(), document.treePath));
     const roots = normalizeTreeRoots(treeJson);
     for (const node of flattenCachedTreeNodes(roots)) {
-      const haystack = normalizeSearchText(`${node.title} ${node.text}`);
-      const score = queryTokens.reduce((sum, token) => sum + countOccurrences(haystack, token), 0);
+      const titleHaystack = normalizeSearchText(node.title);
+      const textHaystack = normalizeSearchText(node.text);
+      const score = queryTokens.reduce(
+        (sum, token) => sum + (countOccurrences(titleHaystack, token) * 4) + countOccurrences(textHaystack, token),
+        0
+      );
       if (score > 0) {
-        hits.push({
+        const rawHit: RetrievedTreeHit = {
           document: document.document,
           title: node.title,
           text: node.text.slice(0, 2400),
           score
-        });
+        };
+        hits.push(enrichRetrievedHit(rawHit, sectionMetadata));
       }
     }
   }
 
-  return hits.sort((left, right) => right.score - left.score || left.document.localeCompare(right.document));
+  const hasHsCodeHit = hits.some((hit) => hit.hsCode);
+  return hits.sort((left, right) => {
+    if (hasHsCodeHit && Boolean(left.hsCode) !== Boolean(right.hsCode)) {
+      return left.hsCode ? -1 : 1;
+    }
+    return right.score - left.score || left.document.localeCompare(right.document);
+  });
+}
+
+async function loadSectionMetadata(documentNames: string[]): Promise<SectionMetadata[]> {
+  const records: SectionMetadata[] = [];
+  const seen = new Set<string>();
+  const append = (items: unknown[], fallbackDocument?: string) => {
+    for (const item of items) {
+      if (typeof item !== "object" || item === null) {
+        continue;
+      }
+      const section = normalizeSectionMetadata(item as Record<string, unknown>, fallbackDocument);
+      const key = `${section.document}|${section.hsCode ?? ""}|${section.section ?? ""}`;
+      if (!section.document || seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      records.push(section);
+    }
+  };
+
+  const allSections = await readOptionalJson<unknown>(path.join(convertedDir, "all.sections.json"));
+  if (Array.isArray(allSections)) {
+    append(allSections);
+  }
+
+  for (const documentName of documentNames) {
+    const sectionPath = path.join(convertedDir, documentName.replace(/\.pdf$/i, ".sections.json"));
+    const payload = await readOptionalJson<unknown>(sectionPath);
+    if (Array.isArray(payload)) {
+      append(payload, documentName);
+      continue;
+    }
+    if (typeof payload === "object" && payload !== null && Array.isArray((payload as { sections?: unknown[] }).sections)) {
+      append((payload as { sections: unknown[] }).sections, documentName);
+    }
+  }
+
+  return records;
+}
+
+function publicSectionCitation(section: EnrichedRetrievedSection): Record<string, unknown> {
+  return {
+    document: section.document,
+    chapter: section.chapter,
+    hsCode: section.hsCode ?? null,
+    title: section.title ?? null,
+    section: section.section ?? null,
+    pageStart: section.pageStart ?? null,
+    pageEnd: section.pageEnd ?? null,
+    source: section.source ?? null,
+    captions: section.captions,
+    score: section.score,
+    metadataWarnings: section.metadataWarnings
+  };
 }
 
 function normalizeTreeRoots(payload: Record<string, unknown> | undefined): unknown[] {
@@ -649,15 +970,17 @@ function flattenCachedTreeNodes(nodes: unknown[]): Array<{ title: string; text: 
 }
 
 function tokenizeForSearch(text: string): string[] {
-  return uniqueStrings(
+  const tokens = uniqueStrings(
     normalizeSearchText(text)
       .split(/[^a-z0-9.]+/g)
-      .filter((token) => token.length >= 3)
+      .filter((token) => token.length >= 3 && !SEARCH_STOPWORDS.has(token))
   );
+  return tokens.length > 0 ? tokens : uniqueStrings(normalizeSearchText(text).split(/[^a-z0-9.]+/g).filter((token) => token.length >= 3));
 }
 
 function normalizeSearchText(text: string): string {
   return text
+    .replace(/[đĐ]/g, "d")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase();
@@ -788,6 +1111,10 @@ async function saveJobDebugLog(
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const baseName = path.basename(inputFile, path.extname(inputFile));
   const filePath = path.join(tmpDir, `${baseName}.ui-job-${jobId}.${timestamp}.json`);
+  JobStore.addTrace(jobId, "saveJobDebugLog", "writing debug log", {
+    inputFile: relativePath(inputFile),
+    path: relativePath(filePath)
+  });
   await writeFile(
     filePath,
     `${JSON.stringify(
@@ -806,6 +1133,30 @@ async function saveJobDebugLog(
     )}\n`,
     "utf8"
   );
+}
+
+function serverTrace(functionName: string, message: string, details: Record<string, unknown> = {}): void {
+  const suffix = formatTraceDetails(details);
+  console.log(`[${new Date().toISOString()}] ${functionName}: ${message}${suffix}`);
+}
+
+function formatTraceDetails(details: Record<string, unknown>): string {
+  const entries = Object.entries(details).filter(([, value]) => value !== undefined && value !== null && value !== "");
+  if (entries.length === 0) {
+    return "";
+  }
+
+  return ` | ${entries.map(([key, value]) => `${key}=${formatTraceValue(value)}`).join(" ")}`;
+}
+
+function formatTraceValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(formatTraceValue).join(",")}]`;
+  }
+  if (typeof value === "object" && value !== null) {
+    return JSON.stringify(value);
+  }
+  return String(value).replace(/\s+/g, "_");
 }
 
 interface ValidationJson {

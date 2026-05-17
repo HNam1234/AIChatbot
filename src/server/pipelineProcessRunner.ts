@@ -23,14 +23,25 @@ export interface PipelineProcessResult {
 }
 
 export async function runPipelineProcess(options: PipelineProcessOptions): Promise<PipelineProcessResult> {
+  const startedAt = Date.now();
   const command = os.platform() === "win32" ? "npm.cmd" : "npm";
   const args = buildParseArgs(options);
   const commandText = formatCommand(command, args);
   const spawnCommand = os.platform() === "win32" ? "cmd.exe" : command;
   const spawnArgs = os.platform() === "win32" ? ["/d", "/s", "/c", command, ...args] : args;
 
-  options.onLog(`Command: ${commandText}`);
-  console.log(`[UI Pipeline] ${commandText}`);
+  options.onLog(
+    traceLine("runPipelineProcess", "spawn preparing", {
+      command: commandText,
+      timeoutMs: options.timeoutMs,
+      exportAssets: options.exportAssets,
+      uploadPageIndex: options.uploadPageIndex,
+      forcePageIndexUpload: Boolean(options.forcePageIndexUpload),
+      hasTemporaryPageIndexKey: Boolean(options.pageIndexApiKey),
+      hasTemporaryGeminiKey: Boolean(options.geminiApiKey)
+    })
+  );
+  console.log(traceLine("runPipelineProcess", "spawn preparing", { command: commandText }));
 
   return await new Promise((resolve, reject) => {
     let settled = false;
@@ -45,11 +56,19 @@ export async function runPipelineProcess(options: PipelineProcessOptions): Promi
       windowsHide: true
     });
 
+    options.onLog(
+      traceLine("runPipelineProcess", "child spawned", {
+        pid: child.pid,
+        spawnCommand,
+        cwd: process.cwd()
+      })
+    );
+
     child.stdout.on("data", (chunk: Buffer) => {
-      handleOutput(chunk.toString("utf8"), options);
+      handleOutput(chunk.toString("utf8"), options, "stdout");
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      handleOutput(chunk.toString("utf8"), options);
+      handleOutput(chunk.toString("utf8"), options, "stderr");
     });
     child.on("error", (error) => {
       if (settled) {
@@ -57,6 +76,12 @@ export async function runPipelineProcess(options: PipelineProcessOptions): Promi
       }
       settled = true;
       clearTimeout(timer);
+      options.onLog(
+        traceLine("runPipelineProcess", "child spawn error", {
+          elapsedMs: Date.now() - startedAt,
+          error: error.message
+        })
+      );
       reject(error);
     });
     child.on("close", (exitCode) => {
@@ -65,6 +90,13 @@ export async function runPipelineProcess(options: PipelineProcessOptions): Promi
       }
       settled = true;
       clearTimeout(timer);
+      options.onLog(
+        traceLine("runPipelineProcess", "child closed", {
+          exitCode,
+          timedOut,
+          elapsedMs: Date.now() - startedAt
+        })
+      );
       resolve({ exitCode, timedOut, command: commandText });
     });
 
@@ -74,7 +106,13 @@ export async function runPipelineProcess(options: PipelineProcessOptions): Promi
       }
       timedOut = true;
       options.onStep("timeout");
-      options.onLog(`UI job exceeded timeout ${options.timeoutMs}ms. Killing process tree.`);
+      options.onLog(
+        traceLine("runPipelineProcess", "timeout exceeded; killing process tree", {
+          timeoutMs: options.timeoutMs,
+          elapsedMs: Date.now() - startedAt,
+          pid: child.pid
+        })
+      );
       void killProcessTree(child);
     }, options.timeoutMs);
   });
@@ -105,7 +143,7 @@ function buildParseArgs(options: PipelineProcessOptions): string[] {
   return args;
 }
 
-function handleOutput(output: string, options: PipelineProcessOptions): void {
+function handleOutput(output: string, options: PipelineProcessOptions, streamName: "stdout" | "stderr"): void {
   for (const line of output.replace(/\r\n/g, "\n").split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) {
@@ -113,7 +151,7 @@ function handleOutput(output: string, options: PipelineProcessOptions): void {
     }
 
     const safeLine = redactSecrets(trimmed);
-    options.onLog(safeLine);
+    options.onLog(traceLine("runPipelineProcess.childOutput", safeLine, { stream: streamName }));
     const step = inferStep(safeLine);
     if (step) {
       options.onStep(step);
@@ -212,4 +250,25 @@ function redactSecrets(value: string): string {
 
 function shellQuote(value: string): string {
   return /\s/.test(value) ? `"${value.replace(/"/g, '\\"')}"` : value;
+}
+
+function traceLine(functionName: string, message: string, details: Record<string, unknown> = {}): string {
+  const suffix = formatTraceDetails(details);
+  return `${functionName}: ${message}${suffix}`;
+}
+
+function formatTraceDetails(details: Record<string, unknown>): string {
+  const entries = Object.entries(details).filter(([, value]) => value !== undefined && value !== null && value !== "");
+  if (entries.length === 0) {
+    return "";
+  }
+
+  return ` | ${entries.map(([key, value]) => `${key}=${formatTraceValue(value)}`).join(" ")}`;
+}
+
+function formatTraceValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(formatTraceValue).join(",")}]`;
+  }
+  return String(value).replace(/\s+/g, "_");
 }

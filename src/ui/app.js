@@ -29,6 +29,7 @@ const questionDocScopeEl = document.querySelector("#question-doc-scope");
 const answerEl = document.querySelector("#answer");
 const pageIndexKeyInput = document.querySelector("#pageindex-key");
 const geminiKeyInputs = [...document.querySelectorAll("[data-gemini-key-input]")];
+const geminiKeyEnabledInputs = [...document.querySelectorAll("[data-gemini-key-enabled]")];
 const temporaryPageIndexKeyInput = document.querySelector("#temporary-pageindex-key");
 const temporaryGeminiKeyInput = document.querySelector("#temporary-gemini-key");
 const uploadPageIndexInput = document.querySelector("#upload-pageindex");
@@ -48,6 +49,7 @@ let selectedBundle = null;
 let indexedDocuments = [];
 let currentPdfUrl = "";
 let currentPage = 1;
+let clientLogs = [];
 let settings = {
   hasPageIndexApiKey: false,
   maskedPageIndexApiKey: null,
@@ -56,7 +58,8 @@ let settings = {
   legacyGeminiKeyConfigured: false,
   maskedLegacyGeminiApiKey: null,
   geminiKeySlots: [],
-  configuredGeminiKeyCount: 0
+  configuredGeminiKeyCount: 0,
+  enabledGeminiKeyCount: 0
 };
 
 void loadSettings();
@@ -120,11 +123,29 @@ saveGeminiKeyButtons.forEach((button) => {
     if (slot) {
       slot.configured = true;
       slot.maskedKey = payload.maskedKey;
+      slot.enabled = slot.enabled !== false;
     }
-    settings.configuredGeminiKeyCount = Math.max(
-      settings.configuredGeminiKeyCount || 0,
-      (settings.geminiKeySlots || []).filter((candidate) => candidate.configured).length
-    );
+    settings.configuredGeminiKeyCount = (settings.geminiKeySlots || []).filter((candidate) => candidate.configured).length;
+    settings.enabledGeminiKeyCount = (settings.geminiKeySlots || [])
+      .filter((candidate) => candidate.configured && candidate.enabled !== false).length;
+    renderGeminiSettingsStatus();
+  });
+});
+
+geminiKeyEnabledInputs.forEach((input) => {
+  input.addEventListener("change", async () => {
+    const payload = await saveGeminiKeyEnabled(input.dataset.slot, input.checked);
+    if (!payload) {
+      input.checked = !input.checked;
+      return;
+    }
+
+    const slot = (settings.geminiKeySlots || []).find((candidate) => candidate.name === payload.slotName);
+    if (slot) {
+      slot.enabled = payload.enabled;
+    }
+    settings.enabledGeminiKeyCount = (settings.geminiKeySlots || [])
+      .filter((candidate) => candidate.configured && candidate.enabled).length;
     renderGeminiSettingsStatus();
   });
 });
@@ -143,7 +164,7 @@ form.addEventListener("submit", async (event) => {
   if (temporaryGeminiKeyInput.checked) {
     geminiKeyInputs.forEach((input, index) => {
       const keyName = `temporaryGeminiApiKey${index + 1}`;
-      if (input.value.trim()) {
+      if (isGeminiSlotEnabled(input.dataset.slot) && input.value.trim()) {
         body.set(keyName, input.value.trim());
       } else {
         body.delete(keyName);
@@ -156,17 +177,54 @@ form.addEventListener("submit", async (event) => {
     body.delete("temporaryGeminiApiKey3");
   }
 
-  setTopStatus({ status: "queued", currentStep: "uploading", progressPercent: 0 });
-  renderSelectedFiles("waiting");
+  const uploadFiles = [...fileInput.files];
+  const uploadBytes = uploadFiles.reduce((sum, file) => sum + file.size, 0);
+  let lastUploadLogPercent = -10;
 
-  const response = await fetch("/api/run-pipeline", { method: "POST", body });
-  const payload = await response.json();
-  if (!response.ok) {
-    setTopStatus({ status: "failed", currentStep: payload.error || "Failed to start pipeline", progressPercent: 0 });
-    logsEl.textContent = payload.error || "Failed to start pipeline.";
+  setTopStatus({ status: "uploading", currentStep: "uploading files", progressPercent: 0 });
+  renderSelectedFiles("uploading");
+  appendUiLog(traceLine("ui.formSubmit", "upload started", {
+    fileCount: uploadFiles.length,
+    totalBytes: uploadBytes,
+    files: uploadFiles.map((file) => file.name)
+  }));
+
+  let uploadResult;
+  try {
+    uploadResult = await uploadFormData("/api/run-pipeline", body, (percent) => {
+      if (Number.isFinite(percent) && (percent >= lastUploadLogPercent + 10 || percent === 100)) {
+        lastUploadLogPercent = percent;
+        appendUiLog(traceLine("ui.uploadFormData", "upload progress", { percent }));
+      }
+      setTopStatus({
+        status: "uploading",
+        currentStep: `uploading files${Number.isFinite(percent) ? ` (${percent}%)` : ""}`,
+        progressPercent: Number.isFinite(percent) ? percent : 0
+      });
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setTopStatus({ status: "failed", currentStep: "Upload request was interrupted", progressPercent: 0 });
+    appendUiLog(traceLine("ui.uploadFormData", "upload interrupted", { error: message }));
     return;
   }
 
+  const payload = uploadResult.payload;
+  if (!uploadResult.ok) {
+    setTopStatus({ status: "failed", currentStep: payload.error || "Failed to start pipeline", progressPercent: 0 });
+    appendUiLog(traceLine("ui.uploadFormData", "upload rejected", {
+      status: uploadResult.status,
+      error: payload.error || "Failed to start pipeline."
+    }));
+    return;
+  }
+
+  setTopStatus({ status: "queued", currentStep: "upload complete; parser queued", progressPercent: 100 });
+  renderSelectedFiles("uploaded");
+  appendUiLog(traceLine("ui.uploadFormData", "upload completed; parser queued", {
+    status: uploadResult.status,
+    jobId: payload.jobId
+  }));
   activeJobId = payload.jobId;
   pollTimer = setInterval(pollStatus, 1500);
   await pollStatus();
@@ -202,6 +260,10 @@ askButton.addEventListener("click", async () => {
   if (temporaryPageIndexKeyInput.checked && pageIndexKeyInput.value.trim()) {
     body.temporaryPageIndexApiKey = pageIndexKeyInput.value.trim();
   }
+  const geminiApiKeys = selectedGeminiKeys();
+  if (geminiApiKeys.length > 0) {
+    body.geminiApiKeys = geminiApiKeys;
+  }
   const response = await fetch("/api/ask", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -218,9 +280,11 @@ askButton.addEventListener("click", async () => {
   const answerScope = payload.mode === "cached-tree"
     ? `Scope: cached tree JSON (${(payload.documents || []).length} source PDF(s))`
     : `Scope: ${(payload.docIds || docIds).length} PageIndex document(s)`;
+  const citationCards = renderCitationCards(payload.citations || []);
   answerEl.innerHTML = `
     <div class="answer-box">
-      <div>${escapeHtml(payload.answer || "")}</div>
+      <div class="answer-text">${escapeHtml(payload.answer || "")}</div>
+      ${citationCards}
       <p>${escapeHtml(answerScope)}</p>
       ${marker ? `<p>${escapeHtml(marker.message || "")}</p>` : ""}
     </div>
@@ -245,7 +309,7 @@ async function pollStatus() {
   }
 
   setTopStatus(job);
-  logsEl.textContent = (job.logs || []).join("\n");
+  logsEl.textContent = [...clientLogs, ...(job.logs || [])].join("\n");
   renderBatchStatus(job.files || []);
 
   if (job.status === "completed" || job.status === "failed") {
@@ -512,6 +576,33 @@ function renderImages(images) {
   `).join("");
 }
 
+function renderCitationCards(citations) {
+  if (!Array.isArray(citations) || citations.length === 0) {
+    return "";
+  }
+
+  return `<div class="citation-cards">${citations.map((citation, index) => `
+    <div class="citation-card">
+      <strong>${index === 0 ? "Primary citation" : "Related citation"}</strong>
+      <dl>
+        <dt>HS Code</dt><dd>${escapeHtml(citation.hsCode || "n/a")}</dd>
+        <dt>Title</dt><dd>${escapeHtml(citation.title || "n/a")}</dd>
+        <dt>Document</dt><dd>${escapeHtml(citation.document || "n/a")}</dd>
+        <dt>Page</dt><dd>${escapeHtml(formatCitationPage(citation.pageStart, citation.pageEnd))}</dd>
+        <dt>Section</dt><dd>${escapeHtml(citation.section || "n/a")}</dd>
+        <dt>Source</dt><dd>${escapeHtml(citation.source || "n/a")}</dd>
+      </dl>
+    </div>
+  `).join("")}</div>`;
+}
+
+function formatCitationPage(pageStart, pageEnd) {
+  if (pageStart && pageEnd && pageStart !== pageEnd) {
+    return `${pageStart}-${pageEnd}`;
+  }
+  return pageStart || pageEnd || "n/a";
+}
+
 function setPdfPage(page) {
   currentPage = Math.max(1, page);
   pageNumberInput.value = String(currentPage);
@@ -529,6 +620,7 @@ function activateTab(tabName) {
 
 function resetResult() {
   logsEl.textContent = "";
+  clientLogs = [];
   markdownEl.textContent = "No Markdown yet.";
   markdownEl.className = "markdown muted";
   renderedEl.textContent = "No rendered preview yet.";
@@ -618,6 +710,27 @@ function formatBytes(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function appendUiLog(message) {
+  clientLogs.push(message);
+  logsEl.textContent = clientLogs.join("\n");
+  logsEl.scrollTop = logsEl.scrollHeight;
+}
+
+function traceLine(functionName, message, details = {}) {
+  const entries = Object.entries(details).filter(([, value]) => value !== undefined && value !== null && value !== "");
+  const suffix = entries.length > 0
+    ? ` | ${entries.map(([key, value]) => `${key}=${formatTraceValue(value)}`).join(" ")}`
+    : "";
+  return `[${new Date().toISOString()}] ${functionName}: ${message}${suffix}`;
+}
+
+function formatTraceValue(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(formatTraceValue).join(",")}]`;
+  }
+  return String(value).replace(/\s+/g, "_");
+}
+
 async function saveApiKey(endpoint, apiKey, statusElement, extraPayload = {}) {
   const response = await fetch(endpoint, {
     method: "POST",
@@ -632,6 +745,82 @@ async function saveApiKey(endpoint, apiKey, statusElement, extraPayload = {}) {
   return payload;
 }
 
+function uploadFormData(url, body, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.responseType = "json";
+
+    xhr.upload.addEventListener("progress", (event) => {
+      if (!event.lengthComputable) {
+        onProgress(undefined);
+        return;
+      }
+
+      onProgress(Math.max(0, Math.min(100, Math.round((event.loaded / event.total) * 100))));
+    });
+
+    xhr.addEventListener("load", () => {
+      let payload = xhr.response;
+      if (!payload && xhr.responseText) {
+        try {
+          payload = JSON.parse(xhr.responseText);
+        } catch {
+          payload = { error: xhr.responseText };
+        }
+      }
+
+      resolve({
+        ok: xhr.status >= 200 && xhr.status < 300,
+        status: xhr.status,
+        payload: payload || {}
+      });
+    });
+    xhr.addEventListener("error", () => reject(new Error("Network error during upload.")));
+    xhr.addEventListener("abort", () => reject(new Error("Upload aborted.")));
+    xhr.addEventListener("timeout", () => reject(new Error("Upload timed out.")));
+    xhr.send(body);
+  });
+}
+
+async function saveGeminiKeyEnabled(slot, enabled) {
+  const response = await fetch("/api/settings/gemini-key-enabled", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ slot, enabled })
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    geminiSettingsStatusEl.textContent = payload.error || "Failed to update Gemini slot.";
+    return null;
+  }
+  return payload;
+}
+
+function syncGeminiEnabledInputs() {
+  const byName = new Map((settings.geminiKeySlots || []).map((slot) => [slot.name, slot]));
+  geminiKeyEnabledInputs.forEach((input) => {
+    const slot = byName.get(input.dataset.slot);
+    input.checked = slot?.enabled !== false;
+  });
+}
+
+function selectedGeminiKeys() {
+  if (!temporaryGeminiKeyInput.checked) {
+    return [];
+  }
+
+  return geminiKeyInputs
+    .filter((input) => isGeminiSlotEnabled(input.dataset.slot))
+    .map((input) => input.value.trim())
+    .filter(Boolean);
+}
+
+function isGeminiSlotEnabled(slotName) {
+  const input = geminiKeyEnabledInputs.find((candidate) => candidate.dataset.slot === slotName);
+  return input ? input.checked : true;
+}
+
 async function loadSettings() {
   const response = await fetch("/api/settings");
   const payload = await response.json();
@@ -641,6 +830,7 @@ async function loadSettings() {
     return;
   }
   settings = payload;
+  syncGeminiEnabledInputs();
   pageIndexSettingsStatusEl.textContent = payload.hasPageIndexApiKey
     ? `PageIndex key configured: yes (${payload.maskedPageIndexApiKey})`
     : "PageIndex key configured: no";
@@ -685,10 +875,15 @@ function renderGeminiSettingsStatus() {
   }
 
   const summary = slots
-    .map((slot) => `${slot.name.replace("GEMINI_KEY_", "#")}: ${slot.configured ? slot.maskedKey : "empty"}`)
+    .map((slot) => {
+      const keyLabel = slot.configured ? slot.maskedKey : "empty";
+      const state = slot.enabled === false ? "disabled" : "enabled";
+      return `${slot.name.replace("GEMINI_KEY_", "#")}: ${keyLabel} (${state})`;
+    })
     .join(" | ");
   const legacy = settings.legacyGeminiKeyConfigured ? ` | legacy: ${settings.maskedLegacyGeminiApiKey}` : "";
-  geminiSettingsStatusEl.textContent = `Gemini slots: ${summary}${legacy}`;
+  const enabledCount = settings.enabledGeminiKeyCount ?? slots.filter((slot) => slot.configured && slot.enabled !== false).length;
+  geminiSettingsStatusEl.textContent = `Gemini slots: ${summary}${legacy} | active saved slots: ${enabledCount}`;
 }
 
 function updatePageIndexWarning() {

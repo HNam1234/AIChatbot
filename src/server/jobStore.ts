@@ -175,7 +175,17 @@ export class JobStore {
     if (!job) {
       return;
     }
-    job.logs.push(`[${new Date().toLocaleTimeString()}] ${message}`);
+    job.logs.push(`[${new Date().toISOString()} +${formatDuration(elapsedMs(job))}] ${message}`);
+  }
+
+  public static addTrace(
+    id: string,
+    functionName: string,
+    message: string,
+    details: Record<string, unknown> = {}
+  ): void {
+    const suffix = formatTraceDetails(details);
+    this.addLog(id, `${functionName}: ${message}${suffix}`);
   }
 
   public static setOutputs(id: string, outputs: Record<string, unknown>): void {
@@ -252,4 +262,31 @@ function elapsedMs(job: PipelineJob): number {
   const start = Date.parse(job.startedAt);
   const end = job.completedAt ? Date.parse(job.completedAt) : Date.now();
   return Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, end - start) : 0;
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) {
+    return `${ms}ms`;
+  }
+
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatTraceDetails(details: Record<string, unknown>): string {
+  const entries = Object.entries(details).filter(([, value]) => value !== undefined && value !== null && value !== "");
+  if (entries.length === 0) {
+    return "";
+  }
+
+  return ` | ${entries.map(([key, value]) => `${key}=${formatTraceValue(value)}`).join(" ")}`;
+}
+
+function formatTraceValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(formatTraceValue).join(",")}]`;
+  }
+  if (typeof value === "object" && value !== null) {
+    return JSON.stringify(value);
+  }
+  return String(value).replace(/\s+/g, "_");
 }

@@ -1,4 +1,5 @@
 import { GoogleGenAI, type GenerateContentConfig } from "@google/genai";
+import { resolveGeminiApiKeys } from "../config/gemini";
 
 export interface GeminiRoundRobinOptions {
   apiKeys?: string[];
@@ -50,14 +51,7 @@ export class GeminiRoundRobinClient {
   private currentIndex = 0;
 
   public constructor(options: GeminiRoundRobinOptions = {}) {
-    this.apiKeys = dedupeApiKeys(
-      options.apiKeys ?? [
-        process.env.GEMINI_KEY_1,
-        process.env.GEMINI_KEY_2,
-        process.env.GEMINI_KEY_3,
-        process.env.GEMINI_API_KEY
-      ]
-    );
+    this.apiKeys = dedupeApiKeys(options.apiKeys ?? resolveGeminiApiKeys());
 
     if (this.apiKeys.length === 0) {
       throw new Error("No Gemini API keys found. Set GEMINI_KEY_1..3 or GEMINI_API_KEY.");
@@ -101,7 +95,7 @@ export class GeminiRoundRobinClient {
           throw error;
         }
 
-        console.warn(`[Round-Robin] Gemini key slot ${slot} hit a retryable error; trying next key.`);
+        console.warn(`[Round-Robin] Gemini key slot ${slot} failed; trying next enabled key.`);
       }
     }
 
@@ -118,8 +112,11 @@ export class GeminiRoundRobinClient {
 
 export function buildHsCodePrompt(context: string, query: string, language: string): string {
   return [
-    "You are a customs classification specialist for HS Code lookup.",
-    "Use only the provided context. Do not invent HS Codes that are not supported by the context.",
+    "You are answering HSCode questions using retrieved sections.",
+    "Use only the provided context and provided metadata. Do not invent HS Codes that are not supported by the context.",
+    "If hsCode is present in retrieved metadata, the final answer MUST include exactly: HS Code: <hsCode>.",
+    "The citation MUST include document, page/page range, and section.",
+    "Do not omit HS Code when available. If metadata and text conflict, prefer metadata for hsCode, title, and citation.",
     `Answer in ${language} unless the user explicitly asks for another language.`,
     "Return the most relevant HS Code, product/title, and 1-2 short reasons based on the context.",
     "If the context is insufficient, say that the document context is insufficient.",
@@ -133,12 +130,23 @@ export function buildHsCodePrompt(context: string, query: string, language: stri
 
 export function isRetryableGeminiError(error: unknown): boolean {
   const status = getErrorStatus(error);
-  if (status === 429 || (typeof status === "number" && status >= 500 && status < 600)) {
+  if (
+    status === 401 ||
+    status === 403 ||
+    status === 429 ||
+    (typeof status === "number" && status >= 500 && status < 600)
+  ) {
     return true;
   }
 
   const message = formatError(error).toLowerCase();
   return (
+    message.includes("api key not valid") ||
+    message.includes("invalid api key") ||
+    message.includes("unauthorized") ||
+    message.includes("permission denied") ||
+    message.includes("forbidden") ||
+    message.includes("banned") ||
     message.includes("quota") ||
     message.includes("rate limit") ||
     message.includes("too many requests") ||

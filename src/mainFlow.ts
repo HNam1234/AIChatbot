@@ -205,9 +205,10 @@ export async function executePipeline(pdfPath: string, options: PipelineOptions 
 }
 
 function logStep(options: PipelineOptions, message: string): void {
-  options.onLog?.(message);
+  const line = `mainFlow.logStep: ${message}`;
+  options.onLog?.(line);
   if (!options.onLog) {
-    console.log(`[Pipeline] ${message}`);
+    console.log(`[Pipeline] ${line}`);
   }
 }
 

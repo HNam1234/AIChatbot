@@ -16,10 +16,15 @@ export interface AppConfig {
 }
 
 export type GeminiKeySlotName = "GEMINI_KEY_1" | "GEMINI_KEY_2" | "GEMINI_KEY_3";
+export type GeminiKeySlotEnabledName =
+  | "GEMINI_KEY_1_ENABLED"
+  | "GEMINI_KEY_2_ENABLED"
+  | "GEMINI_KEY_3_ENABLED";
 
 export interface GeminiKeySlotStatus {
   name: GeminiKeySlotName;
   configured: boolean;
+  enabled: boolean;
   maskedKey: string | null;
 }
 
@@ -28,7 +33,11 @@ const DEFAULT_PAGEINDEX_POLL_INTERVAL_MS = 5000;
 const DEFAULT_PAGEINDEX_POLL_MAX_ATTEMPTS = 60;
 const DEFAULT_UI_PIPELINE_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_PORT = 3000;
-const GEMINI_KEY_SLOTS: GeminiKeySlotName[] = ["GEMINI_KEY_1", "GEMINI_KEY_2", "GEMINI_KEY_3"];
+const GEMINI_KEY_SLOTS: Array<{ name: GeminiKeySlotName; enabledName: GeminiKeySlotEnabledName }> = [
+  { name: "GEMINI_KEY_1", enabledName: "GEMINI_KEY_1_ENABLED" },
+  { name: "GEMINI_KEY_2", enabledName: "GEMINI_KEY_2_ENABLED" },
+  { name: "GEMINI_KEY_3", enabledName: "GEMINI_KEY_3_ENABLED" }
+];
 
 export function loadEnvConfig(): AppConfig {
   return {
@@ -68,16 +77,18 @@ export function getApiSettingsStatus(): {
   maskedLegacyGeminiApiKey: string | null;
   geminiKeySlots: GeminiKeySlotStatus[];
   configuredGeminiKeyCount: number;
+  enabledGeminiKeyCount: number;
   pageIndexBaseUrl: string;
   pollIntervalMs: number;
   pollMaxAttempts: number;
 } {
   const config = loadEnvConfig();
   const geminiKeySlots = GEMINI_KEY_SLOTS.map((slot) => {
-    const key = nonEmpty(process.env[slot]);
+    const key = nonEmpty(process.env[slot.name]);
     return {
-      name: slot,
+      name: slot.name,
       configured: Boolean(key),
+      enabled: isEnabled(process.env[slot.enabledName]),
       maskedKey: maskSecret(key)
     };
   });
@@ -92,6 +103,7 @@ export function getApiSettingsStatus(): {
     maskedLegacyGeminiApiKey: maskSecret(config.geminiApiKey),
     geminiKeySlots,
     configuredGeminiKeyCount: geminiKeySlots.filter((slot) => slot.configured).length,
+    enabledGeminiKeyCount: geminiKeySlots.filter((slot) => slot.configured && slot.enabled).length,
     pageIndexBaseUrl: config.pageIndexBaseUrl,
     pollIntervalMs: config.pageIndexPollIntervalMs,
     pollMaxAttempts: config.pageIndexPollMaxAttempts
@@ -119,12 +131,25 @@ export async function saveGeminiKeySlotToEnv(
   };
 }
 
+export async function saveGeminiKeySlotEnabledToEnv(
+  slotName: GeminiKeySlotName,
+  enabled: boolean
+): Promise<{ slotName: GeminiKeySlotName; enabled: boolean }> {
+  const slot = GEMINI_KEY_SLOTS.find((candidate) => candidate.name === slotName);
+  if (!slot) {
+    throw new Error("Invalid Gemini key slot.");
+  }
+
+  await saveEnvValueToEnv(slot.enabledName, enabled ? "true" : "false");
+  return { slotName, enabled };
+}
+
 export function isGeminiKeySlotName(value: unknown): value is GeminiKeySlotName {
-  return typeof value === "string" && GEMINI_KEY_SLOTS.includes(value as GeminiKeySlotName);
+  return typeof value === "string" && GEMINI_KEY_SLOTS.some((slot) => slot.name === value);
 }
 
 async function saveApiKeyToEnv(
-  keyName: "PAGEINDEX_API_KEY" | "GEMINI_API_KEY" | GeminiKeySlotName,
+  keyName: "PAGEINDEX_API_KEY" | "GEMINI_API_KEY" | GeminiKeySlotName | GeminiKeySlotEnabledName,
   apiKey: string
 ): Promise<{ maskedKey: string }> {
   const trimmed = nonEmpty(apiKey);
@@ -132,15 +157,22 @@ async function saveApiKeyToEnv(
     throw new Error(`${keyName} cannot be empty.`);
   }
 
-  const envPath = path.resolve(process.cwd(), ".env");
-  const current = await readFile(envPath, "utf8").catch(() => "");
-  const next = upsertEnvValue(current, keyName, trimmed);
-  await writeFile(envPath, next, "utf8");
-  process.env[keyName] = trimmed;
+  await saveEnvValueToEnv(keyName, trimmed);
 
   return {
     maskedKey: maskSecret(trimmed) ?? "********"
   };
+}
+
+async function saveEnvValueToEnv(
+  keyName: "PAGEINDEX_API_KEY" | "GEMINI_API_KEY" | GeminiKeySlotName | GeminiKeySlotEnabledName,
+  value: string
+): Promise<void> {
+  const envPath = path.resolve(process.cwd(), ".env");
+  const current = await readFile(envPath, "utf8").catch(() => "");
+  const next = upsertEnvValue(current, keyName, value);
+  await writeFile(envPath, next, "utf8");
+  process.env[keyName] = value;
 }
 
 export function resolvePageIndexSettings(overrides: {
@@ -173,7 +205,11 @@ function resolveGeminiEnvKeys(): string[] {
   const keys: string[] = [];
 
   for (const slot of GEMINI_KEY_SLOTS) {
-    const key = nonEmpty(process.env[slot]);
+    if (!isEnabled(process.env[slot.enabledName])) {
+      continue;
+    }
+
+    const key = nonEmpty(process.env[slot.name]);
     if (key && !seen.has(key)) {
       seen.add(key);
       keys.push(key);
@@ -186,6 +222,11 @@ function resolveGeminiEnvKeys(): string[] {
   }
 
   return keys;
+}
+
+function isEnabled(value: string | undefined): boolean {
+  const normalized = value?.trim().toLowerCase();
+  return normalized !== "false" && normalized !== "0" && normalized !== "off" && normalized !== "no";
 }
 
 function readPositiveInteger(value: string | undefined, fallback: number): number {

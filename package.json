@@ -12,7 +12,8 @@
     "parse:batch": "tsx src/mainFlow.ts --batch",
     "chat": "tsx src/mainFlow.ts --mode chat",
     "agent": "tsx src/mainFlow.ts --mode agent",
-    "dev": "tsx watch src/server/server.ts"
+    "dev": "tsx src/server/server.ts",
+    "dev:watch": "tsx watch src/server/server.ts"
   },
   "engines": {
     "node": ">=18"
