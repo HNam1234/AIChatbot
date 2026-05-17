@@ -880,7 +880,7 @@ async function answerFromCachedTrees(
     serverTrace("answerFromCachedTrees", "gemini synthesis failed; using fallback formatter", { error: llmError });
   }
   const alternatives = selectAlternativeSections(hits, question);
-  const rendered = renderHsCodeAnswer(llmAnswer, hits[0], alternatives, { question });
+  const rendered = renderHsCodeAnswer(llmAnswer, hits[0], alternatives, { question, answerStyle: "class-eval" });
   const answer = rendered.answer;
   debugReport.selectedPrimary = publicSectionCitation(hits[0]);
   debugReport.finalAnswerHsCodes = rendered.finalHsCodes;

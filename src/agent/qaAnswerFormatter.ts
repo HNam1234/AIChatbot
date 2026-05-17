@@ -45,6 +45,23 @@ export interface RenderedHsCodeAnswer {
   metadataWarnings: string[];
   finalHsCodes: string[];
   answerRepairApplied: boolean;
+  structuredAnswer: StructuredAnswer;
+}
+
+export type AnswerStyle = "class-eval" | "verbose";
+
+export interface StructuredAnswer {
+  productTitle: string | null;
+  normalizedProductName: string | null;
+  hsCodes: string[];
+  conciseExplanation: string | null;
+  note: string | null;
+  document: string | null;
+  pageStart: number | null;
+  pageEnd: number | null;
+  section: string | null;
+  source: string | null;
+  selectedPrimary: EnrichedRetrievedSection;
 }
 
 export interface ContrastDetection {
@@ -188,9 +205,23 @@ export function renderHsCodeAnswer(
   llmAnswer: string | undefined,
   topSection: EnrichedRetrievedSection,
   alternatives: EnrichedRetrievedSection[] = [],
-  options: { question?: string } = {}
+  options: { question?: string; answerStyle?: AnswerStyle } = {}
 ): RenderedHsCodeAnswer {
+  const answerStyle = options.answerStyle ?? "class-eval";
   const finalHsCodes = hsCodesForSection(topSection);
+  const structuredAnswer = buildStructuredAnswer(topSection, llmAnswer, options.question);
+  if (answerStyle === "class-eval") {
+    const answer = renderClassEvalAnswer(structuredAnswer, options.question);
+    return {
+      answer,
+      citations: [topSection, ...alternatives],
+      metadataWarnings: [...topSection.metadataWarnings],
+      finalHsCodes,
+      answerRepairApplied: classEvalRepairApplied(llmAnswer, structuredAnswer, answer),
+      structuredAnswer
+    };
+  }
+
   const directAnswer = stripDisallowedHsCodes(cleanDirectAnswer(llmAnswer), finalHsCodes) || fallbackDirectAnswer(topSection);
   const metadataWarnings = [...topSection.metadataWarnings];
   const body = finalHsCodes.length > 0
@@ -206,7 +237,8 @@ export function renderHsCodeAnswer(
     citations: [topSection, ...alternatives],
     metadataWarnings,
     finalHsCodes,
-    answerRepairApplied
+    answerRepairApplied,
+    structuredAnswer
   };
 }
 
@@ -230,6 +262,33 @@ export function formatPageRange(pageStart?: number, pageEnd?: number): string {
     return `page ${pageStart ?? pageEnd}`;
   }
   return "";
+}
+
+export function buildStructuredAnswer(
+  selectedPrimary: EnrichedRetrievedSection,
+  llmAnswer?: string,
+  question?: string
+): StructuredAnswer {
+  const productTitle = selectedPrimary.title ?? titleFromHeading(selectedPrimary.section) ?? selectedPrimary.section ?? null;
+  const normalizedProductName = productTitle ? normalizeProductTitle(productTitle) : null;
+  const hsCodes = hsCodesForSection(selectedPrimary);
+  const conciseExplanation =
+    definitionStyleQuestion(question ?? "") ? extractDefinitionSentence(selectedPrimary.text) : shortLlmExplanation(llmAnswer);
+  const note = extractClassificationNote(selectedPrimary.text);
+
+  return {
+    productTitle,
+    normalizedProductName,
+    hsCodes,
+    conciseExplanation,
+    note,
+    document: selectedPrimary.document || null,
+    pageStart: selectedPrimary.pageStart ?? null,
+    pageEnd: selectedPrimary.pageEnd ?? null,
+    section: selectedPrimary.section ?? null,
+    source: selectedPrimary.source ?? null,
+    selectedPrimary
+  };
 }
 
 export function selectAlternativeSections(
@@ -551,6 +610,162 @@ function formatHsCodeLine(codes: string[], question: string | undefined): string
   return `HS Code: ${joined}${qualifier}.`;
 }
 
+function renderClassEvalAnswer(structured: StructuredAnswer, question: string | undefined): string {
+  const product = structured.normalizedProductName || structured.productTitle || "sản phẩm phù hợp";
+  const definition = definitionStyleQuestion(question ?? "") ? structured.conciseExplanation : null;
+  const prefix = definition ? ensureSentenceEnd(stripHsCodes(definition)) : `Sản phẩm là ${product},`;
+  const codeLine = formatClassEvalHsCodeLine(structured.hsCodes);
+  const note = structured.note ? ` Lưu ý: ${ensureSentenceEnd(stripHsCodes(structured.note))}` : "";
+  const answer = `${prefix} ${codeLine}${note}`;
+  return validateClassEvalAnswer(answer, structured) ? answer : fallbackClassEvalAnswer(structured);
+}
+
+function formatClassEvalHsCodeLine(codes: string[]): string {
+  if (codes.length === 0) {
+    return "HS Code: chưa có trong metadata.";
+  }
+  if (codes.length === 1) {
+    return `HS Code: ${codes[0]}.`;
+  }
+  return `HS Code: ${joinHsCodes(codes)}, tùy trạng thái hàng hóa trong biểu mã.`;
+}
+
+function joinHsCodes(codes: string[]): string {
+  if (codes.length <= 2) {
+    return codes.join(" hoặc ");
+  }
+  return `${codes.slice(0, -1).join(", ")} hoặc ${codes[codes.length - 1]}`;
+}
+
+function fallbackClassEvalAnswer(structured: StructuredAnswer): string {
+  const product = structured.normalizedProductName || structured.productTitle || "sản phẩm phù hợp";
+  return `Sản phẩm là ${product}, ${formatClassEvalHsCodeLine(structured.hsCodes)}`;
+}
+
+function validateClassEvalAnswer(answer: string, structured: StructuredAnswer): boolean {
+  if (!answer.includes("HS Code:")) {
+    return false;
+  }
+  if (!structured.normalizedProductName && !structured.conciseExplanation) {
+    return false;
+  }
+  if (!structured.hsCodes.every((code) => answer.includes(code))) {
+    return false;
+  }
+  if (/\b(Retrieval:|PageIndex|Mã liên quan:|Selected section|Nguồn:)\b/i.test(answer)) {
+    return false;
+  }
+  const mentionedCodes = [...answer.matchAll(new RegExp(HS_CODE_PATTERN.source, "g"))].map((match) => match[0]);
+  if (mentionedCodes.some((code) => !structured.hsCodes.includes(code))) {
+    return false;
+  }
+  return sentenceCount(answer) <= 3;
+}
+
+function classEvalRepairApplied(llmAnswer: string | undefined, structured: StructuredAnswer, answer: string): boolean {
+  if (!llmAnswer) {
+    return false;
+  }
+  const llmCodes = [...llmAnswer.matchAll(new RegExp(HS_CODE_PATTERN.source, "g"))].map((match) => match[0]);
+  return llmCodes.some((code) => !structured.hsCodes.includes(code)) ||
+    structured.hsCodes.some((code) => !llmAnswer.includes(code)) ||
+    cleanDirectAnswer(llmAnswer) !== stripHsCodes(answer);
+}
+
+function normalizeProductTitle(value: string): string {
+  const cleaned = normalizeDisplayText(value)
+    .replace(HS_CODE_PATTERN, "")
+    .replace(/^[\s—–-]+/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) {
+    return "";
+  }
+  return cleaned
+    .toLowerCase()
+    .split(/(\s+|[()/-])/)
+    .map((part, index, parts) => {
+      if (!/[a-z]/i.test(part)) {
+        return part;
+      }
+      if (SMALL_TITLE_WORDS.has(part) && index > 0 && index < parts.length - 1) {
+        return part;
+      }
+      return `${part.charAt(0).toUpperCase()}${part.slice(1)}`;
+    })
+    .join("")
+    .replace(/\(([^)]+)\)/g, (_match, inner: string) => `(${titleCasePhrase(inner)})`);
+}
+
+function titleCasePhrase(value: string): string {
+  return value
+    .split(/\s+/g)
+    .map((part, index, parts) => {
+      const lower = part.toLowerCase();
+      if (SMALL_TITLE_WORDS.has(lower) && index > 0 && index < parts.length - 1) {
+        return lower;
+      }
+      return `${lower.charAt(0).toUpperCase()}${lower.slice(1)}`;
+    })
+    .join(" ");
+}
+
+function definitionStyleQuestion(question: string): boolean {
+  return /\b(define|definition|what is|what are|means|refers to)\b/i.test(question) ||
+    /là gì|được định nghĩa|định nghĩa/i.test(question);
+}
+
+function extractDefinitionSentence(text: string): string | null {
+  const sentence = splitSentences(cleanRetrievedText(text)).find((candidate) =>
+    /\b(are|is|refers to|means|defined as)\b/i.test(candidate) ||
+    /là|được định nghĩa là|có nghĩa là/i.test(candidate)
+  );
+  return sentence ? shortenSentence(sentence, 180) : null;
+}
+
+function shortLlmExplanation(answer: string | undefined): string | null {
+  const cleaned = stripHsCodes(cleanDirectAnswer(answer));
+  if (!cleaned) {
+    return null;
+  }
+  return shortenSentence(splitSentences(cleaned)[0] ?? cleaned, 160);
+}
+
+function extractClassificationNote(text: string): string | null {
+  const sentence = splitSentences(cleanRetrievedText(text)).find((candidate) =>
+    /\b(should be classified under|classified under|remain in heading|does not apply|however|except|provided that|if)\b/i.test(candidate)
+  );
+  return sentence && sentence.length <= 220 ? sentence : sentence ? shortenSentence(sentence, 180) : null;
+}
+
+function splitSentences(text: string): string[] {
+  return normalizeDisplayText(text)
+    .split(/(?<=[.!?])\s+/g)
+    .map((sentence) => sentence.trim())
+    .filter(Boolean);
+}
+
+function shortenSentence(value: string, maxLength: number): string {
+  const cleaned = value.replace(/\s+/g, " ").trim();
+  if (cleaned.length <= maxLength) {
+    return ensureSentenceEnd(cleaned);
+  }
+  const sliced = cleaned.slice(0, maxLength).replace(/\s+\S*$/g, "").trim();
+  return ensureSentenceEnd(sliced);
+}
+
+function stripHsCodes(value: string): string {
+  return value
+    .replace(/HS Code:\s*/gi, "")
+    .replace(new RegExp(HS_CODE_PATTERN.source, "g"), "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sentenceCount(value: string): number {
+  return splitSentences(value).length;
+}
+
 function stripDisallowedHsCodes(answer: string, allowedCodes: string[]): string {
   if (allowedCodes.length === 0) {
     return answer;
@@ -763,6 +978,8 @@ const QUERY_STOPWORDS = new Set([
   "this",
   "that"
 ]);
+
+const SMALL_TITLE_WORDS = new Set(["of", "the", "and", "or", "for", "to", "in", "on", "with", "not"]);
 
 function extractScientificNames(question: string): string[] {
   const names: string[] = [];

@@ -1,58 +1,75 @@
-﻿# Milestone 1.1: Image Asset Export
+# Milestone 1.1: Image Asset Export
 
-Mục tiêu của Milestone 1.1 là xuất ảnh nội dung thật từ PDF thành PNG local và thay placeholder ảnh trong Markdown bằng image link local.
+[Trước: Milestone 1](milestone-1.md) | [Mục lục](../../README.md) | [Tiếp theo: Milestone 2](milestone-2.md)
 
-## Flow Chính
+Milestone 1.1 xuất ảnh nội dung thật từ PDF thành PNG local và thay placeholder trong Markdown bằng image link có caption/source.
+
+## Mục Tiêu
+
+- Crop đúng ảnh nội dung theo `bbox` từ layout layer.
+- Không export decorative full-page background, icon, logo nhỏ hoặc artifact.
+- Giữ caption/source đủ gần để ảnh có ngữ cảnh.
+- Markdown render được ảnh local và validator kiểm được file tồn tại.
+
+## Flow Vận Hành
 
 ```text
-Parsed blocks
+Milestone 1 blocks
  ↓
-ArtifactFilter loại decorative images
+ArtifactFilter loại decorative image blocks
  ↓
-ImageAssetExporter crop ảnh theo bbox
+ImageAssetExporter crop PDF page theo bbox
  ↓
-HSCodeReconstructor render ![caption](asset_path)
+HSCodeReconstructor render Markdown image link
  ↓
 MarkdownValidator Marker 9
 ```
 
 ## Module Chính
 
-- `ImageAssetExporter`: dùng PyMuPDF crop image block theo `bbox`.
-- `HSCodeReconstructor`: render image block thành Markdown image link khi có `assetPath`.
-- `MarkdownValidator`: Marker 9 kiểm local image link có tồn tại và image block có metadata asset.
+- `src/orchestrator/imageAssetExporter.ts`: crop image block bằng PyMuPDF.
+- `src/orchestrator/semanticFusion.ts`: gắn caption/source trước khi render.
+- `src/orchestrator/hsCodeReconstructor.ts`: render `![caption](assets/...)`.
+- `src/validators/markdownValidator.ts`: Marker 9 kiểm asset path và image metadata.
 
-## Output
-
-```text
-data/converted/assets/<pdf-name>/<image-id>.png
-```
-
-Markdown output:
-
-```md
-![caption](assets/<pdf-name>/<image-id>.png)
-<!-- image-id: block_id -->
-*Caption: caption*
-```
-
-## Lệnh Chạy
+## Cách Chạy
 
 ```bash
 npm run parse -- data/uploads/Chapter12.pdf --ocr-lang vie --docling-threads 4 --export-assets
 ```
 
-## Đã Đạt
+Output thêm:
 
-- Chapter 12 export 19 ảnh nội dung.
-- Chapter 7 export 24 ảnh nội dung.
-- 0 decorative full-page background images được export.
-- Marker 9 pass cho image asset links.
+```text
+data/converted/assets/Chapter12/<image-id>.png
+```
 
-## Lưu Ý Asset Path
+Markdown:
 
-Image links hiện là local paths trong `data/converted/assets`. Nếu PageIndex cloud không truy cập được local asset paths, hướng sau này là embed Base64 hoặc upload assets lên public/static storage. Milestone này chưa implement Base64/S3 để giữ pipeline đơn giản.
+```md
+![caption](assets/Chapter12/<image-id>.png)
+<!-- image-id: block_id -->
+*Caption: caption*
+```
 
-## Vì Sao Dùng PyMuPDF Crop
+## Quy Tắc Export
 
-Image block đã có `pageNumber`, `bbox` và `id` từ layout layer. Crop trực tiếp bằng PyMuPDF ổn định hơn việc trích raw embedded image vì PDF có thể chứa mask, reuse xref hoặc ảnh bị cắt theo viewport.
+- Chỉ crop block ảnh có bbox hợp lệ và qua filter artifact.
+- Caption/source được lấy từ block gần nhất, không gộp bừa toàn trang.
+- Nếu crop fail, pipeline ghi warning/debug thay vì làm hỏng toàn bộ parse khi text vẫn hợp lệ.
+- Asset path là relative path dưới `data/converted`, phù hợp UI local.
+
+## Giới Hạn Hiện Tại
+
+Image links hiện là local file path. Nếu cần PageIndex/cloud đọc trực tiếp ảnh, milestone sau phải upload assets lên static storage hoặc embed Base64. Milestone này cố ý giữ local để parser nhanh, rẻ và dễ debug.
+
+## Debug
+
+Kiểm tra:
+
+```text
+data/converted/<file>.milestone1.validation.json
+data/converted/assets/<file>/
+```
+
+Marker 9 fail thường do asset file thiếu, bbox crop sai hoặc Markdown link không trỏ đúng relative path.

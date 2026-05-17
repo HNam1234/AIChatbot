@@ -1,135 +1,131 @@
-# Milestone 4: Custom Agentic Retrieval via MCP with Round-Robin LLM Keys
+# Milestone 4: MCP Agent and Round-Robin LLM Keys
 
-Milestone 4 adds a custom agent on top of the PageIndex Tree Index generated in Milestone 2. The agent keeps retrieval cheap by using PageIndex MCP tools for targeted context, then uses a Gemini Flash-family model to synthesize a grounded answer.
+[Trước: Milestone 3](milestone-3.md) | [Mục lục](../../README.md) | [Tiếp theo: Milestone 5](milestone-5.md)
 
-Unlike the first token-minimized draft, this version does not force 15-word answers. It uses multiple configured Gemini keys in a Round-Robin client so the answer can include the HS Code, product/title, and a short classification reason while still avoiding full-document prompt stuffing.
+Milestone 4 là custom agent dùng PageIndex MCP để lấy targeted context, sau đó dùng Gemini Round-Robin để synthesize answer. Mục tiêu là giảm input token, tăng khả năng chịu lỗi key/quota, nhưng vẫn giữ answer đủ chi tiết.
 
-This milestone is implemented as a first runtime slice. PageIndex MCP tool names, Gemini model names, quotas, and pricing should still be verified during operations because vendor APIs and limits can change.
+## Mục Tiêu
 
-## Goals
+- Không nhồi full PDF/Markdown vào LLM.
+- Dùng PageIndex MCP tool để lấy đúng section/node cần trả lời.
+- Dùng nhiều Gemini key slots để failover khi một key quota/ban/permission lỗi.
+- Cho phép trả lời có giải thích ngắn, không ép 15 từ.
+- Dùng Marker 12/13 để kiểm token budget và output size.
 
-- Build a custom LLM agent that retrieves HS Code evidence from already indexed PageIndex documents.
-- Avoid local vector database ingestion and full-document prompt stuffing.
-- Use PageIndex MCP tools to retrieve only the target section or node needed for the answer.
-- Use a Gemini Round-Robin client over multiple configured keys for availability and rate-limit failover.
-- Allow concise, useful answers with a short explanation grounded in retrieved context.
-- Add Marker 12 and Marker 13 to keep context and answer size bounded.
-
-## Budget And Availability Strategy
-
-Milestone 4 uses vectorless RAG with five controls:
-
-1. Targeted extraction: call MCP tools to retrieve only the relevant section text.
-2. Tree thinning: prefer compact PageIndex tree nodes and summaries over raw full documents.
-3. Round-Robin keys: rotate across `GEMINI_KEY_1`, `GEMINI_KEY_2`, `GEMINI_KEY_3`, or any provided key list.
-4. Failover: if one key hits a retryable quota/rate/transient error, try the next key without crashing the agent.
-5. Bounded answers: allow explanation, but warn if the final answer becomes too long.
-
-Use only API keys owned by the project and comply with the provider's terms and current quota policy. Treat expected request capacity as an implementation-time setting, not a fixed README guarantee.
-
-## Architecture
+## Flow Vận Hành
 
 ```text
-src/
-+-- agent/
-|   +-- mcpClient.ts         # Connect to PageIndex MCP server
-|   +-- geminiClient.ts      # Round-Robin Gemini answer synthesis
-|   +-- hsCodeAgent.ts       # Agent orchestration
-+-- validators/
-|   +-- tokenValidator.ts    # Marker 12 and Marker 13
-+-- mainFlow.ts              # Optional agent mode entry point
+User question
+ ↓
+PageIndex MCP client connect
+ ↓
+Select tree/search/content tool
+ ↓
+Retrieve targeted context
+ ↓
+Marker 12 kiểm context size
+ ↓
+GeminiRoundRobinClient synthesize answer
+ ↓
+Marker 13 kiểm answer length
+ ↓
+Return answer + retrieval metadata
 ```
 
-## Dependencies
+## Module Chính
 
-Installed packages:
+- `src/agent/mcpClient.ts`: kết nối PageIndex MCP bằng Streamable HTTP.
+- `src/agent/geminiClient.ts`: Gemini Round-Robin, retry/failover, prompt rules.
+- `src/agent/hsCodeAgent.ts`: orchestrate MCP retrieval + LLM synthesis.
+- `src/validators/tokenValidator.ts`: Marker 12 và Marker 13.
+- `src/mainFlow.ts`: entry point `--mode agent`.
 
-```bash
-npm install @modelcontextprotocol/sdk @google/genai
-```
+## Cài Key
 
-Environment:
+`.env`:
 
-```text
-PAGEINDEX_API_KEY=your_pageindex_api_key
+```env
+PAGEINDEX_API_KEY=your_pageindex_key
 PAGEINDEX_MCP_URL=https://api.pageindex.ai/mcp
 
-GEMINI_KEY_1=your_first_gemini_key
-GEMINI_KEY_2=your_second_gemini_key
-GEMINI_KEY_3=your_third_gemini_key
+GEMINI_KEY_1=your_first_key
+GEMINI_KEY_1_ENABLED=true
+GEMINI_KEY_2=your_second_key
+GEMINI_KEY_2_ENABLED=true
+GEMINI_KEY_3=your_third_key
+GEMINI_KEY_3_ENABLED=false
 
-# Optional single-key fallback for local development
-GEMINI_API_KEY=your_single_gemini_key
+GEMINI_API_KEY=legacy_single_key_optional
 ```
 
-## MCP Client
+UI API Settings cũng cho:
 
-Implemented in `src/agent/mcpClient.ts`. It uses the MCP Streamable HTTP transport against `https://api.pageindex.ai/mcp` with `Authorization: Bearer <PAGEINDEX_API_KEY>`. It discovers available tools, prefers tree/search/content tools, and can be forced with `--mcp-tool`.
+- sửa từng Gemini key slot,
+- bật/tắt slot bị ban,
+- dùng temporary key cho một run,
+- lưu key vào `.env` mà không lộ raw key.
 
-## Gemini Round-Robin Client
+## Round-Robin Behavior
 
-Implemented in `src/agent/geminiClient.ts`. It uses the current Google GenAI SDK:
+Client load các key đang enabled theo thứ tự:
 
-```ts
-import { GoogleGenAI } from "@google/genai";
+```text
+GEMINI_KEY_1 → GEMINI_KEY_2 → GEMINI_KEY_3 → GEMINI_API_KEY
 ```
 
-It rotates across `GEMINI_KEY_1`, `GEMINI_KEY_2`, `GEMINI_KEY_3`, then `GEMINI_API_KEY`. Retryable quota/rate/transient errors move to the next key without logging raw key values.
+Khi gặp lỗi retryable như quota, 429, 5xx, permission denied, invalid key, forbidden hoặc banned, client bỏ qua key hiện tại và thử key kế tiếp. Raw key không được log.
 
-## Agent Orchestration
-
-Implemented in `src/agent/hsCodeAgent.ts`. It connects MCP, retrieves targeted context, runs Marker 12, calls Gemini Round-Robin synthesis, then runs Marker 13.
-
-## Marker 12 And Marker 13
-
-Implemented in `src/validators/tokenValidator.ts`.
-
-Marker 12 remains a hard gate before any LLM call. Marker 13 is a warning so the agent can answer naturally while still catching verbose outputs during development.
-
-## Usage
-
-Command:
+## Cách Chạy
 
 ```bash
 npm run agent -- --doc-name "Chapter12.milestone1.md" --query "Find the HS Code for round cabbage"
 ```
 
-## Acceptance Criteria
+Có thể ép tool MCP nếu cần debug:
 
-- Agent connects to PageIndex MCP using `PAGEINDEX_API_KEY`.
-- Agent retrieves targeted context for a query using a PageIndex MCP tree/search tool.
-- Marker 12 fails before LLM invocation if targeted context exceeds 1,500 characters.
-- Gemini synthesis receives only targeted context, not full documents.
-- Round-Robin client loads all configured Gemini key slots without logging raw key values.
-- A retryable quota/rate/transient error on one Gemini key automatically tries the next configured key.
-- Marker 13 warns if the final answer exceeds the configured word budget.
-- The final answer may include the HS Code, product/title, and a short grounded reason.
-- Milestone 4 does not mutate Milestone 1/2 parser outputs.
+```bash
+npm run agent -- --doc-name "Chapter12.milestone1.md" --query "Find round cabbage" --mcp-tool pageindex_tree_search
+```
 
-## Implementation Notes
+## Marker 12 Và Marker 13
 
-- Keep Milestone 4 separate from Milestone 3 Chat API work. Milestone 3 uses PageIndex Chat API directly; Milestone 4 builds a custom agent with MCP plus a separate LLM.
-- Do not pass full Markdown documents to Gemini.
-- Log context length, answer word count, doc_id, selected MCP tool name, and Gemini key slot number for cost debugging.
-- Never log raw API keys, raw environment values, or request headers.
-- Validate current Gemini model names, pricing, and rate limits before release.
-- Validate PageIndex MCP package/tool names before release.
-- Use Round-Robin for availability across owned keys, not to bypass provider policy.
+Marker 12:
 
-## Relation To Earlier Milestones
+- hard gate trước khi gọi LLM,
+- fail nếu targeted context vượt budget cấu hình,
+- bảo vệ khỏi việc vô tình gửi toàn bộ document.
+
+Marker 13:
+
+- warning nếu answer quá dài,
+- không chặn answer hợp lệ,
+- dùng để siết prompt khi LLM bắt đầu nói lan man.
+
+## Prompt Rules
+
+Gemini prompt phải:
+
+- dùng metadata/citation nếu có,
+- không invent HS Code,
+- không chọn contrast baseline product bằng keyword đơn thuần,
+- ưu tiên numeric range, physical traits, usage/function,
+- trả lời bằng ngữ cảnh retrieved, không suy diễn ngoài tài liệu.
+
+## Quan Hệ Với Milestone 3
+
+Milestone 3 là Q&A trên cached PageIndex tree và metadata local, phù hợp UI hỏi across all PDFs. Milestone 4 là agent MCP chi phí thấp hơn cho targeted retrieval. Hai flow dùng chung nguyên tắc citation/metadata, nhưng entry point và retrieval tool khác nhau.
+
+## Debug
+
+Log nên có:
 
 ```text
-Milestone 1: clean Markdown + layout blocks + validation
- |
- v
-Milestone 1.1: local image assets
- |
- v
-Milestone 2: PageIndex Tree Index + section map
- |
- v
-Milestone 3: PageIndex Chat API with citations
- |
- v
-Milestone 4: custom MCP agent with Round-Robin LLM key failover
+selected MCP tool
+context chars
+truncated yes/no
+Gemini key slot index
+retry/failover count
+answer word count
 ```
+
+Không log API keys, headers hoặc raw environment values.

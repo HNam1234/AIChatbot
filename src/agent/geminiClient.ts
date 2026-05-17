@@ -113,7 +113,10 @@ export class GeminiRoundRobinClient {
 export function buildHsCodePrompt(context: string, query: string, language: string): string {
   return [
     "You are answering HSCode questions using retrieved sections.",
+    "You are a customs HSCode expert. Identify the HS code for the actual product described by the user.",
     "Use only the provided context and provided metadata. Do not invent HS Codes that are not supported by the context.",
+    "CORE RULE - CONTRAST TERM TRAP: if the question contains comparative or contrast expressions such as 'hơn X', 'so với X', 'khác với X', 'thay vì X', 'không phải X', 'less/more than X', 'compared to X', 'rather than X', or 'instead of X', then X is often a comparison baseline, not the target product.",
+    "Do not select the HS code of X only because X appears in the query. Prefer sections matching product attributes, numeric ranges, physical traits, and usage/function. Reject candidates that only match the contrast term or conflict with described attributes.",
     "If hsCode is present in retrieved metadata, the final answer MUST include exactly: HS Code: <hsCode>.",
     "The citation MUST include document, page/page range, and section.",
     "Do not omit HS Code when available. If metadata and text conflict, prefer metadata for hsCode, title, and citation.",

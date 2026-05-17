@@ -1,113 +1,173 @@
 # Milestone 3: Agentic Q&A and Reasoning Retrieval
 
-Milestone 3 adds a question-answering layer on top of the Markdown, image assets, section maps, and PageIndex Tree Index produced by Milestones 1, 1.1, and 2.
+[Trước: Milestone 2](milestone-2.md) | [Mục lục](../../README.md) | [Tiếp theo: Milestone 4](milestone-4.md)
 
-The goal is to answer natural-language HS Code questions with grounded citations from the indexed source documents. Instead of building a local vector database, the pipeline should call the PageIndex Chat API and use PageIndex's tree-aware retrieval to reason over the uploaded document.
+Milestone 3 thêm lớp hỏi đáp trên PageIndex Tree Index và local section metadata. Mục tiêu là trả lời câu hỏi HS Code bằng ngôn ngữ tự nhiên nhưng luôn có HS Code và citation đầy đủ.
 
-## Goals
+## Mục Tiêu
 
-- Connect to the PageIndex Chat API from Node.js/TypeScript.
-- Let users ask natural-language questions about indexed HS Code reference documents.
-- Enable inline citations so answers are tied back to the source document and page.
-- Add Marker 11 as the Q&A gatekeeper for citation integrity.
-- Keep answers conservative with low temperature and document-scoped retrieval.
+- Hỏi trên một hoặc tất cả documents đã có PageIndex tree cache.
+- PageIndex/cached tree là retrieval source chính.
+- BM25/local section search chỉ là fallback.
+- Join retrieval hit với `sections.json` / `all.sections.json` để lấy `hsCode`, title, document, page, source.
+- Không để LLM tự nhớ hoặc tự suy luận HS Code khi metadata đã có.
+- UI hiển thị answer text, retrieval source và citation card.
 
-Example question:
-
-```text
-Find the HS Code for an LCD monitor product.
-```
-
-Expected answer style:
+## Flow Vận Hành
 
 ```text
-The suitable code is ... because ... <doc=ChapterXX.pdf;page=Y>
+User question
+ ↓
+Load cached tree JSON documents
+ ↓
+Search PageIndex tree nodes first
+ ↓
+Join hit với all.sections.json / sections.json
+ ↓
+Rank section theo metadata + contrast rules
+ ↓
+Build structured context cho LLM
+ ↓
+Gemini Round-Robin synthesize answer nếu có key
+ ↓
+Answer formatter repair/force HS Code + citation từ metadata
+ ↓
+Marker 11 citation validation + UI citation card
 ```
 
-## Architecture
+## Retrieval Strategy
+
+Ưu tiên:
+
+1. PageIndex/cached tree section hit.
+2. Tree node title chứa HS code.
+3. Tree hit join được với local section metadata.
+4. BM25 fallback trên local section metadata nếu PageIndex không có usable result.
+
+BM25 không được trộn ngang hàng với PageIndex hits. Khi fallback xảy ra, API response/UI sẽ hiện:
+
+```json
+{
+  "source": "bm25-fallback",
+  "bm25FallbackUsed": true
+}
+```
+
+## Structured Context
+
+LLM không nhận raw text đơn thuần. Mỗi retrieved section được truyền dạng:
 
 ```text
-src/
-+-- api/
-|   +-- pageindexClient.ts   # Add Chat API method alongside upload/tree methods
-|   +-- chatSession.ts       # Conversation history and request shaping
-+-- cli/
-|   +-- repl.ts              # Interactive terminal chat
-+-- validators/
-|   +-- qaValidator.ts       # Marker 11 citation integrity check
-+-- mainFlow.ts              # Add chat mode entry point or delegate to cli/repl.ts
+[SECTION 1]
+- document: Chapter06.pdf
+- chapter: CHAPTER 6
+- pageStart: 22
+- pageEnd: 22
+- hsCode: 0602.90.50
+- groupedHsCodes:
+- title: SEEDLINGS OF THE GENUS HEVEA
+- section: 0602.90.50 — SEEDLINGS OF THE GENUS HEVEA
+- source: Malaysia
+- captions:
+- text: Seedlings of the genus Hevea are germinated rubber tree seeds...
 ```
 
-## Execution Flow
+Nếu `hsCode` hoặc `groupedHsCodes` có trong metadata, final answer bắt buộc chứa HS Code tương ứng.
 
-1. Read the `doc_id` generated in Milestone 2. It may come from CLI args, a tree JSON file, or the batch manifest.
-2. Start a chat session with optional conversation history.
-3. Send the user query to `POST https://api.pageindex.ai/chat/completions`.
-4. Scope retrieval to the target `doc_id`.
-5. Enable citations with `enable_citations: true`.
-6. Use low temperature, for example `0.1`, to keep answers conservative.
-7. Run Marker 11 on the returned answer before displaying it as trusted output.
+## Answer Format
 
-## Chat API Client
+Single code:
 
-Implemented in `src/api/pageindexClient.ts` as `PageIndexClient.chatCompletion()`. It uses native `fetch`, posts to `/chat/completions`, scopes requests with optional `doc_id`, sets `stream: false`, and enables citations by default.
+```text
+<direct answer>. HS Code: <hsCode>.
 
-## Chat Session
+Nguồn: <document>, page <page>, section "<section>".
+```
 
-Implemented in `src/api/chatSession.ts`. It keeps explicit user/assistant history and reuses `PageIndexClient.chatCompletion()` for each turn.
+Grouped code khi trạng thái hàng hóa chưa rõ:
 
-## Marker 11: Citation Integrity Check
+```text
+<direct answer>. HS Code: <code1> hoặc <code2>, tùy trạng thái hàng hóa.
 
-Marker 11 validates that any factual answer includes at least one inline citation. In development mode, answers without citations should fail loudly so prompt/API settings can be corrected before users trust the output.
+Nguồn: <document>, page <page>, section "<section>".
+```
 
-Implemented in `src/validators/qaValidator.ts`.
+Nếu LLM bỏ sót code, formatter tự repair bằng metadata. Nếu LLM trả code không thuộc selected section, agent retry một lần với prompt strict hơn rồi fallback về template metadata.
 
-## CLI REPL
+## Contrast Term Rule
 
-Implemented in `src/cli/repl.ts`. It supports one-shot questions and interactive chat.
+Các câu có cụm như:
 
-## CLI Entry Point
+```text
+hơn X
+so với X
+khác với X
+thay vì X
+không phải X
+less/more than X
+compared to X
+instead of X
+```
 
-Package script:
+thì `X` thường là baseline so sánh, không phải sản phẩm cần chọn. Ranker ưu tiên section khớp thuộc tính vật lý, numeric range, usage/function và phạt candidate chỉ match baseline trong title.
+
+Ví dụ:
+
+```text
+Loại cà phê có vị đắng hơn Arabica và caffeine cao hơn là gì?
+```
+
+Expected target là Robusta nếu section Robusta match đầy đủ thuộc tính, không chọn Arabica chỉ vì query nhắc đến Arabica.
+
+## CLI
+
+Một câu hỏi:
 
 ```bash
-npm run chat -- --doc-id "doc_id_from_milestone_2" --query "Find the HS Code for round cabbage"
+npm run chat -- --doc-id "doc_id_from_milestone_2" --query "Seedlings of the genus Hevea được định nghĩa là gì?"
+```
+
+Interactive:
+
+```bash
 npm run chat -- --doc-id "doc_id_from_milestone_2"
 ```
 
-The CLI should resolve `PAGEINDEX_API_KEY` the same way Milestone 2 does: explicit CLI flag first, then `.env` or environment variable.
+## UI
 
-## Acceptance Criteria
+Trong Agent Console:
 
-- User can start a chat session with a PageIndex `doc_id`.
-- User can ask factual questions about an indexed HS Code document.
-- Answers include inline citations such as `<doc=Chapter12.pdf;page=4>`.
-- Marker 11 passes when citations are present.
-- Marker 11 fails when an answer contains no citation.
-- Chat mode does not require a local vector database.
-- Chat mode does not mutate Milestone 1 or Milestone 2 parser outputs.
+- `Scope: All cached PageIndex documents` để hỏi toàn bộ PDFs đã có `*.tree.json`.
+- Answer panel hiển thị answer text.
+- Retrieval status hiển thị `pageindex-tree` hoặc `bm25-fallback`.
+- Citation card hiển thị HS Code(s), title, document, page, section, source.
+- UI vẫn hiện HS Code trong citation card ngay cả khi answer text bị LLM thiếu.
 
-## Implementation Notes
+## Marker 11
 
-- Keep `temperature` low, usually `0.1`.
-- Keep retrieval scoped to one `doc_id` unless multi-document chat is explicitly added.
-- Preserve raw citation strings in logs and validation output.
-- Do not hide citation failures in development.
-- If PageIndex changes the beta Chat API response shape, isolate that change in `PageIndexClient.chatCompletion()`.
+Marker 11 kiểm answer có grounding/citation. Với cached-tree Q&A, citation chuẩn là dòng `Nguồn:` và metadata card, không dùng citation rút gọn kiểu `<doc=Chapter06.pdf>` làm output cuối.
 
-## Relation To Earlier Milestones
+## Regression Quan Trọng
+
+- Hevea seedlings trả `0602.90.50`, `Chapter06.pdf`, page 22, section đúng.
+- Oxen trả `0102.29.11`.
+- Agarwood chips trả `1211.90.95`.
+- Contrast query không chọn baseline product bằng keyword đơn thuần.
+- Grouped HS code query trả toàn bộ grouped codes khi state chưa rõ.
+
+## Debug Logs
+
+Khi debug Q&A, backend log:
 
 ```text
-Milestone 1: clean Markdown + layout blocks + validation
- |
- v
-Milestone 1.1: local image assets
- |
- v
-Milestone 2: PageIndex Tree Index + section map
- |
- v
-Milestone 3: agentic Q&A with inline citations
+query
+PageIndex result count
+BM25 fallback used
+top retrieved sections
+contrast terms
+selected section
+final HS codes
+answer repair applied
 ```
 
-Milestone 3 should treat the previous outputs as read-only indexed knowledge. It should not re-parse PDFs or rebuild local chunks.
+Raw API keys không được log.

@@ -1,25 +1,72 @@
-﻿# Local PDF Parser + PageIndex Tree Pipeline
+# HSCode PDF Parser + PageIndex Agent
 
-Pipeline TypeScript parse PDF HS Code thành Markdown chuẩn, export ảnh nội dung, upload Markdown lên PageIndex để sinh Tree Index, rồi dùng cho Agentic Q&A qua PageIndex Chat API hoặc MCP + Gemini.
+Repo này là pipeline TypeScript để parse tài liệu PDF mã HS thành Markdown sạch, export ảnh thật, sinh PageIndex Tree Index, rồi hỏi đáp trên toàn bộ bộ tài liệu bằng retrieval có citation.
 
-## Milestones
+File này đóng vai trò như mục lục và hướng dẫn chạy nhanh. Chi tiết thiết kế, flow và vận hành của từng phần nằm trong các README milestone bên dưới.
 
-- [Milestone 1: Local PDF Parser](docs/milestones/milestone-1.md)
-- [Milestone 1.1: Image Asset Export](docs/milestones/milestone-1-1.md)
-- [Milestone 2: PageIndex Tree Generation](docs/milestones/milestone-2.md)
-- [Milestone 3: Agentic Q&A and Reasoning Retrieval](docs/milestones/milestone-3.md)
-- [Milestone 4: Custom Agentic Retrieval via MCP with Round-Robin Keys](docs/milestones/milestone-4.md)
+## Mục Lục
 
-## Prerequisites
+Đọc theo thứ tự như một quyển sách:
+
+1. [Milestone 1: Local PDF Parser](docs/milestones/milestone-1.md)
+2. [Milestone 1.1: Image Asset Export](docs/milestones/milestone-1-1.md)
+3. [Milestone 2: PageIndex Tree Generation](docs/milestones/milestone-2.md)
+4. [Milestone 3: Agentic Q&A and Reasoning Retrieval](docs/milestones/milestone-3.md)
+5. [Milestone 4: MCP Agent and Round-Robin LLM Keys](docs/milestones/milestone-4.md)
+6. [Milestone 5: Spatial Grounding and BBox Mapping](docs/milestones/milestone-5.md)
+
+## Flow Tổng
+
+```text
+PDF
+ ↓
+Milestone 1: Markdown + blocks.json + validation
+ ↓
+Milestone 1.1: crop ảnh nội dung thành local assets
+ ↓
+Milestone 2: upload Markdown lên PageIndex + cache tree JSON
+ ↓
+Milestone 3: Q&A trên tất cả cached PageIndex trees + citation card
+ ↓
+Milestone 4: MCP targeted retrieval + Gemini Round-Robin failover
+ ↓
+Milestone 5: click PDF ↔ bbox block ↔ Markdown anchor
+```
+
+## Cấu Trúc Repo
+
+```text
+src/
+├── agent/                  # Q&A formatter, Gemini Round-Robin, MCP agent
+├── api/                    # PageIndex client, chat session
+├── cli/                    # Chat REPL
+├── config/                 # .env parsing, API key settings
+├── layout/                 # PDF layout analysis
+├── orchestrator/           # parse flow, reconstruction, fusion, asset export
+├── pageindex/              # tree build/validation, section map
+├── server/                 # local UI backend
+├── ui/                     # local browser UI
+├── utils/                  # path/process helpers
+└── validators/             # Marker validators
+
+docs/milestones/            # milestone docs, đọc theo mục lục ở trên
+data/uploads/               # PDF input local, gitignored
+data/converted/             # Markdown/tree/sections/assets output, gitignored
+data/tmp/                   # debug logs, gitignored
+tests/                      # Vitest regressions
+```
+
+## Yêu Cầu Môi Trường
 
 - Node.js 18+
 - Python 3.10+
 - Git
-- PageIndex API key nếu chạy `--upload-pageindex`
+- PageIndex API key nếu chạy upload/tree hoặc PageIndex chat
+- Gemini API key nếu dùng Milestone 3/4 answer synthesis
 
-## Install
+## Cài Đặt
 
-Windows:
+Windows PowerShell:
 
 ```bash
 npm install
@@ -37,222 +84,67 @@ source .venv/bin/activate
 pip install pymupdf pymupdf4llm docling
 ```
 
-## Add API Key
+## Cấu Hình `.env`
 
-### Option A: Add API key via `.env`
+Tạo `.env` từ `.env.example`. Không commit `.env`.
 
-Tạo `.env` từ `.env.example`:
+```env
+PAGEINDEX_API_KEY=your_pageindex_key
+PAGEINDEX_API_BASE_URL=https://api.pageindex.ai
+PAGEINDEX_MCP_URL=https://api.pageindex.ai/mcp
 
-```text
-PAGEINDEX_API_KEY=your_key_here
-GEMINI_API_KEY=your_gemini_key_here
 GEMINI_KEY_1=your_first_gemini_key
 GEMINI_KEY_1_ENABLED=true
 GEMINI_KEY_2=your_second_gemini_key
 GEMINI_KEY_2_ENABLED=true
 GEMINI_KEY_3=your_third_gemini_key
 GEMINI_KEY_3_ENABLED=true
-PAGEINDEX_API_BASE_URL=https://api.pageindex.ai
-PAGEINDEX_MCP_URL=https://api.pageindex.ai/mcp
-PAGEINDEX_POLL_INTERVAL_MS=5000
-PAGEINDEX_POLL_MAX_ATTEMPTS=60
-UI_PIPELINE_TIMEOUT_MS=600000
+
 PORT=3000
+UI_PIPELINE_TIMEOUT_MS=600000
 ```
 
-Không commit `.env`. Repo đang ignore `data/uploads`, `data/converted` và `data/tmp`; chỉ giữ `.gitkeep`.
+UI cũng có panel API Settings để lưu PageIndex key và bật/tắt từng Gemini key slot. Raw key không được trả về frontend, không log ra terminal.
 
-### Option B: Add API key via UI
-
-Chạy UI:
+## Lệnh Build Và Kiểm Tra
 
 ```bash
-npm run dev
+npm run typecheck
+npm test
+npm run build
 ```
 
-Mở `http://localhost:3000`, nhập key vào panel `API Settings`.
+## Chạy Parser Một PDF
 
-- PageIndex key: dùng cho `--upload-pageindex`.
-- Gemini keys: UI hỗ trợ 3 slot `GEMINI_KEY_1`, `GEMINI_KEY_2`, `GEMINI_KEY_3` cho Milestone 4 Round-Robin failover; `GEMINI_API_KEY` vẫn là fallback legacy.
-- Mỗi Gemini slot có checkbox `Use`; bỏ tick slot bị ban để lưu `GEMINI_KEY_N_ENABLED=false` vào `.env`. Round-Robin tự bỏ qua key lỗi quota, 401/403, permission denied, forbidden, invalid key hoặc banned và thử key đang bật tiếp theo.
-- Temporary key mode: tick `Use ... key only for this run`; key chỉ được truyền cho job hiện tại qua environment, không lưu disk.
-- Save key mode: bấm `Save ... Key to .env`; backend chỉ set/replace key tương ứng và giữ các biến `.env` khác.
-- UI/API chỉ hiện masked key dạng `********...abcd`; raw key không được trả về, không log ra terminal, không ghi job logs, không lưu localStorage.
-
-## Run Local Parse
+Parse Markdown + validation:
 
 ```bash
 npm run parse -- data/uploads/Chapter12.pdf --ocr-lang vie --docling-threads 4
 ```
 
-Full single-document workflow with image export and PageIndex tree generation:
-
-```bash
-npm run parse -- data/uploads/Chapter12.pdf --ocr-lang vie --docling-threads 4 --export-assets --upload-pageindex
-```
-
-`--upload-pageindex` reuses `data/converted/<file>.tree.json` when it already contains a cached `docId` and tree payload. Use `--force-pageindex-upload` only when you intentionally want to regenerate the PageIndex tree.
-
-Output:
-
-```text
-data/converted/<file>.milestone1.md
-data/converted/<file>.milestone1.blocks.json
-data/converted/<file>.milestone1.validation.json
-data/converted/<file>.sections.json
-```
-
-## Markdown Reconstruction Notes
-
-Pipeline rebuilds Markdown from local layout blocks instead of trusting raw parser Markdown. The expected HS section format is:
-
-```md
-## 0102.29.11 — OXEN
-
-Body text...
-
-(Source: Indonesia)
-```
-
-Grouped HS codes that share one title are rendered as separate searchable H2 sections. Each grouped section includes the grouped code set and a duplicated shared-description block so retrieval works even when the query names an earlier code in the group:
-
-```md
-## 0105.11.10 — BREEDING
-
-Grouped HS code set: 0105.11.10, 0105.12.10, 0105.13.10, 0105.14.10, 0105.15.10, 0105.94.10, 0105.99.10, 0105.99.30.
-
-Shared description:
-
-For the purpose of the ASEAN subheadings under heading 01.05, the term “breeding” refers to live poultry of a kind presented for raising as a breeding animal.
-
-## 0105.12.10 — BREEDING
-
-Grouped HS code set: 0105.11.10, 0105.12.10, 0105.13.10, 0105.14.10, 0105.15.10, 0105.94.10, 0105.99.10, 0105.99.30.
-
-Shared description:
-
-For the purpose of the ASEAN subheadings under heading 01.05, the term “breeding” refers to live poultry of a kind presented for raising as a breeding animal.
-```
-
-Normal single-code sections do not receive `Shared description:` and remain unchanged.
-
-## Run Parse + Image Export
+Parse + export ảnh:
 
 ```bash
 npm run parse -- data/uploads/Chapter12.pdf --ocr-lang vie --docling-threads 4 --export-assets
 ```
 
-Output thêm:
-
-```text
-data/converted/assets/<file>/*.png
-```
-
-Markdown sẽ có image links local:
-
-```md
-![caption](assets/<file>/<image-id>.png)
-<!-- image-id: block_id -->
-*Caption: caption*
-```
-
-## Run Parse + Image Export + PageIndex
+Parse + export ảnh + upload PageIndex:
 
 ```bash
 npm run parse -- data/uploads/Chapter12.pdf --ocr-lang vie --docling-threads 4 --export-assets --upload-pageindex
 ```
 
-Output thêm:
+Mặc định `--upload-pageindex` sẽ reuse `data/converted/<file>.tree.json` nếu cache đã có `docId` và tree payload. Chỉ dùng `--force-pageindex-upload` khi thật sự muốn generate lại PageIndex tree.
 
-```text
-data/converted/<file>.tree.json
-data/converted/<file>.tree.validation.json
-```
+## Chạy Batch Nhiều PDF
 
-PageIndex tree cache behavior:
-
-- First run uploads Markdown, polls PageIndex, and writes `<file>.tree.json` with `docId`, tree payload, raw response, and Markdown hash metadata.
-- Later runs with `--upload-pageindex` reuse that local tree cache and skip PageIndex upload/polling whenever the cache has a `docId` and tree payload. If the Markdown hash differs, the validator records a warning but still reuses the cached PageIndex doc instead of regenerating it.
-- Older cache files without hash metadata are still reused if they contain `docId` and `tree`, so existing PageIndex work is not wasted.
-- To rebuild intentionally, pass `--force-pageindex-upload`.
-
-Nếu thiếu key, CLI báo:
-
-```text
-PAGEINDEX_API_KEY is missing. Create .env at project root or pass --pageindex-api-key.
-```
-
-## Milestone 3: Agentic Q&A Plan
-
-Milestone 3 will add chat over indexed PageIndex documents. The planned flow is:
-
-```text
-User question
- ↓
-PageIndex Chat API with doc_id
- ↓
-Agentic retrieval over Tree Index
- ↓
-Answer with inline citations
- ↓
-Marker 11 citation integrity validation
-```
-
-Implementation: [Milestone 3: Agentic Q&A and Reasoning Retrieval](docs/milestones/milestone-3.md).
-
-Run one question:
-
-```bash
-npm run chat -- --doc-id "doc_id_from_milestone_2" --query "Find the HS Code for round cabbage"
-```
-
-Start an interactive session:
-
-```bash
-npm run chat -- --doc-id "doc_id_from_milestone_2"
-```
-
-Milestone 3 is intentionally vectorless: it reuses PageIndex Chat API and inline citations instead of building a separate local vector database. In the UI, Agent Console defaults to all cached PageIndex docs found in `data/converted/*.tree.json`, so one question can search across every PDF that has already been uploaded once.
-
-Cached-tree Q&A joins tree hits back to local `*.sections.json` / `all.sections.json` metadata. Final answers are rendered with a required `HS Code: <code>` and a full citation (`document`, page/page range, section) when the retrieved section has HS metadata; the UI also shows the same metadata in a citation card.
-
-## Milestone 4: MCP Round-Robin Agent Plan
-
-Milestone 4 will add a custom low-token agent that uses PageIndex MCP tools for targeted retrieval and a Gemini Round-Robin client for final answer synthesis across multiple configured keys.
-
-```text
-User question
- ↓
-PageIndex MCP tree/search tool
- ↓
-Targeted context under token budget
- ↓
-Gemini Round-Robin synthesis with key failover
- ↓
-Marker 12 context-size gate
- ↓
-Marker 13 answer-size guard
-```
-
-Implementation: [Milestone 4: Custom Agentic Retrieval via MCP with Round-Robin Keys](docs/milestones/milestone-4.md).
-
-Run:
-
-```bash
-npm run agent -- --doc-name "Chapter12.milestone1.md" --query "Find the HS Code for round cabbage"
-```
-
-Milestone 4 keeps the previous parser and PageIndex tree outputs read-only. Its cost controls are targeted extraction, strict context-size validation, key rotation/failover, and bounded answer validation.
-
-## Run Multi-PDF Batch
-
-Put PDFs in `data/uploads/`, then run:
+Đặt PDF vào `data/uploads/`, sau đó chạy:
 
 ```bash
 npm run parse -- data/uploads --batch --ocr-lang vie --docling-threads 4 --export-assets --upload-pageindex
 ```
 
-Batch mode processes PDFs sequentially and keeps the existing single-file parser behavior for each document. It writes:
+Batch output chính:
 
 ```text
 data/converted/batch.manifest.json
@@ -260,30 +152,13 @@ data/converted/all.sections.json
 data/converted/all.documents.json
 ```
 
-`all.sections.json` merges section records from every parsed document and is the planned Milestone 3 input for Q&A across all documents.
+`all.sections.json` là nguồn metadata quan trọng cho Q&A/citation across documents.
 
-Non-HS reference documents, such as `Introduction.pdf`, are classified as `non-hs-reference`. They can still be uploaded to PageIndex and validated for tree structure, but the validator does not require HS sections in `sections.json`.
-
-Recent validated batch command:
-
-```bash
-npm run parse -- data/uploads --batch --ocr-lang vie --docling-threads 4 --export-assets --upload-pageindex
-```
-
-Expected result:
-
-```text
-[Batch Summary]
-Documents: 16/16 passed
-```
-
-## Start UI
+## Chạy Local UI
 
 ```bash
 npm run dev
 ```
-
-`npm run dev` chạy server ổn định để tránh restart giữa lúc upload. Nếu chỉ sửa code và không upload file lớn, có thể dùng `npm run dev:watch`.
 
 Mở:
 
@@ -291,80 +166,71 @@ Mở:
 http://localhost:3000
 ```
 
+`npm run dev` chạy server ổn định, phù hợp upload PDF lớn. `npm run dev:watch` chỉ nên dùng khi đang sửa code và không upload file lớn.
+
 ## UI Workflow
 
-1. Upload one or more PDFs.
-2. Chọn OCR language, mặc định `vie`.
-3. Chọn Docling threads, mặc định `4`.
-4. Tick `Export image assets` nếu cần ảnh.
-5. Tick `Upload to PageIndex` nếu cần tree/doc_id; `Reuse cached PageIndex tree` mặc định bật để không generate lại nếu đã có `<file>.tree.json`.
-6. Optional: bỏ tick `Reuse cached PageIndex tree` nếu muốn force regenerate, hoặc tick `Stop on first failure`; files run sequentially by default.
-7. Bấm `Run Pipeline`.
-8. Watch the top progress bar, current file, current step, elapsed time, per-file mini progress, and live logs.
+1. Mở `http://localhost:3000`.
+2. Cấu hình PageIndex/Gemini keys nếu cần.
+3. Upload một hoặc nhiều PDF.
+4. Chọn OCR language, Docling threads, export assets, upload PageIndex.
+5. Giữ `Reuse cached PageIndex tree` bật để không generate lại tree.
+6. Bấm `Run Pipeline`.
+7. Theo dõi progress bar, per-file status, live logs.
+8. Dùng Agent Console để hỏi trên tất cả cached PageIndex trees.
 
-The top progress bar includes the browser upload phase before parsing starts. Runtime logs include ISO timestamp, elapsed job time, function/phase name, and selected metadata such as filename, bytes, exit code, cache status, and validation/build durations. Raw API keys are not logged.
+## Chạy Q&A
 
-The UI uses a two-panel debugger layout:
+Hỏi qua CLI với một hoặc nhiều `doc_id`:
 
-- Left panel shows the original uploaded PDF using `/api/uploads/<filename>`.
-- Right panel shows parsed Markdown, rendered Markdown, sections, tree JSON, validation markers, and exported assets.
-- Clicking a section row selects the parsed HS section, shows its page range/source/text preview, and navigates the PDF preview to `#page=<pageStart>` when the browser PDF viewer supports it.
-- The batch result table is shown even for one PDF. Clicking a document row loads that document's PDF and output bundle into the two-panel viewer.
-
-UI job có hard timeout mặc định 10 phút (`UI_PIPELINE_TIMEOUT_MS=600000`). Nếu quá hạn, server kill process tree, đánh dấu job failed và ghi debug log vào `data/tmp/`.
-
-## Demo Flow Cho Final Submission
-
-1. Show `.env` tồn tại nhưng che API key.
-2. Run `npm run typecheck`.
-3. Run `npm test`.
-4. Run pipeline với `--export-assets --upload-pageindex`.
-5. Show Markdown headings đúng, including grouped HS sections with `Grouped HS code set` and `Shared description`.
-6. Show image links và PNG assets.
-7. Show validation markers.
-8. Show `tree.json`, `tree.validation.json`, `sections.json`.
-9. Nói rõ Q&A nằm ở Milestone 3.
-
-## Flow Tổng
-
-```text
-PDF
- ↓
-Milestone 1: Markdown + Blocks + Validation
- ↓
-Milestone 1.1: Local image assets
- ↓
-Milestone 2: PageIndex Tree JSON + Section Map
- ↓
-Milestone 3: Agentic Q&A + Inline Citation Validation
- ↓
-Milestone 4: MCP Agent + Round-Robin LLM Keys
+```bash
+npm run chat -- --doc-id "doc_id_from_milestone_2" --query "Oxen là gì?"
 ```
 
-## Công Nghệ Chính
+Hỏi qua UI trên toàn bộ cached trees:
 
-- **TypeScript/Node.js**: CLI, orchestration, reconstruction, validation, UI server.
-- **PyMuPDF**: đọc layout PDF và crop ảnh theo `bbox`.
-- **PyMuPDF4LLM**: parse nhanh trang text đơn giản.
-- **Docling**: parse trang có bảng, ảnh, scan hoặc layout khó.
-- **PageIndex API**: sinh Tree Index từ Markdown sạch.
-- **PageIndex Chat API**: Milestone 3 agentic retrieval và inline citations.
-- **PageIndex MCP + Gemini Flash**: planned Milestone 4 custom agentic retrieval with Round-Robin key failover and token budget gates.
-- **Express + static HTML/JS/CSS**: UI demo local.
-- **Vitest**: regression tests.
+```text
+Agent Console → Scope: All cached PageIndex documents → Ask
+```
 
-## Troubleshooting
+Milestone 3 ưu tiên PageIndex/cached tree retrieval trước. BM25 chỉ là fallback khi PageIndex không có usable HS section metadata.
 
-- `npm not recognized`: cài Node.js rồi mở terminal mới.
-- Venv chưa activate: chạy `.venv\Scripts\activate` trên Windows hoặc `source .venv/bin/activate` trên macOS/Linux.
-- PyMuPDF/Docling install error: kiểm tra Python 3.10+ và thử update `pip`.
-- Unicode errors on Windows Python stdout/stderr: pipeline sets `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1`; if running Python helpers manually, keep UTF-8 enabled.
-- `PAGEINDEX_API_KEY is missing`: tạo `.env` ở project root hoặc truyền `--pageindex-api-key`.
-- PageIndex bị generate lại: giữ `data/converted/<file>.tree.json` và không dùng `--force-pageindex-upload`; UI phải bật `Reuse cached PageIndex tree`.
-- PageIndex polling timeout: tăng `PAGEINDEX_POLL_MAX_ATTEMPTS` hoặc kiểm tra dashboard PageIndex.
-- UI job chạy quá lâu: kiểm tra `data/tmp/*.ui-job-*.json`; job runner sẽ kill process sau `UI_PIPELINE_TIMEOUT_MS`.
-- Markdown image links không hiện trong cloud: asset path hiện là local; milestone sau có thể dùng Base64 hoặc static hosting.
-- Validation failed: xem debug ở `data/tmp/*.milestone1-failed.*` hoặc `data/tmp/*.pageindex-*.json`.
-- Marker 5 failures include `layoutHSCodeCount`, `pairedHSCodeCount`, `unpairedHsCodes`, and nearest text context for each unpaired code.
-- Marker 10 does not fail non-HS reference documents solely because they have zero HS sections.
-- Marker 12 and Marker 13 are planned Milestone 4 gates for targeted context size and bounded answer length.
+## Chạy MCP Agent
+
+```bash
+npm run agent -- --doc-name "Chapter12.milestone1.md" --query "Find the HS Code for round cabbage"
+```
+
+Milestone 4 dùng PageIndex MCP để lấy targeted context, rồi Gemini Round-Robin để synthesize answer. Có thể bật/tắt từng `GEMINI_KEY_N_ENABLED` trong `.env` hoặc UI.
+
+## Output Chính
+
+```text
+data/converted/<file>.milestone1.md
+data/converted/<file>.milestone1.blocks.json
+data/converted/<file>.milestone1.validation.json
+data/converted/<file>.sections.json
+data/converted/<file>.tree.json
+data/converted/<file>.tree.validation.json
+data/converted/assets/<file>/*.png
+```
+
+## Troubleshooting Nhanh
+
+- `PAGEINDEX_API_KEY is missing`: tạo `.env` hoặc nhập key trong UI.
+- PageIndex bị generate lại: giữ `<file>.tree.json`, bật `Reuse cached PageIndex tree`, không dùng `--force-pageindex-upload`.
+- Upload bị `Request aborted`: giữ tab mở trong lúc upload, kiểm tra file quá lớn hoặc mạng local bị ngắt; UI có upload progress để trace.
+- Python Unicode lỗi Windows: pipeline set `PYTHONIOENCODING=utf-8` và `PYTHONUTF8=1`.
+- Q&A thiếu HS Code: kiểm tra `sections.json` / `all.sections.json`; answer layer sẽ repair từ metadata nếu section có HS code.
+- Gemini key bị ban/quota: bỏ tick key slot đó trong UI hoặc set `GEMINI_KEY_N_ENABLED=false`.
+
+## Demo Checklist
+
+```bash
+npm run typecheck
+npm test
+npm run build
+npm run parse -- data/uploads --batch --ocr-lang vie --docling-threads 4 --export-assets --upload-pageindex
+```
+
+Sau đó mở UI, kiểm tra Markdown, sections, tree JSON, assets, validation markers và Agent Console.

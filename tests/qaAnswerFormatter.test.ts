@@ -28,7 +28,9 @@ describe("qaAnswerFormatter", () => {
 
     const result = renderHsCodeAnswer(
       "Seedlings of the genus Hevea are germinated rubber tree seeds with a root length of about 1-2 cm.",
-      section
+      section,
+      [],
+      { answerStyle: "verbose" }
     );
 
     expect(result.answer).toContain("HS Code: 0602.90.50");
@@ -49,7 +51,9 @@ describe("qaAnswerFormatter", () => {
       text: "Oxen are castrated adult male bovine animals."
     });
 
-    const result = renderHsCodeAnswer("Oxen are castrated adult male bovine animals.", section);
+    const result = renderHsCodeAnswer("Oxen are castrated adult male bovine animals.", section, [], {
+      answerStyle: "verbose"
+    });
 
     expect(result.answer).toContain("HS Code: 0102.29.11");
     expect(result.answer).toContain("Chapter01.pdf");
@@ -68,7 +72,9 @@ describe("qaAnswerFormatter", () => {
       text: "Agarwood chips are also known as gaharu chips."
     });
 
-    const result = renderHsCodeAnswer("Agarwood chips are also known as gaharu chips.", section);
+    const result = renderHsCodeAnswer("Agarwood chips are also known as gaharu chips.", section, [], {
+      answerStyle: "verbose"
+    });
 
     expect(result.answer).toContain("HS Code: 1211.90.95");
     expect(result.answer).toContain("Chapter12.pdf");
@@ -93,7 +99,9 @@ describe("qaAnswerFormatter", () => {
     });
 
     const alternatives = selectAlternativeSections([robusta, arabica], "Compare Robusta coffee with Arabica coffee.");
-    const result = renderHsCodeAnswer("Robusta and Arabica differ by their section descriptions.", robusta, alternatives);
+    const result = renderHsCodeAnswer("Robusta and Arabica differ by their section descriptions.", robusta, alternatives, {
+      answerStyle: "verbose"
+    });
 
     expect(result.answer).toContain("HS Code: 0901.11.30");
     expect(result.answer).toContain("0901.21.12");
@@ -121,7 +129,9 @@ describe("qaAnswerFormatter", () => {
       [arabica, robusta],
       "Which coffee is more bitter than Arabica and has higher caffeine?"
     );
-    const answer = renderHsCodeAnswer("The matching product is Robusta coffee.", ranked[0]);
+    const answer = renderHsCodeAnswer("The matching product is Robusta coffee.", ranked[0], [], {
+      answerStyle: "verbose"
+    });
 
     expect(detectContrastTerms("bitter hon Arabica").baselineTokens).toContain("arabica");
     expect(ranked[0].title).toContain("ROBUSTA");
@@ -166,7 +176,8 @@ describe("qaAnswerFormatter", () => {
     });
 
     const result = renderHsCodeAnswer("Mechanically deboned meat is meat separated by machine.", section, [], {
-      question: "What is mechanically deboned meat?"
+      question: "What is mechanically deboned meat?",
+      answerStyle: "verbose"
     });
 
     expect(result.answer).toContain("HS Code:");
@@ -186,7 +197,9 @@ describe("qaAnswerFormatter", () => {
       text: "Seedlings of the genus Hevea are germinated rubber tree seeds."
     });
 
-    const result = renderHsCodeAnswer("Seedlings of the genus Hevea are germinated rubber tree seeds.", section);
+    const result = renderHsCodeAnswer("Seedlings of the genus Hevea are germinated rubber tree seeds.", section, [], {
+      answerStyle: "verbose"
+    });
 
     expect(result.answer).toContain("0602.90.50");
     expect(result.answer).toContain("Chapter06.pdf");
@@ -205,7 +218,9 @@ describe("qaAnswerFormatter", () => {
 
     const result = renderHsCodeAnswer(
       "Seedlings are germinated rubber tree seeds. Citation: Chapter06.pdf, page 22.",
-      section
+      section,
+      [],
+      { answerStyle: "verbose" }
     );
 
     expect(result.answer).not.toContain("Citation:");
@@ -249,6 +264,99 @@ describe("qaAnswerFormatter", () => {
     }))).toContain("Chapter06.pdf");
   });
 
+  it("renders class-eval single-code product answer without inline citation", () => {
+    const section = sectionFixture({
+      document: "Chapter10.pdf",
+      hsCode: "1001.99.10",
+      title: "WHEAT (NOT FIT FOR HUMAN CONSUMPTION)",
+      section: "1001.99.10 - WHEAT (NOT FIT FOR HUMAN CONSUMPTION)",
+      text: "Wheat not fit for human consumption is grain used outside food channels."
+    });
+
+    const result = renderHsCodeAnswer("Wrong extra text. HS Code: 9999.99.99.", section);
+
+    expect(result.answer).toContain("Wheat (Not Fit for Human Consumption)");
+    expect(result.answer).toContain("HS Code:");
+    expect(result.answer).toContain("1001.99.10");
+    expect(result.answer).not.toContain("Nguồn:");
+    expect(result.answer).not.toContain("9999.99.99");
+  });
+
+  it("renders class-eval grouped-code product answer with all grouped codes", () => {
+    const section = sectionFixture({
+      document: "Chapter02.pdf",
+      hsCode: "0207.14.10",
+      groupedHsCodes: ["0207.14.10", "0207.27.10", "0207.45.10"],
+      title: "MECHANICALLY DEBONED MEAT",
+      section: "0207.14.10 - MECHANICALLY DEBONED MEAT",
+      text: "Grouped HS code set: 0207.14.10, 0207.27.10, 0207.45.10."
+    });
+
+    const result = renderHsCodeAnswer(undefined, section);
+
+    expect(result.answer).toContain("0207.14.10");
+    expect(result.answer).toContain("0207.27.10");
+    expect(result.answer).toContain("0207.45.10");
+    expect(result.answer).toContain("hoặc");
+    expect(result.answer).toContain("tùy trạng thái hàng hóa");
+    expect(result.answer).not.toContain("Nguồn:");
+  });
+
+  it("renders class-eval definition answer from selected text", () => {
+    const section = sectionFixture({
+      document: "Chapter01.pdf",
+      hsCode: "0102.29.11",
+      title: "OXEN",
+      section: "0102.29.11 - OXEN",
+      text: "Oxen are castrated adult male bovine animals. They are commonly used as draught animals."
+    });
+
+    const result = renderHsCodeAnswer(undefined, section, [], { question: "What is Oxen?" });
+
+    expect(result.answer).toContain("Oxen are castrated adult male bovine animals.");
+    expect(result.answer).toContain("HS Code: 0102.29.11");
+    expect(result.answer).not.toContain("Nguồn:");
+  });
+
+  it("includes short classification note when source text has a caveat", () => {
+    const section = sectionFixture({
+      document: "Chapter99.pdf",
+      hsCode: "9999.10.10",
+      title: "SAMPLE PRODUCT",
+      section: "9999.10.10 - SAMPLE PRODUCT",
+      text: "Sample product is a demonstrative item. However, goods presented with retail packaging should be classified under this code."
+    });
+
+    const result = renderHsCodeAnswer(undefined, section);
+
+    expect(result.answer).toContain("HS Code: 9999.10.10");
+    expect(result.answer).toContain("Lưu ý:");
+    expect(result.answer.length).toBeLessThan(260);
+  });
+
+  it("does not include related candidate codes in class-eval answer", () => {
+    const selected = sectionFixture({
+      document: "Chapter09.pdf",
+      hsCode: "0901.11.30",
+      title: "ROBUSTA COFFEE",
+      section: "0901.11.30 - ROBUSTA COFFEE",
+      text: "Robusta coffee has a strong taste."
+    });
+    const related = sectionFixture({
+      document: "Chapter09.pdf",
+      hsCode: "0901.21.12",
+      title: "ARABICA COFFEE",
+      section: "0901.21.12 - ARABICA COFFEE",
+      text: "Arabica coffee has a mild taste."
+    });
+
+    const result = renderHsCodeAnswer("Use HS Code: 0901.21.12.", selected, [related]);
+
+    expect(result.answer).toContain("HS Code: 0901.11.30");
+    expect(result.answer).not.toContain("0901.21.12");
+    expect(result.answer).not.toContain("Mã liên quan");
+  });
+
   it("extracts distinctive signals and selects an attribute-heavy candidate by properties", () => {
     const relevant = sectionFixture({
       document: "Chapter09.pdf",
@@ -278,7 +386,7 @@ describe("qaAnswerFormatter", () => {
     expect(selectedRelevance.matchedAttributes.length).toBeGreaterThan(0);
     expect(selection.ranked[0].document).not.toBe("Chapter44.pdf");
     expect(answer.finalHsCodes).toContain(selection.ranked[0].hsCode);
-    expect(answer.answer).toContain("Chapter09.pdf");
+    expect(answer.answer).not.toContain("Chapter09.pdf");
   });
 
   it("penalizes contrast-only candidates and promotes positive attribute evidence", () => {
@@ -348,7 +456,7 @@ describe("qaAnswerFormatter", () => {
 
     expect(selection.ranked[0].title).toBe("OXEN");
     expect(result.answer).toContain("HS Code: 0102.29.11");
-    expect(result.answer).toContain("Chapter01.pdf");
+    expect(result.answer).not.toContain("Chapter01.pdf");
   });
 
   it("rejects an irrelevant primary result and promotes a relevant secondary result", () => {
