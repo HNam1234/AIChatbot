@@ -422,6 +422,10 @@ export function createApiRouter(): express.Router {
         ...stringListValue(req.body.docIds),
         ...splitDocIds(stringValue(req.body.docId))
       ]);
+      const requestedCachedTreeDocuments = uniqueStrings([
+        ...stringListValue(req.body.cachedTreeDocuments),
+        ...splitDocIds(stringValue(req.body.cachedTreeDocument))
+      ]);
       const cachedDocIds =
         stringValue(req.body.scope) === "all"
           ? (await listCachedTreeDocuments())
@@ -436,6 +440,7 @@ export function createApiRouter(): express.Router {
       serverTrace("routes.ask", "request accepted", {
         scope: stringValue(req.body.scope) ?? "selected",
         requestedDocIds: requestedDocIds.length,
+        requestedCachedTreeDocuments: requestedCachedTreeDocuments.length,
         cachedDocIds: cachedDocIds.length,
         overrideGeminiKeys: requestGeminiApiKeys.length
       });
@@ -446,6 +451,21 @@ export function createApiRouter(): express.Router {
           debug: booleanValue(req.body.debug)
         });
         serverTrace("routes.ask", "cached-tree answer sent", { elapsedMs: Date.now() - startedAt });
+        res.json(cachedAnswer);
+        return;
+      }
+
+      if (requestScope === "cached-tree-selected") {
+        if (requestedCachedTreeDocuments.length === 0) {
+          res.status(400).json({ error: "No cached tree document was selected." });
+          return;
+        }
+        const cachedAnswer = await answerFromCachedTrees(question, {
+          geminiApiKeys: requestGeminiApiKeys,
+          debug: booleanValue(req.body.debug),
+          cachedTreeDocuments: requestedCachedTreeDocuments
+        });
+        serverTrace("routes.ask", "selected cached-tree answer sent", { elapsedMs: Date.now() - startedAt });
         res.json(cachedAnswer);
         return;
       }
@@ -966,14 +986,23 @@ async function listCachedTreeDocuments(): Promise<CachedTreeDocument[]> {
 
 async function answerFromCachedTrees(
   question: string,
-  options: { geminiApiKeys?: string[]; debug?: boolean; localSectionDocuments?: string[] } = {}
+  options: { geminiApiKeys?: string[]; debug?: boolean; cachedTreeDocuments?: string[]; localSectionDocuments?: string[] } = {}
 ): Promise<Record<string, unknown>> {
   const startedAt = Date.now();
+  const selectedCachedTreeDocuments = uniqueStrings(options.cachedTreeDocuments ?? []);
+  const localSectionDocuments = uniqueStrings(options.localSectionDocuments ?? []);
   serverTrace("answerFromCachedTrees", "started", {
-    overrideGeminiKeys: options.geminiApiKeys?.length ?? 0
+    overrideGeminiKeys: options.geminiApiKeys?.length ?? 0,
+    selectedCachedTreeDocuments: selectedCachedTreeDocuments.length,
+    localSectionDocuments: localSectionDocuments.length
   });
-  const forceLocalSections = (options.localSectionDocuments?.length ?? 0) > 0;
-  const documents = forceLocalSections ? [] : await listCachedTreeDocuments();
+  const forceLocalSections = localSectionDocuments.length > 0 && selectedCachedTreeDocuments.length === 0;
+  const cachedDocuments = forceLocalSections ? [] : await listCachedTreeDocuments();
+  const selectedCachedTreeSet = new Set(selectedCachedTreeDocuments);
+  const documents = selectedCachedTreeSet.size > 0
+    ? cachedDocuments.filter((document) => selectedCachedTreeSet.has(document.document))
+    : cachedDocuments;
+  const localFallbackDocuments = localSectionDocuments.length > 0 ? localSectionDocuments : selectedCachedTreeDocuments;
   serverTrace("answerFromCachedTrees", "cached tree documents loaded", {
     documentCount: documents.length,
     elapsedMs: Date.now() - startedAt
@@ -987,7 +1016,7 @@ async function answerFromCachedTrees(
   const searchStartedAt = Date.now();
   const retrieval = documents.length > 0
     ? await searchCachedTreeDocuments(question, documents)
-    : await searchLocalSectionsOnly(question, options.localSectionDocuments);
+    : await searchLocalSectionsOnly(question, localFallbackDocuments);
   const hits = retrieval.hits;
   const debugReport = createQaDebugReport(question, retrieval);
   serverTrace("answerFromCachedTrees", "cached tree search completed", {

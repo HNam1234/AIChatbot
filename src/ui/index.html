@@ -3,219 +3,246 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>HSCode PDF Pipeline</title>
+    <title>PageIndex HSCode Notebook</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="shell">
-      <header class="app-header">
-        <div>
-          <span class="eyebrow">Local HSCode Workbench</span>
-          <h1>HSCode PDF Pipeline</h1>
-          <p>Parse PDFs, export real assets, validate sections, and inspect PageIndex tree outputs in one workspace.</p>
+    <main class="notebook-shell">
+      <header class="notebook-topbar">
+        <div class="brand-lockup">
+          <button id="back-to-setup" type="button" class="icon-button hidden" aria-label="Back to data setup">←</button>
+          <div class="brand-mark">PI</div>
+          <div>
+            <h1>PageIndex HSCode Notebook</h1>
+            <p id="screen-subtitle">Add PDFs, configure keys, then process sources before chatting.</p>
+          </div>
         </div>
-        <div class="header-metrics" aria-label="Pipeline capabilities">
-          <span>Parser</span>
-          <span>Assets</span>
-          <span>Tree</span>
-          <span>Q&A</span>
+        <div class="top-actions">
+          <button id="continue-to-chat" type="button" class="secondary" disabled>Continue to chat</button>
+          <button type="submit" form="pipeline-form" class="primary-action">Run Pipeline</button>
         </div>
       </header>
 
-      <section class="control-grid">
-        <section class="panel settings">
-          <div class="section-heading">
+      <section id="setup-screen" class="screen setup-screen">
+        <section class="notebook-pane setup-pane">
+          <div class="pane-heading">
             <div>
-              <span class="kicker">Keys</span>
-              <h2>API Settings</h2>
+              <span class="kicker">Step 1</span>
+              <h2>Prepare Data</h2>
             </div>
+            <strong id="job-status">Idle</strong>
           </div>
-          <div class="settings-grid">
-            <div class="field-group">
-              <label for="pageindex-key">PageIndex API Key</label>
-              <div class="settings-row">
-                <input id="pageindex-key" name="temporaryPageIndexApiKey" type="password" autocomplete="off" placeholder="sk-..." />
-                <button id="toggle-pageindex-key" type="button" class="secondary compact">Show</button>
-              </div>
-              <label class="check"><input id="temporary-pageindex-key" type="checkbox" checked /> Use only for this run</label>
-              <div class="actions">
-                <button id="save-pageindex-key" type="button" class="secondary">Save PageIndex Key</button>
-                <span id="pageindex-settings-status" class="muted">Loading...</span>
-              </div>
-            </div>
 
-            <div class="field-group">
-              <label>Gemini Round-Robin API Keys</label>
-              <div class="gemini-key-list">
-                <div class="key-slot">
-                  <span>Slot 1</span>
-                  <input id="gemini-key-1" data-gemini-key-input data-slot="GEMINI_KEY_1" name="temporaryGeminiApiKey1" type="password" autocomplete="off" placeholder="AIza..." />
-                  <label class="key-enabled"><input data-gemini-key-enabled data-slot="GEMINI_KEY_1" type="checkbox" checked /> Use</label>
-                  <button data-toggle-gemini-key data-target="gemini-key-1" type="button" class="secondary compact">Show</button>
-                  <button data-save-gemini-key data-target="gemini-key-1" data-slot="GEMINI_KEY_1" type="button" class="secondary compact">Save</button>
-                </div>
-                <div class="key-slot">
-                  <span>Slot 2</span>
-                  <input id="gemini-key-2" data-gemini-key-input data-slot="GEMINI_KEY_2" name="temporaryGeminiApiKey2" type="password" autocomplete="off" placeholder="AIza..." />
-                  <label class="key-enabled"><input data-gemini-key-enabled data-slot="GEMINI_KEY_2" type="checkbox" checked /> Use</label>
-                  <button data-toggle-gemini-key data-target="gemini-key-2" type="button" class="secondary compact">Show</button>
-                  <button data-save-gemini-key data-target="gemini-key-2" data-slot="GEMINI_KEY_2" type="button" class="secondary compact">Save</button>
-                </div>
-                <div class="key-slot">
-                  <span>Slot 3</span>
-                  <input id="gemini-key-3" data-gemini-key-input data-slot="GEMINI_KEY_3" name="temporaryGeminiApiKey3" type="password" autocomplete="off" placeholder="AIza..." />
-                  <label class="key-enabled"><input data-gemini-key-enabled data-slot="GEMINI_KEY_3" type="checkbox" checked /> Use</label>
-                  <button data-toggle-gemini-key data-target="gemini-key-3" type="button" class="secondary compact">Show</button>
-                  <button data-save-gemini-key data-target="gemini-key-3" data-slot="GEMINI_KEY_3" type="button" class="secondary compact">Save</button>
-                </div>
-              </div>
-              <label class="check"><input id="temporary-gemini-key" type="checkbox" checked /> Use typed keys only for this run</label>
-              <span id="gemini-settings-status" class="muted">Loading...</span>
-            </div>
-          </div>
-        </section>
-
-        <section class="panel run-panel">
-          <div class="section-heading">
-            <div>
-              <span class="kicker">Run</span>
-              <h2>Pipeline Input</h2>
-            </div>
-            <button type="submit" form="pipeline-form" class="primary-action">Run Pipeline</button>
-          </div>
-          <form id="pipeline-form">
-            <div class="form-grid">
-              <label class="file-picker">
-                <span>PDFs</span>
+          <div class="setup-grid">
+            <form id="pipeline-form" class="source-form">
+              <label class="file-picker source-add">
+                <span>+ Add PDFs</span>
                 <input id="pdf" name="files" type="file" accept="application/pdf,.pdf" multiple required />
               </label>
-              <label>
-                OCR language
-                <input name="ocrLanguage" type="text" value="vie+eng" />
-              </label>
-              <label>
-                Docling threads
-                <input name="doclingThreads" type="number" min="1" value="4" />
-              </label>
-            </div>
 
-            <div class="checks">
-              <label><input name="exportAssets" type="checkbox" checked /> Export image assets</label>
-              <label><input id="reuse-parsed-cache" name="reuseParsedCache" type="checkbox" checked /> Reuse parsed cache</label>
-              <label><input id="reuse-pageindex-cache" name="reuseCachedPageIndexTree" type="checkbox" checked /> Reuse cached PageIndex tree</label>
-              <label><input id="force-reparse" name="forceReparse" type="checkbox" /> Force reparse</label>
-              <label><input id="upload-pageindex" name="uploadPageIndex" type="checkbox" /> Upload to PageIndex if missing/stale</label>
-              <label><input id="force-pageindex-upload" name="forcePageIndexUpload" type="checkbox" /> Force PageIndex re-upload</label>
-              <label><input name="sequential" type="checkbox" checked disabled /> Run files sequentially</label>
-              <label><input name="failFast" type="checkbox" /> Stop on first failure</label>
+              <div class="source-settings-row">
+                <label>
+                  OCR language
+                  <input name="ocrLanguage" type="text" value="vie+eng" />
+                </label>
+                <label>
+                  Threads
+                  <input name="doclingThreads" type="number" min="1" value="4" />
+                </label>
+              </div>
+
+              <div class="source-options">
+                <label><input name="exportAssets" type="checkbox" checked /> Export image assets</label>
+                <label><input id="reuse-parsed-cache" name="reuseParsedCache" type="checkbox" checked /> Reuse parsed cache</label>
+                <label><input id="reuse-pageindex-cache" name="reuseCachedPageIndexTree" type="checkbox" checked /> Reuse cached PageIndex tree</label>
+                <label><input id="force-reparse" name="forceReparse" type="checkbox" /> Force reparse</label>
+                <label><input id="upload-pageindex" name="uploadPageIndex" type="checkbox" /> Upload to PageIndex if missing/stale</label>
+                <label><input id="force-pageindex-upload" name="forcePageIndexUpload" type="checkbox" /> Force PageIndex re-upload</label>
+                <label><input name="sequential" type="checkbox" checked disabled /> Run files sequentially</label>
+                <label><input name="failFast" type="checkbox" /> Stop on first failure</label>
+              </div>
+
+              <div id="pageindex-warning" class="warning hidden">PageIndex key is required only when no reusable tree exists.</div>
+              <div id="cache-status-summary" class="cache-summary muted">Select PDFs to inspect cache status.</div>
+            </form>
+
+            <section class="source-block api-setup-block">
+              <div class="block-heading">
+                <span>API keys & settings</span>
+                <small>saved or temporary</small>
+              </div>
+              <div class="settings-grid">
+                <div class="field-group">
+                  <label for="pageindex-key">PageIndex API Key</label>
+                  <div class="settings-row">
+                    <input id="pageindex-key" name="temporaryPageIndexApiKey" type="password" autocomplete="off" placeholder="sk-..." />
+                    <button id="toggle-pageindex-key" type="button" class="secondary compact">Show</button>
+                  </div>
+                  <label class="check"><input id="temporary-pageindex-key" type="checkbox" checked /> Use only for this run</label>
+                  <div class="actions">
+                    <button id="save-pageindex-key" type="button" class="secondary">Save PageIndex Key</button>
+                    <span id="pageindex-settings-status" class="muted">Loading...</span>
+                  </div>
+                </div>
+
+                <div class="field-group">
+                  <label>Gemini Round-Robin API Keys</label>
+                  <div class="gemini-key-list">
+                    <div class="key-slot">
+                      <span>Slot 1</span>
+                      <input id="gemini-key-1" data-gemini-key-input data-slot="GEMINI_KEY_1" name="temporaryGeminiApiKey1" type="password" autocomplete="off" placeholder="AIza..." />
+                      <label class="key-enabled"><input data-gemini-key-enabled data-slot="GEMINI_KEY_1" type="checkbox" checked /> Use</label>
+                      <button data-toggle-gemini-key data-target="gemini-key-1" type="button" class="secondary compact">Show</button>
+                      <button data-save-gemini-key data-target="gemini-key-1" data-slot="GEMINI_KEY_1" type="button" class="secondary compact">Save</button>
+                    </div>
+                    <div class="key-slot">
+                      <span>Slot 2</span>
+                      <input id="gemini-key-2" data-gemini-key-input data-slot="GEMINI_KEY_2" name="temporaryGeminiApiKey2" type="password" autocomplete="off" placeholder="AIza..." />
+                      <label class="key-enabled"><input data-gemini-key-enabled data-slot="GEMINI_KEY_2" type="checkbox" checked /> Use</label>
+                      <button data-toggle-gemini-key data-target="gemini-key-2" type="button" class="secondary compact">Show</button>
+                      <button data-save-gemini-key data-target="gemini-key-2" data-slot="GEMINI_KEY_2" type="button" class="secondary compact">Save</button>
+                    </div>
+                    <div class="key-slot">
+                      <span>Slot 3</span>
+                      <input id="gemini-key-3" data-gemini-key-input data-slot="GEMINI_KEY_3" name="temporaryGeminiApiKey3" type="password" autocomplete="off" placeholder="AIza..." />
+                      <label class="key-enabled"><input data-gemini-key-enabled data-slot="GEMINI_KEY_3" type="checkbox" checked /> Use</label>
+                      <button data-toggle-gemini-key data-target="gemini-key-3" type="button" class="secondary compact">Show</button>
+                      <button data-save-gemini-key data-target="gemini-key-3" data-slot="GEMINI_KEY_3" type="button" class="secondary compact">Save</button>
+                    </div>
+                  </div>
+                  <label class="check"><input id="temporary-gemini-key" type="checkbox" checked /> Use typed keys only for this run</label>
+                  <span id="gemini-settings-status" class="muted">Loading...</span>
+                </div>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="notebook-pane setup-pane setup-status-pane">
+          <div class="pane-heading">
+            <div>
+              <span class="kicker">Step 2</span>
+              <h2>Process & Verify Sources</h2>
             </div>
-            <div id="pageindex-warning" class="warning hidden">PageIndex key is only required when no cached tree exists or cache reuse is disabled.</div>
-            <div id="cache-status-summary" class="cache-summary muted">Select PDFs to inspect cache status.</div>
-            <div id="selected-files" class="selected-files muted">No files selected.</div>
-          </form>
+          </div>
+
+          <div class="setup-grid status-columns">
+            <section class="source-block">
+              <div class="block-heading">
+                <span>Selected inputs</span>
+                <small id="current-file">n/a</small>
+              </div>
+              <div id="selected-files" class="selected-files muted">No files selected.</div>
+            </section>
+
+            <section class="source-block run-status-block">
+              <div class="status-grid">
+                <div><span>Step</span><strong id="current-step">n/a</strong></div>
+                <div><span>Elapsed</span><strong id="elapsed">0s</strong></div>
+              </div>
+              <div class="progress">
+                <div id="progress-fill"></div>
+              </div>
+              <div id="progress-text" class="progress-text">0% - waiting</div>
+            </section>
+          </div>
+
+          <section class="source-block parsed-source-block">
+            <div class="block-heading">
+              <span>Processed documents</span>
+              <small>available for chat</small>
+            </div>
+            <div id="batch-table" class="source-results muted">No documents yet.</div>
+          </section>
+
+          <details class="drawer">
+            <summary>Runtime logs</summary>
+            <pre id="logs" class="logs"></pre>
+          </details>
         </section>
       </section>
 
-      <section class="panel status-card">
-        <div class="status-grid">
-          <div><span>Pipeline status</span><strong id="job-status">Idle</strong></div>
-          <div><span>Current file</span><strong id="current-file">n/a</strong></div>
-          <div><span>Current step</span><strong id="current-step">n/a</strong></div>
-          <div><span>Elapsed</span><strong id="elapsed">0s</strong></div>
-        </div>
-        <div class="progress">
-          <div id="progress-fill"></div>
-        </div>
-        <div id="progress-text" class="progress-text">0% - waiting</div>
-      </section>
+      <section id="chat-screen" class="screen chat-screen hidden">
+        <section class="notebook-grid">
+          <aside class="notebook-pane query-source-pane" aria-label="Query sources">
+            <div class="pane-heading">
+              <div>
+                <span class="kicker">Sources</span>
+                <h2>Choose Query Inputs</h2>
+              </div>
+            </div>
+            <label class="check qa-all-docs"><input id="question-all-docs" type="checkbox" checked /> Use checked sources</label>
+            <div id="query-source-list" class="query-source-list muted">No processed sources yet.</div>
+            <label class="check"><input id="question-debug" type="checkbox" /> Debug retrieval</label>
+            <label>
+              Manual doc_id override
+              <input id="question-doc-id" type="text" placeholder="Optional doc_id list" />
+            </label>
+            <span id="question-doc-scope" class="query-scope-note muted">No source selected.</span>
+          </aside>
 
-      <section class="workspace">
-        <section class="panel pdf-panel">
-          <div class="section-heading">
-            <div>
-              <span class="kicker">Source</span>
-              <h2>PDF Preview</h2>
+          <section class="notebook-pane chat-pane" aria-label="Chat">
+            <div class="pane-heading chat-heading">
+              <div>
+                <span class="kicker">Chat</span>
+                <h2>Ask Your Parsed Documents</h2>
+              </div>
             </div>
-            <div class="page-controls">
-              <button id="prev-page" type="button" class="secondary">Prev</button>
-              <input id="page-number" type="number" min="1" value="1" />
-              <button id="next-page" type="button" class="secondary">Next</button>
+
+            <div id="answer" class="chat-thread muted">
+              Ask a question about the selected documents.
             </div>
-          </div>
-          <iframe id="pdf-frame" title="PDF preview"></iframe>
-          <a id="open-page" class="muted" href="#" target="_blank" rel="noreferrer">Open PDF page in new tab</a>
+
+            <div class="chat-composer">
+              <input id="question" type="text" placeholder="Ask about selected HSCode sources." />
+              <button id="ask" type="button">➜</button>
+            </div>
+          </section>
+
+          <aside class="notebook-pane studio-pane" aria-label="Notebook Studio">
+            <section class="artifact-section pdf-panel">
+              <div class="pane-heading compact-heading">
+                <div>
+                  <span class="kicker">Preview</span>
+                  <h2>PDF</h2>
+                </div>
+                <div class="page-controls">
+                  <button id="prev-page" type="button" class="secondary">Prev</button>
+                  <input id="page-number" type="number" min="1" value="1" />
+                  <button id="next-page" type="button" class="secondary">Next</button>
+                </div>
+              </div>
+              <iframe id="pdf-frame" title="PDF preview"></iframe>
+              <a id="open-page" class="muted" href="#" target="_blank" rel="noreferrer">Open PDF page in new tab</a>
+            </section>
+
+            <section class="artifact-section result-panel">
+              <div class="pane-heading compact-heading">
+                <div>
+                  <span class="kicker">Artifacts</span>
+                  <h2>Parsed Output</h2>
+                </div>
+              </div>
+              <div class="tabs" role="tablist">
+                <button type="button" class="tab active" data-tab="markdown">Markdown</button>
+                <button type="button" class="tab" data-tab="rendered">Rendered</button>
+                <button type="button" class="tab" data-tab="sections">Sections</button>
+                <button type="button" class="tab" data-tab="tree">Tree</button>
+                <button type="button" class="tab" data-tab="validation">Validation</button>
+                <button type="button" class="tab" data-tab="assets">Assets</button>
+              </div>
+              <div id="tab-markdown" class="tab-panel"><pre id="markdown" class="markdown muted">No Markdown yet.</pre></div>
+              <div id="tab-rendered" class="tab-panel hidden"><article id="rendered" class="rendered muted">No rendered preview yet.</article></div>
+              <div id="tab-sections" class="tab-panel hidden">
+                <div id="section-detail" class="section-detail muted">Select a section to inspect page mapping.</div>
+                <div id="sections" class="table-wrap muted">No sections yet.</div>
+              </div>
+              <div id="tab-tree" class="tab-panel hidden"><div id="tree" class="tree muted">No tree JSON yet.</div></div>
+              <div id="tab-validation" class="tab-panel hidden"><div id="markers" class="markers muted">No markers yet.</div></div>
+              <div id="tab-assets" class="tab-panel hidden"><div id="images" class="images muted">No images yet.</div></div>
+            </section>
+          </aside>
         </section>
-
-        <section class="panel result-panel">
-          <div class="section-heading results-heading">
-            <div>
-              <span class="kicker">Output</span>
-              <h2>Parsed Artifacts</h2>
-            </div>
-          </div>
-          <div class="tabs" role="tablist">
-            <button type="button" class="tab active" data-tab="markdown">Markdown</button>
-            <button type="button" class="tab" data-tab="rendered">Rendered</button>
-            <button type="button" class="tab" data-tab="sections">Sections</button>
-            <button type="button" class="tab" data-tab="tree">Tree JSON</button>
-            <button type="button" class="tab" data-tab="validation">Validation</button>
-            <button type="button" class="tab" data-tab="assets">Assets</button>
-          </div>
-          <div id="tab-markdown" class="tab-panel"><pre id="markdown" class="markdown muted">No Markdown yet.</pre></div>
-          <div id="tab-rendered" class="tab-panel hidden"><article id="rendered" class="rendered muted">No rendered preview yet.</article></div>
-          <div id="tab-sections" class="tab-panel hidden">
-            <div id="section-detail" class="section-detail muted">Select a section to inspect page mapping.</div>
-            <div id="sections" class="table-wrap muted">No sections yet.</div>
-          </div>
-          <div id="tab-tree" class="tab-panel hidden"><div id="tree" class="tree muted">No tree JSON yet.</div></div>
-          <div id="tab-validation" class="tab-panel hidden"><div id="markers" class="markers muted">No markers yet.</div></div>
-          <div id="tab-assets" class="tab-panel hidden"><div id="images" class="images muted">No images yet.</div></div>
-        </section>
-      </section>
-
-      <section class="bottom-grid">
-        <section class="panel">
-          <div class="section-heading">
-            <div>
-              <span class="kicker">Batch</span>
-              <h2>Document Results</h2>
-            </div>
-          </div>
-          <div id="batch-table" class="table-wrap muted">No documents yet.</div>
-        </section>
-
-        <section class="panel">
-          <div class="section-heading">
-            <div>
-              <span class="kicker">Runtime</span>
-              <h2>Logs</h2>
-            </div>
-          </div>
-          <pre id="logs" class="logs"></pre>
-        </section>
-      </section>
-
-      <section class="panel">
-        <div class="section-heading">
-          <div>
-            <span class="kicker">Milestone 3/4</span>
-            <h2>Agent Console</h2>
-          </div>
-        </div>
-        <div class="qa-scope">
-          <label class="check qa-all-docs"><input id="question-all-docs" type="checkbox" checked /> Ask across all cached PageIndex PDFs</label>
-          <label class="check"><input id="question-debug" type="checkbox" /> Debug retrieval</label>
-          <label>
-            Manual doc_id override
-            <input id="question-doc-id" type="text" placeholder="Optional: paste one or more doc_id values separated by commas" />
-          </label>
-          <span id="question-doc-scope" class="muted">Loading indexed documents...</span>
-        </div>
-        <div class="qa">
-          <input id="question" type="text" placeholder="Ask about an indexed HSCode document." />
-          <button id="ask" type="button">Ask</button>
-        </div>
-        <div id="answer" class="muted"></div>
       </section>
     </main>
 

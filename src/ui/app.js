@@ -47,6 +47,12 @@ const runButton = document.querySelector("[form='pipeline-form'][type='submit']"
 const reuseParsedCacheInput = document.querySelector("#reuse-parsed-cache");
 const forceReparseInput = document.querySelector("#force-reparse");
 const forcePageIndexUploadInput = document.querySelector("#force-pageindex-upload");
+const setupScreen = document.querySelector("#setup-screen");
+const chatScreen = document.querySelector("#chat-screen");
+const backToSetupButton = document.querySelector("#back-to-setup");
+const continueToChatButton = document.querySelector("#continue-to-chat");
+const querySourceListEl = document.querySelector("#query-source-list");
+const screenSubtitleEl = document.querySelector("#screen-subtitle");
 
 let activeJobId = null;
 let pollTimer = null;
@@ -57,6 +63,8 @@ let currentPdfUrl = "";
 let currentPage = 1;
 let clientLogs = [];
 let selectedCacheRows = [];
+let availableSources = [];
+let selectedSourceKeys = new Set();
 let cacheStatusRequestId = 0;
 let uploadInProgress = false;
 let settings = {
@@ -73,6 +81,7 @@ let settings = {
 
 void loadSettings();
 void loadIndexedDocuments();
+showSetupScreen();
 
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => activateTab(tab.dataset.tab));
@@ -87,6 +96,12 @@ reusePageIndexCacheInput.addEventListener("change", updatePageIndexWarning);
 reuseParsedCacheInput.addEventListener("change", updatePageIndexWarning);
 forceReparseInput.addEventListener("change", updatePageIndexWarning);
 forcePageIndexUploadInput.addEventListener("change", updatePageIndexWarning);
+backToSetupButton.addEventListener("click", showSetupScreen);
+continueToChatButton.addEventListener("click", () => {
+  if (hasProcessedSources()) {
+    showChatScreen();
+  }
+});
 questionAllDocsInput.addEventListener("change", updateAgentScope);
 questionDocIdInput.addEventListener("input", updateAgentScope);
 prevPageButton.addEventListener("click", () => setPdfPage(Math.max(1, currentPage - 1)));
@@ -255,33 +270,66 @@ form.addEventListener("submit", async (event) => {
 askButton.addEventListener("click", async () => {
   const question = questionInput.value.trim();
   const manualDocIds = parseDocIds(questionDocIdInput.value);
-  const selectedDocIds = selectedBundle?.pageIndexDocId ? [selectedBundle.pageIndexDocId] : [];
-  const allCachedDocIds = indexedDocuments.map((document) => document.docId).filter(Boolean);
+  const checkedSources = selectedQuerySources();
+  const checkedDocuments = uniqueStrings(checkedSources.map((source) => source.document).filter(Boolean));
+  const checkedTreeDocuments = uniqueStrings(checkedSources.filter(sourceHasCachedTree).map((source) => source.document).filter(Boolean));
+  const checkedLocalDocuments = uniqueStrings(checkedSources.filter((source) => !sourceHasCachedTree(source)).map((source) => source.document).filter(Boolean));
+  const selectedTreeDocument = selectedBundle?.document && selectedBundle.hasTree ? [selectedBundle.document] : [];
+  const selectedLocalDocument = selectedBundle?.document && !selectedBundle.hasTree ? [selectedBundle.document] : [];
+  const selectedDocIds = !selectedBundle?.hasTree && selectedBundle?.pageIndexDocId ? [selectedBundle.pageIndexDocId] : [];
   const docIds = questionAllDocsInput.checked
-    ? uniqueStrings([...allCachedDocIds, ...manualDocIds])
+    ? uniqueStrings([...manualDocIds])
     : uniqueStrings([...manualDocIds, ...selectedDocIds]);
   if (!question) {
-    answerEl.className = "warning";
+    answerEl.className = "chat-thread warning";
     answerEl.textContent = "Enter a question first.";
     return;
   }
+  const canUseSelectedCachedTree = Boolean(selectedBundle?.document && selectedBundle.hasTree);
   const canUseSelectedLocalSections = Boolean(selectedBundle?.document && Array.isArray(selectedBundle.sections) && selectedBundle.sections.length > 0);
-  if (docIds.length === 0 && !questionAllDocsInput.checked && !canUseSelectedLocalSections) {
-    answerEl.className = "warning";
-    answerEl.textContent = "No PageIndex docs are available. Run Upload to PageIndex once, keep cached tree files, or paste doc_id manually.";
+  const canUseCheckedLocalSections = questionAllDocsInput.checked && checkedLocalDocuments.length > 0;
+  if (questionAllDocsInput.checked && checkedSources.length === 0 && manualDocIds.length === 0) {
+    answerEl.className = "chat-thread warning";
+    answerEl.textContent = "Select at least one processed source before asking.";
     return;
   }
-  answerEl.className = "muted";
-  answerEl.textContent = questionAllDocsInput.checked
-    ? `Searching cached tree JSON across ${indexedDocuments.length} PDF(s)...`
+  if (docIds.length === 0 && !canUseCheckedLocalSections && !questionAllDocsInput.checked && !canUseSelectedCachedTree && !canUseSelectedLocalSections) {
+    answerEl.className = "chat-thread warning";
+    answerEl.textContent = "No source is available. Add PDFs and run the pipeline before chatting.";
+    return;
+  }
+  const mixedCheckedSources = questionAllDocsInput.checked && checkedTreeDocuments.length > 0 && checkedLocalDocuments.length > 0;
+  const cachedTreeDocuments = questionAllDocsInput.checked
+    ? mixedCheckedSources
+      ? []
+      : checkedTreeDocuments
+    : selectedTreeDocument;
+  const localSectionDocuments = questionAllDocsInput.checked
+    ? mixedCheckedSources
+      ? checkedDocuments
+      : checkedLocalDocuments
+    : selectedLocalDocument;
+  const selectedScope = cachedTreeDocuments.length > 0
+    ? "cached-tree-selected"
+    : localSectionDocuments.length > 0
+      ? "local-sections"
+      : docIds.length > 0
+        ? "selected"
+        : "local-sections";
+  answerEl.className = "chat-thread muted";
+  answerEl.textContent = selectedScope === "cached-tree-selected"
+    ? `Searching cached tree JSON for ${cachedTreeDocuments.length} selected source(s)...`
+    : selectedScope === "local-sections"
+      ? `Searching local sections for ${localSectionDocuments.length} selected source(s)...`
     : docIds.length > 0
       ? `Asking PageIndex Chat across ${docIds.length} document(s)...`
       : `Searching local sections for ${selectedBundle.document}...`;
   const body = {
     question,
     docIds,
-    scope: questionAllDocsInput.checked ? "all" : docIds.length > 0 ? "selected" : "local-sections",
-    document: selectedBundle?.document,
+    scope: selectedScope,
+    cachedTreeDocuments,
+    document: localSectionDocuments.join(","),
     debug: Boolean(questionDebugInput?.checked)
   };
   if (temporaryPageIndexKeyInput.checked && pageIndexKeyInput.value.trim()) {
@@ -298,18 +346,16 @@ askButton.addEventListener("click", async () => {
   });
   const payload = await response.json();
   if (!response.ok) {
-    answerEl.className = "warning";
+    answerEl.className = "chat-thread warning";
     answerEl.textContent = payload.error || "Could not get answer.";
     return;
   }
-  answerEl.className = "";
+  answerEl.className = "chat-thread";
   const marker = payload.validation?.markers?.[0];
-  const answerScope = payload.mode === "cached-tree"
-    ? `Scope: cached tree JSON (${(payload.documents || []).length} source PDF(s))`
-    : payload.mode === "local-sections"
-      ? `Scope: local sections (${(payload.documents || []).length} source PDF(s))`
-      : `Scope: ${(payload.docIds || docIds).length} PageIndex document(s)`;
   const indexSource = payload.indexSource || selectedIndexSource();
+  const answerScope = indexSource?.source === "pageindex-chat"
+    ? `Scope: ${(payload.docIds || docIds).length} PageIndex document(s)`
+    : `Index source: ${formatIndexSource(indexSource, payload.retrieval)}`;
   const retrievalStatus = renderRetrievalStatus(payload.retrieval, indexSource);
   const citationCards = renderCitationCards(payload.citations || []);
   const debugPanel = questionDebugInput?.checked ? renderDebugPanel(payload.debug) : "";
@@ -365,6 +411,9 @@ async function loadResult() {
   const firstDocument = payload.selectedDocument || payload.outputs?.selectedDocument;
   if (firstDocument) {
     await loadDocument(firstDocument);
+  }
+  if (hasProcessedSources()) {
+    showChatScreen();
   }
 }
 
@@ -456,6 +505,15 @@ function renderBatchStatus(files) {
 
 function renderBatchOutputs(outputs) {
   if (outputs.length === 0) return;
+  mergeAvailableSources(outputs.map((output) => ({
+    document: output.document,
+    docId: output.pageIndexDocId,
+    treePath: output.paths?.tree || "",
+    pageIndexCacheStatus: output.pageIndexCacheStatus || output.pageIndexCacheStatusAfter || output.pageIndex || "skipped",
+    parseCacheStatus: output.parseCacheStatus || output.parseCacheStatusAfter || output.status,
+    treeStatus: output.treeStatus || (output.hasTree ? "cached" : "missing"),
+    sectionCount: output.hsSections ?? output.hsSectionCount ?? 0
+  })));
   mergeIndexedDocuments(outputs
     .filter((output) => output.pageIndexDocId)
     .map((output) => ({
@@ -477,39 +535,35 @@ function renderBatchOutputs(outputs) {
     error: output.error || ""
   })), false);
 
-  batchTableEl.querySelectorAll("tr[data-document]").forEach((row) => {
+  batchTableEl.querySelectorAll("[data-document]").forEach((row) => {
     row.addEventListener("click", () => loadDocument(row.dataset.document));
   });
 }
 
 function batchTableMarkup(rows, live) {
   return `
-    <table>
-      <thead>
-        <tr>
-          <th>Document</th><th>Parse Cache</th><th>PageIndex Cache</th><th>Assets</th>
-          <th>Sections</th><th>Tree</th><th>Action</th><th>Error</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rows.map((row) => `
-          <tr data-document="${escapeHtml(row.document)}" class="${selectedDocument === row.document ? "selected" : ""}">
-            <td>
-              <strong>${escapeHtml(row.document)}</strong>
-              <div class="mini-progress"><span style="width:${Number(row.progressPercent || 0)}%"></span></div>
-            </td>
-            <td>${statusChip(row.parseCache || row.status)}</td>
-            <td>${statusChip(row.pageIndexCache || "n/a")}</td>
-            <td>${plainOrChip(row.assets)}</td>
-            <td>${plainOrChip(row.sections)}</td>
-            <td>${plainOrChip(row.tree)}</td>
-            <td>${escapeHtml(row.action)}</td>
-            <td class="error-cell">${escapeHtml(row.error)}</td>
-          </tr>
-        `).join("")}
-      </tbody>
-    </table>
-    ${live ? "<p class=\"muted\">Rows become clickable when results are available.</p>" : ""}
+    <div class="source-list ${live ? "live" : ""}">
+      ${rows.map((row) => `
+        <article data-document="${escapeHtml(row.document)}" class="source-card ${selectedDocument === row.document ? "selected" : ""}">
+          <div class="source-title">
+            <strong>${escapeHtml(row.document)}</strong>
+            ${statusChip(row.status || row.parseCache || "waiting")}
+          </div>
+          <div class="mini-progress"><span style="width:${Number(row.progressPercent || 0)}%"></span></div>
+          <div class="source-chips">
+            <span class="chip-group">Parse ${statusChip(row.parseCache || row.status || "n/a")}</span>
+            <span class="chip-group">Index ${statusChip(row.pageIndexCache || "n/a")}</span>
+            ${row.tree ? `<span class="chip-group">Tree ${statusChip(row.tree)}</span>` : ""}
+          </div>
+          <div class="source-meta">
+            <span>Assets ${escapeHtml(row.assets ?? "")}</span>
+            <span>Sections ${escapeHtml(row.sections ?? "")}</span>
+          </div>
+          ${row.action ? `<div class="source-action">${escapeHtml(row.action)}</div>` : ""}
+          ${row.error ? `<div class="error-cell">${escapeHtml(row.error)}</div>` : ""}
+        </article>
+      `).join("")}
+    </div>
   `;
 }
 
@@ -753,6 +807,8 @@ function activateTab(tabName) {
 function resetResult() {
   logsEl.textContent = "";
   clientLogs = [];
+  answerEl.className = "chat-thread muted";
+  answerEl.textContent = "Ask a question about the selected document, all cached trees, or local sections.";
   markdownEl.textContent = "No Markdown yet.";
   markdownEl.className = "markdown muted";
   renderedEl.textContent = "No rendered preview yet.";
@@ -983,6 +1039,123 @@ async function hashFile(file) {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function showSetupScreen() {
+  setupScreen?.classList.remove("hidden");
+  chatScreen?.classList.add("hidden");
+  backToSetupButton?.classList.add("hidden");
+  runButton?.classList.remove("hidden");
+  continueToChatButton?.classList.remove("hidden");
+  if (screenSubtitleEl) screenSubtitleEl.textContent = "Add PDFs, configure keys, then process sources before chatting.";
+  updateChatGate();
+}
+
+function showChatScreen() {
+  if (!hasProcessedSources()) {
+    showSetupScreen();
+    return;
+  }
+  setupScreen?.classList.add("hidden");
+  chatScreen?.classList.remove("hidden");
+  backToSetupButton?.classList.remove("hidden");
+  runButton?.classList.add("hidden");
+  continueToChatButton?.classList.add("hidden");
+  if (screenSubtitleEl) screenSubtitleEl.textContent = "Ask across selected parsed sources. Use the back arrow to edit the dataset.";
+  renderQuerySourceList();
+  updateAgentScope();
+}
+
+function hasProcessedSources() {
+  return availableSources.length > 0 || indexedDocuments.length > 0;
+}
+
+function updateChatGate() {
+  const ready = hasProcessedSources();
+  if (continueToChatButton) {
+    continueToChatButton.disabled = !ready;
+    continueToChatButton.textContent = ready ? "Continue to chat" : "Process data first";
+  }
+  if (askButton) {
+    askButton.disabled = !ready;
+  }
+  renderQuerySourceList();
+}
+
+function mergeAvailableSources(sources) {
+  const byKey = new Map(availableSources.map((source) => [sourceKey(source), source]));
+  for (const source of sources) {
+    if (!source?.document) continue;
+    const normalized = {
+      document: source.document,
+      docId: source.docId || null,
+      treePath: source.treePath || "",
+      pageIndexCacheStatus: source.pageIndexCacheStatus || "missing",
+      parseCacheStatus: source.parseCacheStatus || "fresh",
+      treeStatus: source.treeStatus || (source.treePath ? "cached" : "missing"),
+      sectionCount: Number(source.sectionCount || source.hsSectionCount || source.sections || 0)
+    };
+    const key = sourceKey(normalized);
+    byKey.set(key, { ...(byKey.get(key) || {}), ...normalized });
+    if (!selectedSourceKeys.has(key)) {
+      selectedSourceKeys.add(key);
+    }
+  }
+  availableSources = [...byKey.values()]
+    .sort((left, right) => String(left.document).localeCompare(String(right.document)));
+  renderQuerySourceList();
+  updateChatGate();
+}
+
+function sourceKey(source) {
+  return source.docId ? `doc:${source.docId}` : `local:${source.document}`;
+}
+
+function sourceHasCachedTree(source) {
+  const status = String(source?.pageIndexCacheStatus || source?.treeStatus || "").toLowerCase();
+  return Boolean(source?.treePath || source?.docId || ["fresh", "cached", "stale"].includes(status));
+}
+
+function selectedQuerySources() {
+  return availableSources.filter((source) => selectedSourceKeys.has(sourceKey(source)));
+}
+
+function renderQuerySourceList() {
+  if (!querySourceListEl) return;
+  if (availableSources.length === 0) {
+    querySourceListEl.className = "query-source-list muted";
+    querySourceListEl.textContent = "No processed sources yet.";
+    return;
+  }
+
+  querySourceListEl.className = "query-source-list";
+  querySourceListEl.innerHTML = availableSources.map((source) => {
+    const key = sourceKey(source);
+    const selected = selectedSourceKeys.has(key);
+    return `
+      <label class="query-source-card ${selected ? "selected" : ""}" data-source-key="${escapeHtml(key)}">
+        <input type="checkbox" data-source-checkbox="${escapeHtml(key)}" ${selected ? "checked" : ""} />
+        <span>
+          <strong>${escapeHtml(source.document)}</strong>
+          <small>${escapeHtml(source.docId ? "PageIndex tree" : "Local sections")} · ${escapeHtml(source.sectionCount || 0)} sections</small>
+        </span>
+        ${statusChip(source.pageIndexCacheStatus || source.treeStatus || "local")}
+      </label>
+    `;
+  }).join("");
+
+  querySourceListEl.querySelectorAll("[data-source-checkbox]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const key = input.dataset.sourceCheckbox;
+      if (input.checked) {
+        selectedSourceKeys.add(key);
+      } else {
+        selectedSourceKeys.delete(key);
+      }
+      renderQuerySourceList();
+      updateAgentScope();
+    });
+  });
+}
+
 function updateAgentScope(bundle) {
   if (Array.isArray(bundle)) {
     indexedDocuments = bundle;
@@ -990,10 +1163,12 @@ function updateAgentScope(bundle) {
 
   const manualDocIds = parseDocIds(questionDocIdInput.value);
   if (questionAllDocsInput.checked) {
-    const docIdCount = uniqueStrings([...indexedDocuments.map((document) => document.docId).filter(Boolean), ...manualDocIds]).length;
-    questionDocScopeEl.textContent = indexedDocuments.length > 0
-      ? `Scope: all cached tree PDFs (${indexedDocuments.length}); PageIndex doc_id values: ${docIdCount}.`
-      : "Scope: all cached tree PDFs, but no cached tree JSON was found.";
+    const selectedSources = selectedQuerySources();
+    const docIdCount = uniqueStrings([...selectedSources.map((document) => document.docId).filter(Boolean), ...manualDocIds]).length;
+    const localCount = selectedSources.filter((source) => !source.docId).length;
+    questionDocScopeEl.textContent = selectedSources.length > 0
+      ? `Scope: ${selectedSources.length} checked source(s); PageIndex doc_id values: ${docIdCount}; local section sources: ${localCount}.`
+      : "Select one or more processed sources before asking.";
     return;
   }
 
@@ -1191,10 +1366,23 @@ async function loadIndexedDocuments() {
   if (!response.ok) {
     indexedDocuments = [];
     updateAgentScope();
+    updateChatGate();
     return;
   }
 
   indexedDocuments = payload.documents || [];
+  mergeAvailableSources(indexedDocuments.map((document) => ({
+    document: document.document,
+    docId: document.docId,
+    treePath: document.treePath,
+    pageIndexCacheStatus: document.pageIndexCacheStatus || "fresh",
+    treeStatus: document.pageIndexCacheStatus === "fresh" ? "fresh" : "cached"
+  })));
+  if (hasProcessedSources()) {
+    showChatScreen();
+  } else {
+    showSetupScreen();
+  }
   updateAgentScope();
 }
 
@@ -1206,6 +1394,13 @@ function mergeIndexedDocuments(documents) {
     }
   }
   indexedDocuments = [...byDocId.values()].sort((left, right) => String(left.document).localeCompare(String(right.document)));
+  mergeAvailableSources(documents.map((document) => ({
+    document: document.document,
+    docId: document.docId,
+    treePath: document.treePath,
+    pageIndexCacheStatus: "fresh",
+    treeStatus: document.treePath ? "fresh" : "missing"
+  })));
   updateAgentScope();
 }
 
