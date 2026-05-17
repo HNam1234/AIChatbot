@@ -7,9 +7,11 @@ const config = loadEnvConfig();
 const app = express();
 const uiDir = path.resolve(__dirname, "..", "ui");
 const assetsDir = path.resolve(process.cwd(), "data", "converted", "assets");
+const pdfjsDir = path.resolve(process.cwd(), "node_modules", "pdfjs-dist", "build");
 
 app.use(express.json());
 app.use("/assets", express.static(assetsDir));
+app.use("/vendor/pdfjs", express.static(pdfjsDir));
 app.use("/api", createApiRouter());
 app.use(express.static(uiDir));
 

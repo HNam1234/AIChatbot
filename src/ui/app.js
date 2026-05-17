@@ -1,3 +1,7 @@
+import * as pdfjsLib from "/vendor/pdfjs/pdf.mjs";
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = "/vendor/pdfjs/pdf.worker.mjs";
+
 const form = document.querySelector("#pipeline-form");
 const fileInput = document.querySelector("#pdf");
 const selectedFilesEl = document.querySelector("#selected-files");
@@ -56,6 +60,27 @@ const debugOutputEl = document.querySelector("#debug-output");
 const chatTerminalEl = document.querySelector("#chat-terminal");
 const toggleDebugPanelButton = document.querySelector("#toggle-debug-panel");
 const collapseDebugPanelButton = document.querySelector("#collapse-debug-panel");
+const openMappingButton = document.querySelector("#open-mapping");
+const mappingScreen = document.querySelector("#mapping-screen");
+const mappingDocumentSelect = document.querySelector("#mapping-document");
+const mappingPageInput = document.querySelector("#mapping-page");
+const mappingModeSelect = document.querySelector("#mapping-mode");
+const mappingPrevPageButton = document.querySelector("#mapping-prev-page");
+const mappingNextPageButton = document.querySelector("#mapping-next-page");
+const mappingCacheStatusEl = document.querySelector("#mapping-cache-status");
+const mappingShowOverlayInput = document.querySelector("#mapping-show-overlay");
+const mappingSectionOnlyInput = document.querySelector("#mapping-section-only");
+const mappingShowLabelsInput = document.querySelector("#mapping-show-labels");
+const mappingInvertYInput = document.querySelector("#mapping-invert-y");
+const mappingTypeFilterSelect = document.querySelector("#mapping-type-filter");
+const mappingPageCountEl = document.querySelector("#mapping-page-count");
+const mappingPdfStage = document.querySelector("#mapping-pdf-stage");
+const mappingCanvas = document.querySelector("#mapping-canvas");
+const mappingOverlay = document.querySelector("#mapping-overlay");
+const mappingPdfMessageEl = document.querySelector("#mapping-pdf-message");
+const mappingTextViewerEl = document.querySelector("#mapping-text-viewer");
+const mappingDetailsEl = document.querySelector("#mapping-details");
+const mappingClearSelectionButton = document.querySelector("#mapping-clear-selection");
 
 let activeJobId = null;
 let pollTimer = null;
@@ -69,6 +94,14 @@ let selectedCacheRows = [];
 let availableSources = [];
 let selectedSourceKeys = new Set();
 let debugPanelCollapsed = false;
+let mappingDocuments = [];
+let mappingData = null;
+let mappingPdfDocument = null;
+let mappingCurrentPage = 1;
+let mappingSelectedBlockId = null;
+let mappingSelectedSectionKey = null;
+let mappingViewportScale = 1;
+let mappingRenderToken = 0;
 let cacheStatusRequestId = 0;
 let uploadInProgress = false;
 let settings = {
@@ -85,6 +118,7 @@ let settings = {
 
 void loadSettings();
 void loadIndexedDocuments();
+void loadMappingDocuments();
 showSetupScreen();
 
 document.querySelectorAll(".tab").forEach((tab) => {
@@ -106,10 +140,44 @@ continueToChatButton.addEventListener("click", () => {
     showChatScreen();
   }
 });
+openMappingButton?.addEventListener("click", () => {
+  void showMappingScreen();
+});
 toggleDebugPanelButton?.addEventListener("click", () => setDebugPanelCollapsed(!debugPanelCollapsed));
 collapseDebugPanelButton?.addEventListener("click", () => setDebugPanelCollapsed(true));
 questionAllDocsInput.addEventListener("change", updateAgentScope);
 questionDocIdInput.addEventListener("input", updateAgentScope);
+mappingDocumentSelect?.addEventListener("change", () => {
+  if (mappingDocumentSelect.value) {
+    void loadMappingDocument(mappingDocumentSelect.value);
+  }
+});
+mappingPageInput?.addEventListener("change", () => {
+  const page = Number(mappingPageInput.value) || 1;
+  void renderMappingPage(page);
+});
+mappingPrevPageButton?.addEventListener("click", () => {
+  void renderMappingPage(Math.max(1, mappingCurrentPage - 1));
+});
+mappingNextPageButton?.addEventListener("click", () => {
+  void renderMappingPage(Math.min(mappingData?.pageCount || mappingCurrentPage + 1, mappingCurrentPage + 1));
+});
+mappingModeSelect?.addEventListener("change", renderMappingTextViewer);
+mappingShowOverlayInput?.addEventListener("change", renderMappingOverlays);
+mappingSectionOnlyInput?.addEventListener("change", renderMappingOverlays);
+mappingShowLabelsInput?.addEventListener("change", renderMappingOverlays);
+mappingInvertYInput?.addEventListener("change", renderMappingOverlays);
+mappingTypeFilterSelect?.addEventListener("change", () => {
+  renderMappingOverlays();
+  renderMappingTextViewer();
+});
+mappingClearSelectionButton?.addEventListener("click", () => {
+  mappingSelectedBlockId = null;
+  mappingSelectedSectionKey = null;
+  renderMappingOverlays();
+  renderMappingTextViewer();
+  renderMappingDetails();
+});
 prevPageButton.addEventListener("click", () => setPdfPage(Math.max(1, currentPage - 1)));
 nextPageButton.addEventListener("click", () => setPdfPage(currentPage + 1));
 pageNumberInput.addEventListener("change", () => setPdfPage(Number(pageNumberInput.value) || 1));
@@ -415,6 +483,7 @@ async function loadResult() {
   }
   renderBatchOutputs(payload.outputs?.documentOutputs || []);
   await loadIndexedDocuments();
+  await loadMappingDocuments();
   const firstDocument = payload.selectedDocument || payload.outputs?.selectedDocument;
   if (firstDocument) {
     await loadDocument(firstDocument);
@@ -1068,9 +1137,11 @@ async function hashFile(file) {
 function showSetupScreen() {
   setupScreen?.classList.remove("hidden");
   chatScreen?.classList.add("hidden");
+  mappingScreen?.classList.add("hidden");
   backToSetupButton?.classList.add("hidden");
   runButton?.classList.remove("hidden");
   continueToChatButton?.classList.remove("hidden");
+  openMappingButton?.classList.remove("hidden");
   if (screenSubtitleEl) screenSubtitleEl.textContent = "Add PDFs, configure keys, then process sources before chatting.";
   updateChatGate();
 }
@@ -1082,12 +1153,30 @@ function showChatScreen() {
   }
   setupScreen?.classList.add("hidden");
   chatScreen?.classList.remove("hidden");
+  mappingScreen?.classList.add("hidden");
   backToSetupButton?.classList.remove("hidden");
   runButton?.classList.add("hidden");
   continueToChatButton?.classList.add("hidden");
+  openMappingButton?.classList.remove("hidden");
   if (screenSubtitleEl) screenSubtitleEl.textContent = "Ask across selected parsed sources. Use the back arrow to edit the dataset.";
   renderQuerySourceList();
   updateAgentScope();
+}
+
+async function showMappingScreen() {
+  setupScreen?.classList.add("hidden");
+  chatScreen?.classList.add("hidden");
+  mappingScreen?.classList.remove("hidden");
+  backToSetupButton?.classList.remove("hidden");
+  runButton?.classList.add("hidden");
+  continueToChatButton?.classList.add("hidden");
+  openMappingButton?.classList.add("hidden");
+  if (screenSubtitleEl) screenSubtitleEl.textContent = "Map PDF page regions to parsed blocks and sections.";
+  await loadMappingDocuments();
+  const selected = mappingDocumentSelect?.value || mappingDocuments[0]?.document;
+  if (selected && (!mappingData || mappingData.document !== selected)) {
+    await loadMappingDocument(selected);
+  }
 }
 
 function setDebugPanelCollapsed(collapsed) {
@@ -1113,6 +1202,9 @@ function updateChatGate() {
   }
   if (askButton) {
     askButton.disabled = !ready;
+  }
+  if (openMappingButton) {
+    openMappingButton.disabled = mappingDocuments.length === 0;
   }
   renderQuerySourceList();
 }
@@ -1231,6 +1323,343 @@ function updateAgentScope(bundle) {
   }
 
   questionDocScopeEl.textContent = "Scope: selected document only, but no document is selected.";
+}
+
+async function loadMappingDocuments() {
+  if (!mappingDocumentSelect) return;
+  const response = await fetch("/api/mapping");
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    mappingDocuments = [];
+    mappingDocumentSelect.innerHTML = "";
+    setMappingStatus(payload.error || "Could not load mapping documents.", true);
+    updateChatGate();
+    return;
+  }
+
+  mappingDocuments = payload.documents || [];
+  mappingDocumentSelect.innerHTML = mappingDocuments.length > 0
+    ? mappingDocuments.map((document) => `<option value="${escapeHtml(document.document)}">${escapeHtml(document.document)}</option>`).join("")
+    : "<option value=\"\">No mapped documents</option>";
+  if (mappingData?.document) {
+    mappingDocumentSelect.value = mappingData.document;
+  }
+  setMappingStatus(
+    mappingDocuments.length > 0
+      ? `${mappingDocuments.length} document(s) with PDF, Markdown, and blocks.json available.`
+      : "Mapping unavailable: run local parse to produce PDF, Markdown, and blocks.json.",
+    mappingDocuments.length === 0
+  );
+  updateChatGate();
+}
+
+async function loadMappingDocument(documentName) {
+  if (!documentName) return;
+  setMappingStatus(`Loading mapping data for ${documentName}...`);
+  mappingData = null;
+  mappingPdfDocument = null;
+  mappingSelectedBlockId = null;
+  mappingSelectedSectionKey = null;
+  renderMappingDetails();
+  if (mappingTextViewerEl) {
+    mappingTextViewerEl.className = "mapping-text-viewer muted";
+    mappingTextViewerEl.textContent = "Loading parsed blocks...";
+  }
+
+  const response = await fetch(`/api/mapping/${encodeURIComponent(documentName)}`);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    setMappingStatus(payload.error || "Could not load mapping data.", true);
+    if (mappingPdfMessageEl) mappingPdfMessageEl.textContent = payload.error || "Mapping unavailable.";
+    return;
+  }
+
+  mappingData = payload;
+  if (mappingDocumentSelect) mappingDocumentSelect.value = payload.document;
+  setMappingStatus(formatMappingCacheStatus(payload));
+  renderMappingTextViewer();
+
+  try {
+    mappingPdfDocument = await pdfjsLib.getDocument(payload.pdfUrl).promise;
+    mappingData.pageCount = mappingPdfDocument.numPages || mappingData.pageCount || 1;
+    const firstSectionPage = (payload.sections || []).find((section) => Number(section.pageStart) > 0)?.pageStart;
+    await renderMappingPage(Number(firstSectionPage) || 1);
+  } catch (error) {
+    setMappingStatus(`Mapping unavailable: ${error instanceof Error ? error.message : String(error)}`, true);
+  }
+}
+
+async function renderMappingPage(pageNumber) {
+  if (!mappingPdfDocument || !mappingCanvas || !mappingOverlay || !mappingPdfStage) return;
+  const pageCount = mappingData?.pageCount || mappingPdfDocument.numPages || 1;
+  mappingCurrentPage = Math.max(1, Math.min(pageCount, Number(pageNumber) || 1));
+  if (mappingPageInput) {
+    mappingPageInput.max = String(pageCount);
+    mappingPageInput.value = String(mappingCurrentPage);
+  }
+  if (mappingPageCountEl) {
+    mappingPageCountEl.textContent = `Page ${mappingCurrentPage} / ${pageCount}`;
+  }
+  if (mappingPdfMessageEl) {
+    mappingPdfMessageEl.textContent = "Rendering PDF page...";
+  }
+
+  const token = ++mappingRenderToken;
+  const page = await mappingPdfDocument.getPage(mappingCurrentPage);
+  const baseViewport = page.getViewport({ scale: 1 });
+  const stageWidth = Math.max(320, mappingPdfStage.clientWidth - 24);
+  const scale = Math.max(0.65, Math.min(2.2, stageWidth / baseViewport.width));
+  mappingViewportScale = scale;
+  const viewport = page.getViewport({ scale });
+  const context = mappingCanvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  mappingCanvas.width = Math.floor(viewport.width * dpr);
+  mappingCanvas.height = Math.floor(viewport.height * dpr);
+  mappingCanvas.style.width = `${viewport.width}px`;
+  mappingCanvas.style.height = `${viewport.height}px`;
+  mappingOverlay.style.width = `${viewport.width}px`;
+  mappingOverlay.style.height = `${viewport.height}px`;
+  context.setTransform(dpr, 0, 0, dpr, 0, 0);
+  await page.render({ canvasContext: context, viewport }).promise;
+  if (token !== mappingRenderToken) return;
+
+  renderMappingOverlays();
+  if (mappingPdfMessageEl) {
+    const count = currentMappingPageBlocks().length;
+    mappingPdfMessageEl.textContent = `${count} parsed block overlay(s) on this page.`;
+  }
+}
+
+function renderMappingOverlays() {
+  if (!mappingOverlay || !mappingCanvas) return;
+  mappingOverlay.innerHTML = "";
+  mappingOverlay.classList.toggle("hidden", !mappingShowOverlayInput?.checked);
+  if (!mappingData || !mappingShowOverlayInput?.checked) return;
+
+  const blocks = currentMappingPageBlocks()
+    .filter(mappingBlockVisible)
+    .sort((left, right) => blockArea(right) - blockArea(left));
+  for (const block of blocks) {
+    const rect = bboxToCanvasRect(block.bbox);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `mapping-box ${block.type} ${block.id === mappingSelectedBlockId ? "selected" : ""} ${block.section && sectionKey(block) === mappingSelectedSectionKey ? "section-selected" : ""}`;
+    button.dataset.blockId = block.id;
+    button.style.left = `${rect.left}px`;
+    button.style.top = `${rect.top}px`;
+    button.style.width = `${Math.max(4, rect.width)}px`;
+    button.style.height = `${Math.max(4, rect.height)}px`;
+    button.title = `${block.type}: ${textPreview(block.text, 110)}`;
+    if (mappingShowLabelsInput?.checked) {
+      button.textContent = block.hsCode || block.type;
+    }
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      void selectMappingBlock(block.id, { scrollText: true });
+    });
+    mappingOverlay.appendChild(button);
+  }
+}
+
+function renderMappingTextViewer() {
+  if (!mappingTextViewerEl) return;
+  if (!mappingData) {
+    mappingTextViewerEl.className = "mapping-text-viewer muted";
+    mappingTextViewerEl.textContent = "No mapping data loaded.";
+    return;
+  }
+
+  const mode = mappingModeSelect?.value || "blocks";
+  mappingTextViewerEl.className = "mapping-text-viewer";
+  if (mode === "markdown") {
+    mappingTextViewerEl.innerHTML = `<pre class="mapping-markdown">${escapeHtml(mappingData.markdown || "No Markdown found.")}</pre>`;
+    scrollMappingSectionIntoView();
+    return;
+  }
+  if (mode === "sections") {
+    renderMappingSections();
+    return;
+  }
+
+  const blocks = mappingData.blocks.filter(mappingBlockVisible);
+  mappingTextViewerEl.innerHTML = blocks.map((block) => `
+    <article class="mapping-block ${block.id === mappingSelectedBlockId ? "selected" : ""}" data-mapping-block-id="${escapeHtml(block.id)}">
+      <div class="mapping-block-head">
+        <strong>${escapeHtml(block.hsCode || block.type)}</strong>
+        <span>p${escapeHtml(block.pageNumber)} · ${escapeHtml(block.type)}</span>
+      </div>
+      <p>${escapeHtml(textPreview(block.text || block.markdownText || "(empty block)", 500))}</p>
+      ${block.section ? `<small>${escapeHtml(block.section)}</small>` : ""}
+    </article>
+  `).join("") || "<div class=\"muted\">No blocks match the current filters.</div>";
+  mappingTextViewerEl.querySelectorAll("[data-mapping-block-id]").forEach((element) => {
+    element.addEventListener("click", () => {
+      void selectMappingBlock(element.dataset.mappingBlockId, { scrollPdf: true });
+    });
+  });
+}
+
+function renderMappingSections() {
+  const sections = mappingData?.sections || [];
+  mappingTextViewerEl.innerHTML = sections.length > 0
+    ? sections.map((section, index) => {
+        const key = sectionKey(section);
+        return `
+          <article class="mapping-section ${key === mappingSelectedSectionKey ? "selected" : ""}" data-mapping-section="${escapeHtml(key)}" data-index="${index}">
+            <div class="mapping-block-head">
+              <strong>${escapeHtml(section.hsCode || "n/a")}</strong>
+              <span>p${escapeHtml(section.pageStart || "?")}-${escapeHtml(section.pageEnd || section.pageStart || "?")}</span>
+            </div>
+            <h3>${escapeHtml(section.title || section.section || "Untitled section")}</h3>
+            <p>${escapeHtml(section.textPreview || "")}</p>
+            <small>${escapeHtml(section.source || "source n/a")}</small>
+          </article>
+        `;
+      }).join("")
+    : "<div class=\"muted\">No sections.json records found.</div>";
+  mappingTextViewerEl.querySelectorAll("[data-mapping-section]").forEach((element) => {
+    element.addEventListener("click", () => {
+      const section = sections[Number(element.dataset.index)];
+      void selectMappingSection(section);
+    });
+  });
+}
+
+async function selectMappingBlock(blockId, options = {}) {
+  const block = mappingData?.blocks.find((candidate) => candidate.id === blockId);
+  if (!block) return;
+  mappingSelectedBlockId = block.id;
+  mappingSelectedSectionKey = block.section ? sectionKey(block) : null;
+  if (block.pageNumber !== mappingCurrentPage) {
+    await renderMappingPage(block.pageNumber);
+  } else {
+    renderMappingOverlays();
+  }
+  if (options.scrollText !== false && mappingModeSelect && mappingModeSelect.value !== "blocks") {
+    mappingModeSelect.value = "blocks";
+  }
+  renderMappingTextViewer();
+  renderMappingDetails(block);
+  if (options.scrollText !== false) {
+    scrollMappingBlockIntoView(block.id);
+  }
+  if (options.scrollPdf !== false) {
+    mappingPdfStage?.scrollIntoView({ block: "nearest" });
+  }
+}
+
+async function selectMappingSection(section) {
+  if (!section) return;
+  mappingSelectedSectionKey = sectionKey(section);
+  mappingSelectedBlockId = null;
+  const page = Number(section.pageStart) || 1;
+  await renderMappingPage(page);
+  renderMappingTextViewer();
+  renderMappingDetails(undefined, section);
+  scrollMappingSectionIntoView();
+}
+
+function renderMappingDetails(block, section) {
+  if (!mappingDetailsEl) return;
+  if (section) {
+    mappingDetailsEl.className = "mapping-details";
+    mappingDetailsEl.innerHTML = `
+      <dl>
+        <dt>section</dt><dd>${escapeHtml(section.section || "n/a")}</dd>
+        <dt>hsCode</dt><dd>${escapeHtml(section.hsCode || "n/a")}</dd>
+        <dt>title</dt><dd>${escapeHtml(section.title || "n/a")}</dd>
+        <dt>page range</dt><dd>${escapeHtml(section.pageStart || "?")} - ${escapeHtml(section.pageEnd || section.pageStart || "?")}</dd>
+        <dt>source</dt><dd>${escapeHtml(section.source || "n/a")}</dd>
+      </dl>
+    `;
+    return;
+  }
+  if (!block) {
+    mappingDetailsEl.className = "mapping-details muted";
+    mappingDetailsEl.textContent = "Click a PDF overlay or parsed block to inspect mapping metadata.";
+    return;
+  }
+  mappingDetailsEl.className = "mapping-details";
+  mappingDetailsEl.innerHTML = `
+    <dl>
+      <dt>id</dt><dd>${escapeHtml(block.id)}</dd>
+      <dt>page</dt><dd>${escapeHtml(block.pageNumber)}</dd>
+      <dt>type</dt><dd>${escapeHtml(block.type)}</dd>
+      <dt>bbox</dt><dd>${escapeHtml(`${round(block.bbox.x0)}, ${round(block.bbox.y0)}, ${round(block.bbox.x1)}, ${round(block.bbox.y1)}`)}</dd>
+      <dt>section</dt><dd>${escapeHtml(block.section || "n/a")}</dd>
+      <dt>hsCode/title</dt><dd>${escapeHtml([block.hsCode, block.title].filter(Boolean).join(" - ") || "n/a")}</dd>
+      <dt>text</dt><dd>${escapeHtml(textPreview(block.text, 700))}</dd>
+    </dl>
+  `;
+}
+
+function currentMappingPageBlocks() {
+  return (mappingData?.blocks || []).filter((block) => block.pageNumber === mappingCurrentPage);
+}
+
+function mappingBlockVisible(block) {
+  const typeFilter = mappingTypeFilterSelect?.value || "all";
+  if (typeFilter !== "all" && block.type !== typeFilter) return false;
+  if (mappingSectionOnlyInput?.checked && mappingSelectedSectionKey) {
+    return sectionKey(block) === mappingSelectedSectionKey;
+  }
+  return true;
+}
+
+function bboxToCanvasRect(bbox) {
+  const scale = mappingViewportScale;
+  const left = bbox.x0 * scale;
+  const width = (bbox.x1 - bbox.x0) * scale;
+  const height = (bbox.y1 - bbox.y0) * scale;
+  const top = mappingInvertYInput?.checked
+    ? (Number.parseFloat(mappingCanvas.style.height) || mappingCanvas.clientHeight) - bbox.y1 * scale
+    : bbox.y0 * scale;
+  return { left, top, width, height };
+}
+
+function scrollMappingBlockIntoView(blockId) {
+  const element = mappingTextViewerEl?.querySelector(`[data-mapping-block-id="${cssEscape(blockId)}"]`);
+  element?.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
+function scrollMappingSectionIntoView() {
+  if (!mappingSelectedSectionKey) return;
+  const element = mappingTextViewerEl?.querySelector(`[data-mapping-section="${cssEscape(mappingSelectedSectionKey)}"]`);
+  element?.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
+function setMappingStatus(message, warning = false) {
+  if (!mappingCacheStatusEl) return;
+  mappingCacheStatusEl.className = warning ? "mapping-status warning" : "mapping-status muted";
+  mappingCacheStatusEl.textContent = message;
+}
+
+function formatMappingCacheStatus(payload) {
+  const cache = payload.cacheStatus || {};
+  return `Parse cache: ${cache.parse || "unknown"} | PageIndex cache: ${cache.pageIndex || "unknown"} | Mapping data: ${cache.mapping || "unknown"} | Blocks: ${(payload.blocks || []).length}`;
+}
+
+function sectionKey(item) {
+  return item?.section || item?.hsCode || item?.title || "";
+}
+
+function blockArea(block) {
+  const bbox = block.bbox || block;
+  return Math.max(1, (bbox.x1 - bbox.x0) * (bbox.y1 - bbox.y0));
+}
+
+function textPreview(value, limit = 160) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > limit ? `${text.slice(0, limit - 1)}...` : text;
+}
+
+function round(value) {
+  return Math.round(Number(value) * 100) / 100;
+}
+
+function cssEscape(value) {
+  if (window.CSS?.escape) return CSS.escape(value);
+  return String(value).replace(/["\\]/g, "\\$&");
 }
 
 function renderMarkdown(markdown) {

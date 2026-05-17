@@ -18,6 +18,7 @@
           </div>
         </div>
         <div class="top-actions">
+          <button id="open-mapping" type="button" class="secondary">Mapping</button>
           <button id="continue-to-chat" type="button" class="secondary" disabled>Continue to chat</button>
           <button type="submit" form="pipeline-form" class="primary-action">Run Pipeline</button>
         </div>
@@ -263,8 +264,93 @@
           </aside>
         </section>
       </section>
+
+      <section id="mapping-screen" class="screen mapping-screen hidden">
+        <section class="notebook-pane mapping-toolbar">
+          <div class="mapping-controls">
+            <label>
+              Document
+              <select id="mapping-document"></select>
+            </label>
+            <label>
+              Page
+              <input id="mapping-page" type="number" min="1" value="1" />
+            </label>
+            <label>
+              Right panel
+              <select id="mapping-mode">
+                <option value="blocks">Blocks</option>
+                <option value="markdown">Markdown</option>
+                <option value="sections">Sections</option>
+              </select>
+            </label>
+            <div class="mapping-nav">
+              <button id="mapping-prev-page" type="button" class="secondary">Prev</button>
+              <button id="mapping-next-page" type="button" class="secondary">Next</button>
+            </div>
+          </div>
+          <div id="mapping-cache-status" class="mapping-status muted">Load a processed document to inspect mapping data.</div>
+          <div class="mapping-debug-controls">
+            <label class="check"><input id="mapping-show-overlay" type="checkbox" checked /> Show bbox overlay</label>
+            <label class="check"><input id="mapping-section-only" type="checkbox" /> Show only selected section</label>
+            <label class="check"><input id="mapping-show-labels" type="checkbox" /> Block labels</label>
+            <label class="check"><input id="mapping-invert-y" type="checkbox" /> Invert Y</label>
+            <label>
+              Filter type
+              <select id="mapping-type-filter">
+                <option value="all">All blocks</option>
+                <option value="heading">Headings</option>
+                <option value="hs-code">HS codes</option>
+                <option value="paragraph">Text</option>
+                <option value="image">Images</option>
+                <option value="caption">Captions</option>
+                <option value="source">Sources</option>
+                <option value="table">Tables</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section class="mapping-grid">
+          <section class="notebook-pane mapping-pdf-pane">
+            <div class="pane-heading compact-heading">
+              <div>
+                <span class="kicker">PDF</span>
+                <h2>Original Page</h2>
+              </div>
+              <span id="mapping-page-count" class="muted">Page 1</span>
+            </div>
+            <div id="mapping-pdf-stage" class="mapping-pdf-stage">
+              <canvas id="mapping-canvas"></canvas>
+              <div id="mapping-overlay" class="mapping-overlay"></div>
+            </div>
+            <div id="mapping-pdf-message" class="mapping-message muted">Select a document to render the PDF page.</div>
+          </section>
+
+          <section class="notebook-pane mapping-text-pane">
+            <div class="pane-heading compact-heading">
+              <div>
+                <span class="kicker">Parsed</span>
+                <h2>Text Blocks</h2>
+              </div>
+              <button id="mapping-clear-selection" type="button" class="secondary compact">Clear</button>
+            </div>
+            <div id="mapping-text-viewer" class="mapping-text-viewer muted">No mapping data loaded.</div>
+          </section>
+        </section>
+
+        <section class="notebook-pane mapping-details-pane">
+          <div class="pane-heading compact-heading">
+            <div>
+              <span class="kicker">Selected</span>
+              <h2>Block Details</h2>
+            </div>
+          </div>
+          <div id="mapping-details" class="mapping-details muted">Click a PDF overlay or parsed block to inspect mapping metadata.</div>
+        </section>
+      </section>
     </main>
 
-    <script src="/app.js"></script>
+    <script type="module" src="/app.js"></script>
   </body>
 </html>
