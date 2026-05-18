@@ -679,9 +679,14 @@ function renderClassEvalAnswer(structured: StructuredAnswer, question: string | 
   const definition = isDefinitionStyleQuestion(question ?? "") && !asksForHsCodeOrClassificationQuestion(question ?? "")
     ? formatDefinitionExplanation(structured.conciseExplanation ?? firstSectionSentence(structured.selectedPrimary.text), question)
     : null;
-  const prefix = definition ? ensureSentenceEnd(stripHsCodes(definition)) : `Sản phẩm là ${product},`;
+  if (definition) {
+    const definitionText = ensureSentenceEnd(stripHsCodes(definition));
+    const answer = `${definitionText} ${formatClassEvalHsCodeLine(structured.hsCodes)}`;
+    return validateClassEvalAnswer(answer, structured) ? answer : fallbackClassEvalAnswer(structured);
+  }
+  const prefix = `Sản phẩm là ${product},`;
   const codeLine = formatClassEvalHsCodeLine(structured.hsCodes);
-  const note = !definition && structured.note ? ` Lưu ý: ${ensureSentenceEnd(stripHsCodes(structured.note))}` : "";
+  const note = structured.note ? ` Lưu ý: ${ensureSentenceEnd(stripHsCodes(structured.note))}` : "";
   const answer = `${prefix} ${codeLine}${note}`;
   return validateClassEvalAnswer(answer, structured) ? answer : fallbackClassEvalAnswer(structured);
 }

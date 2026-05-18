@@ -22,6 +22,7 @@ export interface SelectedSectionAnswerContext {
   hsCode?: string;
   source?: string;
   text: string;
+  context?: string;
 }
 
 export interface GeminiQueryPlannerOptions {
@@ -174,13 +175,14 @@ export function buildHsCodePrompt(context: string, query: string, language: stri
 export function buildSelectedSectionAnswerPrompt(section: SelectedSectionAnswerContext, query: string): string {
   return [
     "You are answering a question using only the selected HSCode document section.",
+    "Use the selected section text and retrieved context as evidence.",
     "Do not use outside knowledge.",
     "Do not invent information.",
     "If the selected section does not contain the requested information, say so.",
     "Prefer Vietnamese for Vietnamese or mixed-language questions.",
     "Answer the user's actual question directly.",
-    "If the user asks about requirements, characteristics, appearance, usage, or notes, extract that field from the selected section and do not output HS Code unless the user asks for HS Code.",
-    "If the user asks for a definition or meaning, answer from the selected section text, then append HS Code from selected section metadata when available.",
+    "If the user asks about requirements, characteristics, appearance, usage, definition, meaning, or notes, extract that information from the selected section.",
+    "Do not output HS Code unless the user explicitly asks for HS Code or classification.",
     "",
     "Selected section metadata:",
     `- document: ${section.document ?? ""}`,
@@ -193,6 +195,15 @@ export function buildSelectedSectionAnswerPrompt(section: SelectedSectionAnswerC
     "---",
     section.text,
     "---",
+    ...(section.context
+      ? [
+          "",
+          "Retrieved context:",
+          "---",
+          section.context,
+          "---"
+        ]
+      : []),
     "",
     "User question:",
     query,

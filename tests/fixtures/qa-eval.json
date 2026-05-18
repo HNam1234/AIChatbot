@@ -1,247 +1,221 @@
 [
-    {
-        "id":  "exact-code-001",
-        "question":  "Tra cứu HS Code 0102.29.11",
-        "expectedIntent":  "exact_hscode_lookup",
-        "mustContainAll":  [
-                               "0102.29.11"
-                           ],
-        "mustContainAny":  [
-                               "Oxen",
-                               "OXEN"
-                           ],
-        "mustNotContain":  [
-                               "Retrieval:",
-                               "PageIndex:",
-                               "Primary citation"
-                           ],
-        "expectedHsCodes":  [
-                                "0102.29.11"
-                            ],
-        "expectedDocument":  "Chapter01.pdf",
-        "expectedTitleContains":  "OXEN"
-    },
-    {
-        "id":  "agarwood-descriptive-hscode-001",
-        "question":  "dark resinous heartwood Aquilaria Gyrinops woodchips HS Code?",
-        "expectedIntent":  "product_classification",
-        "mustContainAll":  [
-                               "Agarwood (Gaharu) chips",
-                               "1211.90.95"
-                           ],
-        "mustContainAny":  [
-
-                           ],
-        "mustNotContain":  [
-                               "Retrieval:",
-                               "PageIndex:",
-                               "Primary citation",
-                               "Index source"
-                           ],
-        "expectedHsCodes":  [
-                                "1211.90.95"
-                            ],
-        "expectedDocument":  "Chapter12.pdf",
-        "expectedTitleContains":  "AGARWOOD"
-    },
-    {
-        "id":  "breeding-fish-appearance-001",
-        "question":  "Breeding fish appearance requirements?",
-        "expectedIntent":  "selected_section_qa",
-        "mustContainAll":  [
-
-                           ],
-        "mustContainAny":  [
-                               "Well-proportioned",
-                               "no deformity",
-                               "normal fins",
-                               "no scratches"
-                           ],
-        "mustNotContain":  [
-                               "SÃƒÂ¡Ã‚ÂºÃ‚Â£n phÃƒÂ¡Ã‚ÂºÃ‚Â©m lÃƒÆ’Ã‚Â ",
-                               "HS Code:",
-                               "Retrieval:",
-                               "PageIndex:",
-                               "Primary citation"
-                           ],
-        "expectedHsCodes":  [
-
-                            ],
-        "expectedDocument":  "Chapter03.pdf",
-        "expectedTitleContains":  "BREEDING"
-    },
-    {
-        "id":  "numeric-only-001",
-        "question":  "0.8",
-        "expectedIntent":  "clarification_needed",
-        "mustContainAll":  [
-
-                           ],
-        "mustContainAny":  [
-                               "Chưa đủ thông tin",
-                               "mô tả"
-                           ],
-        "mustNotContain":  [
-                               "SÃƒÂ¡Ã‚ÂºÃ‚Â£n phÃƒÂ¡Ã‚ÂºÃ‚Â©m lÃƒÆ’Ã‚Â ",
-                               "HS Code:",
-                               "Retrieval:",
-                               "PageIndex:"
-                           ],
-        "expectedHsCodes":  [
-
-                            ],
-        "expectedDocument":  null,
-        "expectedTitleContains":  null
-    },
-    {
-        "id":  "coffee-attribute-001",
-        "question":  "Which coffee is more bitter than Arabica and has higher caffeine?",
-        "expectedIntent":  "selected_section_qa",
-        "mustContainAll":  [
-
-                           ],
-        "mustContainAny":  [
-                               "Robusta",
-                               "bitter",
-                               "caffeine"
-                           ],
-        "mustNotContain":  [
-                               "NguÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚Â»ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œn:",
-                               "Related citation",
-                               "Retrieval:"
-                           ],
-        "expectedHsCodes":  [
-
-                            ],
-        "expectedDocument":  "Chapter09.pdf",
-        "expectedTitleContains":  "ROBUSTA"
-    },
-    {
-        "id":  "definition-001",
-        "question":  "What is Oxen?",
-        "expectedIntent":  "selected_section_qa",
-        "mustContainAll":  [
-                               "HS Code:"
-                           ],
-        "mustContainAny":  [
-                               "castrated",
-                               "bovine"
-                           ],
-        "mustNotContain":  [
-                               "NguÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚Â»ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œn:",
-                               "Primary citation"
-                           ],
-        "expectedHsCodes":  [
-                                "0102.29.11"
-                            ],
-        "expectedDocument":  "Chapter01.pdf",
-        "expectedTitleContains":  "OXEN"
-    },
-    {
-        "id":  "chapter-summary-001",
-        "question":  "chapter 10 summary",
-        "expectedIntent":  "chapter_summary",
-        "mustContainAll":  [
-                               "Chapter 10"
-                           ],
-        "mustContainAny":  [
-                               "Wheat",
-                               "WHEAT"
-                           ],
-        "mustNotContain":  [
-                               "SÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â£n phÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â ",
-                               "Primary citation"
-                           ],
-        "expectedHsCodes":  [
-
-                            ],
-        "expectedDocument":  "Chapter10.pdf",
-        "expectedTitleContains":  null
-    },
-    {
-        "id":  "document-summary-001",
-        "question":  "document Introduction summary",
-        "expectedIntent":  "document_summary",
-        "mustContainAll":  [
-                               "Introduction.pdf"
-                           ],
-        "mustContainAny":  [
-                               "reference",
-                               "FOREWORD",
-                               "Introduction"
-                           ],
-        "mustNotContain":  [
-                               "SÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â£n phÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â ",
-                               "Primary citation"
-                           ],
-        "expectedHsCodes":  [
-
-                            ],
-        "expectedDocument":  "Introduction.pdf",
-        "expectedTitleContains":  null
-    },
-    {
-        "id":  "grouped-code-001",
-        "question":  "Mechanically deboned or separated meat lÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â  gÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¬?",
-        "expectedIntent":  "selected_section_qa",
-        "mustContainAll":  [
-                               "HS Code:"
-                           ],
-        "mustContainAny":  [
-                               "paste-like",
-                               "meat product",
-                               "thÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚Â»ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¹t"
-                           ],
-        "mustNotContain":  [
-                               "NguÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚Â»ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œn:",
-                               "Related citation"
-                           ],
-        "expectedHsCodes":  [
-                                "0207.14.91",
-                                "0207.27.91"
-                            ],
-        "expectedDocument":  "Chapter02.pdf",
-        "expectedTitleContains":  "MECHANICALLY"
-    },
-    {
-        "id":  "weak-match-001",
-        "question":  "2",
-        "expectedIntent":  "clarification_needed",
-        "mustContainAll":  [
-                               "Chưa"
-                           ],
-        "mustContainAny":  [
-
-                           ],
-        "mustNotContain":  [
-                               "SÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â£n phÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â ",
-                               "HS Code:"
-                           ],
-        "expectedHsCodes":  [
-
-                            ],
-        "expectedDocument":  null,
-        "expectedTitleContains":  null
-    },
-    {
-        "id":  "state-isolation-001",
-        "question":  "chapter 10 about",
-        "expectedIntent":  "chapter_summary",
-        "mustContainAll":  [
-                               "Chapter 10"
-                           ],
-        "mustContainAny":  [
-                               "Wheat",
-                               "WHEAT"
-                           ],
-        "mustNotContain":  [
-                               "SÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â£n phÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â  Oxen",
-                               "Primary citation"
-                           ],
-        "expectedHsCodes":  [
-
-                            ],
-        "expectedDocument":  "Chapter10.pdf",
-        "expectedTitleContains":  null
-    }
+  {
+    "id": "exact-code-001",
+    "question": "Tra cá»©u HS Code 0102.29.11",
+    "expectedIntent": "exact_hscode_lookup",
+    "mustContainAll": [
+      "0102.29.11"
+    ],
+    "mustContainAny": [
+      "Oxen",
+      "OXEN"
+    ],
+    "mustNotContain": [
+      "Retrieval:",
+      "PageIndex:",
+      "Primary citation"
+    ],
+    "expectedHsCodes": [
+      "0102.29.11"
+    ],
+    "expectedDocument": "Chapter01.pdf",
+    "expectedTitleContains": "OXEN"
+  },
+  {
+    "id": "agarwood-descriptive-hscode-001",
+    "question": "dark resinous heartwood Aquilaria Gyrinops woodchips HS Code?",
+    "expectedIntent": "product_classification",
+    "mustContainAll": [
+      "Agarwood (Gaharu) chips",
+      "1211.90.95"
+    ],
+    "mustContainAny": [],
+    "mustNotContain": [
+      "Retrieval:",
+      "PageIndex:",
+      "Primary citation",
+      "Index source"
+    ],
+    "expectedHsCodes": [
+      "1211.90.95"
+    ],
+    "expectedDocument": "Chapter12.pdf",
+    "expectedTitleContains": "AGARWOOD"
+  },
+  {
+    "id": "breeding-fish-appearance-001",
+    "question": "Breeding fish appearance requirements?",
+    "expectedIntent": "selected_section_qa",
+    "mustContainAll": [],
+    "mustContainAny": [
+      "Tôi đã tìm thấy section liên quan",
+      "bật API key"
+    ],
+    "mustNotContain": [
+      "SÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â£n phÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â ",
+      "Retrieval:",
+      "PageIndex:",
+      "Primary citation",
+      "HS Code:"
+    ],
+    "expectedHsCodes": [],
+    "expectedDocument": "Chapter03.pdf",
+    "expectedTitleContains": "BREEDING"
+  },
+  {
+    "id": "numeric-only-001",
+    "question": "0.8",
+    "expectedIntent": "clarification_needed",
+    "mustContainAll": [],
+    "mustContainAny": [
+      "Chưa đủ thông tin",
+      "mô tả"
+    ],
+    "mustNotContain": [
+      "SÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â£n phÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â ",
+      "HS Code:",
+      "Retrieval:",
+      "PageIndex:"
+    ],
+    "expectedHsCodes": [],
+    "expectedDocument": null,
+    "expectedTitleContains": null
+  },
+  {
+    "id": "coffee-attribute-001",
+    "question": "Which coffee is more bitter than Arabica and has higher caffeine?",
+    "expectedIntent": "selected_section_qa",
+    "mustContainAll": [],
+    "mustContainAny": [
+      "Tôi đã tìm thấy section liên quan",
+      "bật API key"
+    ],
+    "mustNotContain": [
+      "NguÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â»ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“n:",
+      "Related citation",
+      "Retrieval:",
+      "HS Code:"
+    ],
+    "expectedHsCodes": [],
+    "expectedDocument": "Chapter09.pdf",
+    "expectedTitleContains": "ROBUSTA"
+  },
+  {
+    "id": "definition-001",
+    "question": "What is Oxen?",
+    "expectedIntent": "definition",
+    "mustContainAll": [
+      "HS Code: 0102.29.11"
+    ],
+    "mustContainAny": [
+      "castrated",
+      "bovine"
+    ],
+    "mustNotContain": [
+      "NguÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â»ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“n:",
+      "Primary citation"
+    ],
+    "expectedHsCodes": [
+      "0102.29.11"
+    ],
+    "expectedDocument": "Chapter01.pdf",
+    "expectedTitleContains": "OXEN"
+  },
+  {
+    "id": "chapter-summary-001",
+    "question": "chapter 10 summary",
+    "expectedIntent": "chapter_summary",
+    "mustContainAll": [
+      "Chapter 10"
+    ],
+    "mustContainAny": [
+      "Wheat",
+      "WHEAT"
+    ],
+    "mustNotContain": [
+      "SÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£n phÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ",
+      "Primary citation"
+    ],
+    "expectedHsCodes": [],
+    "expectedDocument": "Chapter10.pdf",
+    "expectedTitleContains": null
+  },
+  {
+    "id": "document-summary-001",
+    "question": "document Introduction summary",
+    "expectedIntent": "document_summary",
+    "mustContainAll": [
+      "Introduction.pdf"
+    ],
+    "mustContainAny": [
+      "reference",
+      "FOREWORD",
+      "Introduction"
+    ],
+    "mustNotContain": [
+      "SÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£n phÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ",
+      "Primary citation"
+    ],
+    "expectedHsCodes": [],
+    "expectedDocument": "Introduction.pdf",
+    "expectedTitleContains": null
+  },
+  {
+    "id": "grouped-code-001",
+    "question": "Mechanically deboned or separated meat lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â  gÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬?",
+    "expectedIntent": "definition",
+    "mustContainAll": [
+      "0207.14.91",
+      "0207.27.91"
+    ],
+    "mustContainAny": [
+      "Mechanically",
+      "meat"
+    ],
+    "mustNotContain": [
+      "NguÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â»ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“n:",
+      "Related citation"
+    ],
+    "expectedHsCodes": [
+      "0207.14.91",
+      "0207.27.91"
+    ],
+    "expectedDocument": "Chapter02.pdf",
+    "expectedTitleContains": "MECHANICALLY"
+  },
+  {
+    "id": "weak-match-001",
+    "question": "2",
+    "expectedIntent": "clarification_needed",
+    "mustContainAll": [
+      "Chưa"
+    ],
+    "mustContainAny": [],
+    "mustNotContain": [
+      "SÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£n phÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ",
+      "HS Code:"
+    ],
+    "expectedHsCodes": [],
+    "expectedDocument": null,
+    "expectedTitleContains": null
+  },
+  {
+    "id": "state-isolation-001",
+    "question": "chapter 10 about",
+    "expectedIntent": "chapter_summary",
+    "mustContainAll": [
+      "Chapter 10"
+    ],
+    "mustContainAny": [
+      "Wheat",
+      "WHEAT"
+    ],
+    "mustNotContain": [
+      "SÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£n phÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â  Oxen",
+      "Primary citation"
+    ],
+    "expectedHsCodes": [],
+    "expectedDocument": "Chapter10.pdf",
+    "expectedTitleContains": null
+  }
 ]

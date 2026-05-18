@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   detectIntent,
   handleChapterSummary,
+  handleDefinition,
   handleDocumentSummary,
   handleExactHsCodeLookup,
   handleProductClassification,
@@ -100,7 +101,33 @@ describe("qaIntentRouter", () => {
     expect(result.answer).toBe("Sản phẩm là Dried sample chips, HS Code: 1211.90.95.");
   });
 
-  it("answers non-HS field questions from selected section text without forcing HS Code", () => {
+  it("lists HS Codes for broad multi-result lookups instead of forcing one classification", () => {
+    const robusta = retrievedFixture({
+      document: "Chapter09.pdf",
+      hsCode: "0901.11.30",
+      title: "ROBUSTA COFFEE",
+      section: "0901.11.30 - ROBUSTA COFFEE",
+      text: "Robusta coffee beans."
+    });
+    const arabica = retrievedFixture({
+      document: "Chapter09.pdf",
+      hsCode: "0901.21.12",
+      title: "ARABICA COFFEE",
+      section: "0901.21.12 - ARABICA COFFEE",
+      text: "Arabica coffee beans."
+    });
+    const result = handleProductClassification("coffee", robusta, [], undefined, [
+      candidateFor(robusta, { finalScore: 70, matchedTerms: ["coffee"], candidateMatchedTokens: ["coffee"] }),
+      candidateFor(arabica, { finalScore: 68, matchedTerms: ["coffee"], candidateMatchedTokens: ["coffee"] })
+    ], detectIntent("coffee"));
+
+    expect(result.answerMode).toBe("ambiguous_lookup");
+    expect(result.answer).toContain("Robusta coffee - HS Code: 0901.11.30.");
+    expect(result.answer).toContain("Arabica coffee - HS Code: 0901.21.12.");
+    expect(result.answer).not.toContain("Sản phẩm là");
+  });
+
+  it("answers non-HS field questions first and only appends a related code", () => {
     const selected = retrievedFixture({
       document: "Chapter03.pdf",
       hsCode: "0301.99.10",
@@ -110,17 +137,42 @@ describe("qaIntentRouter", () => {
       score: 80
     });
     const result = handleSelectedSectionQa(
-      "Breeding sample cáº§n ngoáº¡i quan tháº¿ nÃ o?",
+      "Breeding sample appearance requirements?",
       selected,
-      "Breeding sample cáº§n cÃ³ thÃ¢n cÃ¢n Ä‘á»‘i vÃ  vÃ¢y bÃ¬nh thÆ°á»ng.",
+      "Breeding sample requires a balanced body and normal fins.",
       [candidateFor(selected, { finalScore: 80, matchedTerms: ["breeding", "sample"] })],
-      detectIntent("Breeding sample cáº§n ngoáº¡i quan tháº¿ nÃ o?")
+      detectIntent("Breeding sample appearance requirements?")
     );
 
     expect(result.answerMode).toBe("selected_section_qa");
-    expect(result.answer).toContain("thÃ¢n cÃ¢n Ä‘á»‘i");
+    expect(result.answer).toContain("balanced body");
+    expect(result.answer).toContain("Mã liên quan: 0301.99.10.");
     expect(result.answer).not.toContain("HS Code");
     expect(result.answer).not.toContain("Sản phẩm là");
+  });
+
+  it("does not duplicate HS Code when selected-section text already mentioned it", () => {
+    const selected = retrievedFixture({
+      document: "Chapter03.pdf",
+      hsCode: "0301.99.10",
+      title: "BREEDING SAMPLE",
+      section: "0301.99.10 - BREEDING SAMPLE",
+      text: "Appearance: the body is balanced and fins are normal.",
+      score: 80
+    });
+    const result = handleSelectedSectionQa(
+      "Breeding sample appearance requirements?",
+      selected,
+      "Breeding sample requires a balanced body and normal fins. HS Code: 0301.99.10.",
+      [candidateFor(selected, { finalScore: 80, matchedTerms: ["breeding", "sample"] })],
+      detectIntent("Breeding sample appearance requirements?")
+    );
+
+    const codeMentions = result.answer.match(/0301\.99\.10/g) ?? [];
+    expect(result.answer).toContain("balanced body");
+    expect(result.answer).toContain("Mã liên quan: 0301.99.10.");
+    expect(result.answer).not.toContain("HS Code:");
+    expect(codeMentions).toHaveLength(1);
   });
 
   it("keeps selected-section answers free of debug metadata", () => {
@@ -144,7 +196,7 @@ describe("qaIntentRouter", () => {
     expect(result.answer).not.toMatch(/Index source|PageIndex|cache freshness|final score|candidate debug/i);
   });
 
-  it("answers definition questions through selected section QA with selected HS code metadata", () => {
+  it("answers definition questions with the definition first and HS Code attached", () => {
     const query = "What is Oxen?";
     const selected = retrievedFixture({
       document: "Chapter01.pdf",
@@ -153,15 +205,38 @@ describe("qaIntentRouter", () => {
       section: "0102.29.11 - OXEN",
       text: "Oxen are castrated adult male bovine animals. They are used as draft animals."
     });
-    const result = handleSelectedSectionQa(query, selected, "Oxen are castrated adult male bovine animals.", [
+    const detection = detectIntent(query);
+    const result = handleDefinition(query, selected, [
       candidateFor(selected, { finalScore: 80, matchedTerms: ["oxen"], candidateMatchedPhrases: ["what oxen"] })
-    ], detectIntent(query));
+    ], detection);
 
-    expect(result.intent).toBe("selected_section_qa");
+    expect(detection.intent).toBe("definition");
+    expect(result.intent).toBe("definition");
     expect(result.selectedPrimary?.hsCode).toBe("0102.29.11");
-    expect(result.answer).toContain("Oxen are castrated adult male bovine animals.");
-    expect(result.answer).toContain("HS Code: 0102.29.11");
+    expect(result.answer).toBe("Oxen are castrated adult male bovine animals. HS Code: 0102.29.11.");
     expect(result.answer).not.toMatch(/Index source|PageIndex|cache freshness|final score|candidate debug/i);
+  });
+
+  it("uses safe fallback for selected-section QA when LLM answer is unavailable", () => {
+    const selected = retrievedFixture({
+      document: "Chapter03.pdf",
+      hsCode: "0301.99.10",
+      title: "BREEDING SAMPLE",
+      section: "0301.99.10 - BREEDING SAMPLE",
+      text: "Appearance: the body is balanced and fins are normal.",
+      score: 80
+    });
+    const result = handleSelectedSectionQa(
+      "Breeding sample appearance requirements?",
+      selected,
+      undefined,
+      [candidateFor(selected, { finalScore: 80, matchedTerms: ["breeding", "sample"] })],
+      detectIntent("Breeding sample appearance requirements?")
+    );
+
+    expect(result.answer).toBe("Tôi đã tìm thấy section liên quan, nhưng chưa thể trích xuất câu trả lời từ nội dung section. Vui lòng thử lại hoặc bật API key.");
+    expect(result.answer).not.toContain("Sản phẩm là");
+    expect(result.answer).not.toContain("HS Code");
   });
 
   it("summarizes chapter 2 dynamically without selecting a product section", () => {

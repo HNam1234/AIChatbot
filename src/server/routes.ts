@@ -35,7 +35,7 @@ import {
 import { JobStore } from "./jobStore";
 import { runPipelineProcess } from "./pipelineProcessRunner";
 import { QAValidator } from "../validators/qaValidator";
-import { GeminiRoundRobinClient } from "../agent/geminiClient";
+import { GeminiRoundRobinClient, type SelectedSectionAnswerContext } from "../agent/geminiClient";
 import {
   buildStructuredRetrievedContext,
   detectContrastTerms,
@@ -59,12 +59,14 @@ import {
 import {
   handleClarificationNeeded,
   handleChapterSummary,
+  handleDefinition,
   handleDocumentSummary,
   handleExactHsCodeLookup,
   handleProductClassification,
   handleSelectedSectionQa,
   asksForHsCodeOrClassification,
   detectIntent,
+  detectAmbiguousLookup,
   type RoutedQaAnswer,
   type QaDocumentMetadata
 } from "../agent/qaIntentRouter";
@@ -78,6 +80,8 @@ const tmpDir = path.resolve(process.cwd(), "data", "tmp");
 const MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024;
 const MAX_UPLOAD_TOTAL_BYTES = 500 * 1024 * 1024;
 const MAX_UPLOAD_FILES = 50;
+const SAFE_SELECTED_SECTION_FALLBACK = "Tôi đã tìm thấy section liên quan, nhưng chưa thể trích xuất câu trả lời từ nội dung section. Vui lòng thử lại hoặc bật API key.";
+const MISSING_SECTION_TEXT_FALLBACK = "Tìm thấy section liên quan nhưng thiếu nội dung chi tiết để trả lời.";
 const SEARCH_STOPWORDS = new Set([
   "the",
   "and",
@@ -582,7 +586,7 @@ export function createApiRouter(): express.Router {
       const requestScope = stringValue(req.body.scope) ?? "selected";
       if (requestScope === "all") {
         const cachedAnswer = await answerFromCachedTrees(question, {
-          geminiApiKeys: requestGeminiApiKeys,
+          geminiApiKeys: requestGeminiApiKeys.length > 0 ? requestGeminiApiKeys : undefined,
           debug: booleanValue(req.body.debug),
           answerStyle: parseAnswerStyle(req.body.answerStyle)
         });
@@ -597,7 +601,7 @@ export function createApiRouter(): express.Router {
           return;
         }
         const cachedAnswer = await answerFromCachedTrees(question, {
-          geminiApiKeys: requestGeminiApiKeys,
+          geminiApiKeys: requestGeminiApiKeys.length > 0 ? requestGeminiApiKeys : undefined,
           debug: booleanValue(req.body.debug),
           cachedTreeDocuments: requestedCachedTreeDocuments,
           answerStyle: parseAnswerStyle(req.body.answerStyle)
@@ -609,7 +613,7 @@ export function createApiRouter(): express.Router {
 
       if (requestScope === "local-sections") {
         const cachedAnswer = await answerFromCachedTrees(question, {
-          geminiApiKeys: requestGeminiApiKeys,
+          geminiApiKeys: requestGeminiApiKeys.length > 0 ? requestGeminiApiKeys : undefined,
           debug: booleanValue(req.body.debug),
           localSectionDocuments: splitDocIds(stringValue(req.body.document)),
           answerStyle: parseAnswerStyle(req.body.answerStyle)
@@ -1458,6 +1462,9 @@ export async function answerFromCachedTrees(
     debug?: boolean;
     cachedTreeDocuments?: string[];
     localSectionDocuments?: string[];
+    selectedSectionAnswerer?: {
+      synthesizeSectionAnswer(section: SelectedSectionAnswerContext, query: string, options?: { language?: string }): Promise<string>;
+    };
     answerStyle?: AnswerStyleOption;
   } = {}
 ): Promise<Record<string, unknown>> {
@@ -1610,7 +1617,10 @@ export async function answerFromCachedTrees(
         answerRepairApplied: false
       },
       ...buildCacheResponseFields(documents, retrieval.retrievalSource),
-      answerGeneration: "template"
+      answerGeneration: "safe-fallback",
+      llmCalled: false,
+      sectionTextChars: 0,
+      fallbackReason: "no_selected_section"
     };
     return options.debug
       ? {
@@ -1632,7 +1642,9 @@ export async function answerFromCachedTrees(
         };
   }
 
-  const topHits = hits.slice(0, 10);
+  const hydratedPrimary = hydrateSelectedSectionText(hits[0], sectionMetadata, documentMetadata);
+  const sectionTextChars = selectedSectionTextChars(hydratedPrimary);
+  const topHits = [hydratedPrimary, ...hits.slice(1, 10)];
   const context = buildStructuredRetrievedContext(topHits);
   const marker12 = TokenValidator.validateContextSize(context.slice(0, 12000), { maxChars: 12000 });
   serverTrace("answerFromCachedTrees", "context prepared", {
@@ -1642,86 +1654,135 @@ export async function answerFromCachedTrees(
   });
   let llmAnswer: string | undefined;
   let llmError: string | undefined;
+  let llmCalled = false;
+  let fallbackReason: string | null = null;
   const explicitHsQuestion = asksForHsCodeOrClassification(question);
-  const useTemplateFastPath = explicitHsQuestion && shouldUseTemplateFastPath("product_classification", hits[0], answerStyle);
-  if (useTemplateFastPath) {
-    serverTrace("answerFromCachedTrees", "template fast path used", {
-      intent: explicitHsQuestion ? "product_classification" : detection.intent,
+  const alternatives = selectAlternativeSections(topHits, retrievalQuestion);
+  const candidateRelevance = retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults;
+  const broadAmbiguity = detectAmbiguousLookup(question, candidateRelevance);
+  const selectedSectionContext = buildStructuredRetrievedContext([hydratedPrimary]).slice(0, 12000);
+  const selectedSectionContextChars = selectedSectionContext.length;
+  if (explicitHsQuestion) {
+    serverTrace("answerFromCachedTrees", "metadata template used", {
+      intent: "product_classification",
       selectedSection: hits[0].section,
       answerStyle
     });
-  }
-  try {
-    if (useTemplateFastPath) {
-      throw new TemplateFastPathSkip();
-    }
-    if (!explicitHsQuestion && options.geminiApiKeys?.length === 0) {
-      throw new TemplateFastPathSkip();
-    }
-    const llm = new GeminiRoundRobinClient({ apiKeys: resolveGeminiApiKeys(options.geminiApiKeys ?? []) });
+  } else if (detection.intent === "selected_section_qa" && !broadAmbiguity) {
+    const apiKeys = options.selectedSectionAnswerer ? [] : resolveOptionalGeminiApiKeys(options.geminiApiKeys);
+    const llmKeyCount: number | "injected" = options.selectedSectionAnswerer ? "injected" : apiKeys.length;
+    const llmTraceDetails = {
+      llmKeyCount,
+      sectionTextChars,
+      contextChars: selectedSectionContextChars,
+      selectedSection: hydratedPrimary.section
+    };
     const llmStartedAt = Date.now();
-    serverTrace("answerFromCachedTrees", "gemini synthesis started", { keyCount: llm.keyCount });
-    llmAnswer = explicitHsQuestion
-      ? await llm.synthesizeAnswer(
-          context.slice(0, 12000),
-          [
-            question,
-            "",
-            "Use the retrieved section metadata. If hsCode is present, final answer must include HS Code.",
-            "Citation must include document, page/page range, and section.",
-            "Do not invent HS Code. Prefer metadata for hsCode/title/citation."
-          ].join("\n")
-        )
-      : await llm.synthesizeSectionAnswer({
-          document: hits[0].document,
-          section: hits[0].section,
-          title: hits[0].title,
-          hsCode: hits[0].hsCode,
-          source: hits[0].source,
-          text: hits[0].text
-        }, question, { language: "Vietnamese" });
-    if (explicitHsQuestion && llmAnswer && answerMentionsHsCodeOutsideSection(llmAnswer, topHits[0])) {
-      serverTrace("answerFromCachedTrees", "unsupported HS code detected; retrying strict prompt", {
-        selectedSection: topHits[0].section,
-        allowedCodes: hsCodesForSection(topHits[0])
+    serverTrace("answerFromCachedTrees", "selected_section_qa llm start", llmTraceDetails);
+
+    if (sectionTextChars === 0) {
+      fallbackReason = "missing_section_text";
+      llmAnswer = MISSING_SECTION_TEXT_FALLBACK;
+      serverTrace("answerFromCachedTrees", "selected_section_qa llm failed with reason", {
+        ...llmTraceDetails,
+        reason: fallbackReason
       });
-      llmAnswer = await llm.synthesizeAnswer(
-        context.slice(0, 12000),
-        [
-          question,
-          "",
-          "Your previous answer selected an HS code not present in the retrieved section metadata.",
-          "Re-answer using only the provided section metadata.",
-          `Allowed HS codes for the selected section: ${hsCodesForSection(topHits[0]).join(", ")}`
-        ].join("\n")
-      );
-    }
-    serverTrace("answerFromCachedTrees", "gemini synthesis completed", {
-      answerChars: llmAnswer.length,
-      elapsedMs: Date.now() - llmStartedAt
-    });
-  } catch (error) {
-    if (error instanceof TemplateFastPathSkip) {
-      llmError = undefined;
+    } else if (selectedSectionContextChars === 0) {
+      fallbackReason = "missing_context";
+      llmAnswer = MISSING_SECTION_TEXT_FALLBACK;
+      serverTrace("answerFromCachedTrees", "selected_section_qa llm failed with reason", {
+        ...llmTraceDetails,
+        reason: fallbackReason
+      });
+    } else if (!options.selectedSectionAnswerer && apiKeys.length === 0) {
+      fallbackReason = "llm_unavailable";
+      llmAnswer = SAFE_SELECTED_SECTION_FALLBACK;
+      serverTrace("answerFromCachedTrees", "selected_section_qa llm failed with reason", {
+        ...llmTraceDetails,
+        reason: fallbackReason
+      });
     } else {
-    llmError = error instanceof Error ? error.message : String(error);
-    serverTrace("answerFromCachedTrees", "gemini synthesis failed; using fallback formatter", { error: llmError });
+      try {
+        const llm = options.selectedSectionAnswerer ?? new GeminiRoundRobinClient({ apiKeys });
+        llmCalled = true;
+        llmAnswer = await llm.synthesizeSectionAnswer({
+          document: hydratedPrimary.document,
+          section: hydratedPrimary.section,
+          title: hydratedPrimary.title,
+          hsCode: hydratedPrimary.hsCode,
+          source: hydratedPrimary.source,
+          text: hydratedPrimary.text,
+          context: selectedSectionContext
+        }, question, { language: "Vietnamese" });
+
+        if (!llmAnswer?.trim()) {
+          fallbackReason = "empty_llm_answer";
+          llmError = fallbackReason;
+          llmAnswer = SAFE_SELECTED_SECTION_FALLBACK;
+          serverTrace("answerFromCachedTrees", "selected_section_qa llm failed with reason", {
+            ...llmTraceDetails,
+            reason: fallbackReason,
+            elapsedMs: Date.now() - llmStartedAt
+          });
+        } else {
+          serverTrace("answerFromCachedTrees", "selected_section_qa llm completed", {
+            ...llmTraceDetails,
+            answerChars: llmAnswer.length,
+            elapsedMs: Date.now() - llmStartedAt
+          });
+        }
+      } catch (error) {
+        llmError = error instanceof Error ? error.message : String(error);
+        fallbackReason = llmError;
+        llmAnswer = SAFE_SELECTED_SECTION_FALLBACK;
+        serverTrace("answerFromCachedTrees", "selected_section_qa llm failed with reason", {
+          ...llmTraceDetails,
+          reason: llmError,
+          elapsedMs: Date.now() - llmStartedAt
+        });
+      }
     }
   }
-  const alternatives = selectAlternativeSections(hits, retrievalQuestion);
-  const candidateRelevance = retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults;
+  const answerGeneration = broadAmbiguity
+    ? "ambiguous-lookup"
+    : explicitHsQuestion
+    ? "template-classification"
+    : detection.intent === "definition"
+      ? "template-definition"
+    : llmAnswer && fallbackReason === null
+      ? "llm-selected-section"
+      : "safe-fallback";
   const routed = explicitHsQuestion
-    ? handleProductClassification(question, hits[0], alternatives, llmAnswer, candidateRelevance, detection, {
+    ? handleProductClassification(question, hydratedPrimary, alternatives, llmAnswer, candidateRelevance, detection, {
         ...baseDebug,
         ...debugReport,
-        answerGeneration: "template"
+        answerGeneration,
+        llmCalled,
+        sectionTextChars,
+        contextChars: selectedSectionContextChars,
+        fallbackReason
       })
-    : handleSelectedSectionQa(question, hits[0], llmAnswer, candidateRelevance, detection, {
+    : detection.intent === "definition"
+      ? handleDefinition(question, hydratedPrimary, candidateRelevance, detection, {
+          ...baseDebug,
+          ...debugReport,
+          answerGeneration,
+          llmCalled,
+          sectionTextChars,
+          contextChars: selectedSectionContextChars,
+          fallbackReason
+        })
+    : handleSelectedSectionQa(question, hydratedPrimary, llmAnswer, candidateRelevance, detection, {
         ...baseDebug,
         ...debugReport,
-        answerGeneration: llmAnswer ? "llm" : "template-fallback"
+        answerGeneration,
+        llmCalled,
+        sectionTextChars,
+        contextChars: selectedSectionContextChars,
+        fallbackReason
       });
   const answer = routed.answer;
+  const finalAnswerGeneration = typeof routed.debug.answerGeneration === "string" ? routed.debug.answerGeneration : answerGeneration;
   const finalHsCodes = Array.isArray(routed.debug.finalHsCodes) ? routed.debug.finalHsCodes as string[] : hsCodesForSection(hits[0]);
   const answerRepairApplied = Boolean(routed.debug.answerRepairApplied);
   const marker13 = TokenValidator.validateOutputSize(answer, { maxWords: 180 });
@@ -1763,7 +1824,11 @@ export async function answerFromCachedTrees(
     citations: routed.citations,
     retrievedSections: topHits.slice(0, 5).map(publicSectionCitation),
     metadataWarnings: hits[0].metadataWarnings,
-    answerGeneration: useTemplateFastPath ? "template" : llmAnswer ? "llm" : "template-fallback",
+    answerGeneration: finalAnswerGeneration,
+    llmCalled,
+    sectionTextChars,
+    contextChars: selectedSectionContextChars,
+    fallbackReason,
     llmError,
     validation: {
       ...validation,
@@ -1842,6 +1907,9 @@ export async function answerQuestionForEval(
   options: {
     cachedTreeDocuments?: string[];
     localSectionDocuments?: string[];
+    selectedSectionAnswerer?: {
+      synthesizeSectionAnswer(section: SelectedSectionAnswerContext, query: string, options?: { language?: string }): Promise<string>;
+    };
     debug?: boolean;
   } = {}
 ): Promise<Record<string, unknown>> {
@@ -1966,6 +2034,18 @@ function summarizePageIndexUploadStatus(cachedDocuments: CachedTreeDocument[]): 
 }
 
 class TemplateFastPathSkip extends Error {}
+
+function resolveOptionalGeminiApiKeys(overrides: string[] | undefined): string[] {
+  if (overrides !== undefined) {
+    return uniqueStrings(overrides.map((key) => key.trim()).filter(Boolean));
+  }
+
+  try {
+    return resolveGeminiApiKeys();
+  } catch {
+    return [];
+  }
+}
 
 function shouldUseTemplateFastPath(intent: string, section: EnrichedRetrievedSection, answerStyle: AnswerStyleOption): boolean {
   if (answerStyle === "verbose") {
@@ -2267,6 +2347,93 @@ function createQaDebugReport(question: string, retrieval: CachedTreeRetrievalRes
     finalAnswerHsCodes: [],
     answerRepairApplied: false
   };
+}
+
+function hydrateSelectedSectionText(
+  section: EnrichedRetrievedSection,
+  sectionMetadata: SectionMetadata[],
+  documentMetadata: QaDocumentMetadata[]
+): EnrichedRetrievedSection {
+  if (selectedSectionTextChars(section) > 0) {
+    return section;
+  }
+
+  const metadata = findMatchingSectionMetadata(section, sectionMetadata);
+  if (metadata) {
+    const text = [metadata.text, metadata.textPreview].filter(Boolean).join("\n\n").trim();
+    const captions = uniqueStrings([...(section.captions ?? []), ...(metadata.captions ?? [])]);
+    if (text || captions.length > 0) {
+      return {
+        ...section,
+        chapter: section.chapter ?? metadata.chapter,
+        pageStart: section.pageStart ?? metadata.pageStart,
+        pageEnd: section.pageEnd ?? metadata.pageEnd,
+        source: section.source ?? metadata.source,
+        text,
+        captions
+      };
+    }
+  }
+
+  const markdownText = documentMetadata
+    .filter((document) => document.document === section.document)
+    .map((document) => [document.markdownText, document.rootText].filter(Boolean).join("\n\n"))
+    .find((text) => text.trim());
+  const markdownSection = markdownText ? extractMarkdownSectionBody(markdownText, section) : "";
+  return markdownSection ? { ...section, text: markdownSection } : section;
+}
+
+function selectedSectionTextChars(section: EnrichedRetrievedSection): number {
+  return `${section.text ?? ""} ${(section.captions ?? []).join(" ")}`.trim().length;
+}
+
+function findMatchingSectionMetadata(
+  section: EnrichedRetrievedSection,
+  sectionMetadata: SectionMetadata[]
+): SectionMetadata | undefined {
+  const codes = new Set(hsCodesForSection(section));
+  const normalizedTitle = normalizeSearchText(`${section.title ?? ""} ${section.section ?? ""}`);
+  return sectionMetadata.find((candidate) => {
+    if (candidate.document !== section.document) {
+      return false;
+    }
+    const candidateCodes = new Set([...(candidate.groupedHsCodes ?? []), candidate.hsCode].filter((code): code is string => Boolean(code)));
+    if ([...codes].some((code) => candidateCodes.has(code))) {
+      return true;
+    }
+    const candidateTitle = normalizeSearchText(`${candidate.title ?? ""} ${candidate.section ?? ""}`);
+    return Boolean(normalizedTitle && candidateTitle && (normalizedTitle.includes(candidateTitle) || candidateTitle.includes(normalizedTitle)));
+  });
+}
+
+function extractMarkdownSectionBody(markdown: string, section: EnrichedRetrievedSection): string {
+  const lines = markdown.split(/\r?\n/g);
+  const code = section.hsCode;
+  const title = normalizeSearchText(section.title ?? section.section ?? "");
+  const startIndex = lines.findIndex((line) => {
+    const normalized = normalizeSearchText(line);
+    return Boolean(
+      line.startsWith("#") &&
+      ((code && line.includes(code)) || (title && normalized.includes(title)))
+    );
+  });
+  if (startIndex < 0) {
+    return "";
+  }
+  const startLevel = headingLevel(lines[startIndex]);
+  const body: string[] = [];
+  for (const line of lines.slice(startIndex + 1)) {
+    const level = headingLevel(line);
+    if (level > 0 && level <= startLevel) {
+      break;
+    }
+    body.push(line);
+  }
+  return body.join("\n").replace(/\s+/g, " ").trim();
+}
+
+function headingLevel(line: string): number {
+  return line.match(/^(#{1,6})\s/)?.[1].length ?? 0;
 }
 
 function answerMentionsHsCodeOutsideSection(answer: string, section: EnrichedRetrievedSection): boolean {

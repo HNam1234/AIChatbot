@@ -279,7 +279,7 @@ describe("qaAnswerFormatter", () => {
     expect(result.answer).toContain("Wheat not fit for human consumption");
     expect(result.answer).toContain("HS Code:");
     expect(result.answer).toContain("1001.99.10");
-    expect(result.answer).not.toContain("Nguá»“n:");
+    expect(result.answer).not.toContain("NguÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚Â»ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œn:");
     expect(result.answer).not.toContain("9999.99.99");
   });
 
@@ -292,7 +292,7 @@ describe("qaAnswerFormatter", () => {
       text: "Arabica coffee has a milder taste."
     });
 
-    const result = renderHsCodeAnswer(undefined, section, [], { question: "Arabica coffee thuá»™c mÃ£ HS nÃ o?" });
+    const result = renderHsCodeAnswer(undefined, section, [], { question: "Arabica coffee thuÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚Â»ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢c mÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â£ HS nÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â o?" });
 
     expect(result.answer).toBe("Sản phẩm là Arabica coffee, HS Code: 0901.21.12.");
   });
@@ -306,7 +306,7 @@ describe("qaAnswerFormatter", () => {
       text: "Agarwood chips are resinous fragrant wood pieces used for incense and perfume."
     });
 
-    const result = renderHsCodeAnswer(undefined, section, [], { question: "Agarwood chips lÃ  mÃ£ nÃ o?" });
+    const result = renderHsCodeAnswer(undefined, section, [], { question: "Agarwood chips lÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â  mÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â£ nÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â o?" });
 
     expect(result.answer).toBe("Sản phẩm là Agarwood (Gaharu) chips, HS Code: 1211.90.95.");
   });
@@ -321,7 +321,7 @@ describe("qaAnswerFormatter", () => {
     });
 
     const result = renderHsCodeAnswer(undefined, section, [], {
-      question: "Resinous fragrant agarwood chips dÃ¹ng lÃ m incense thuá»™c mÃ£ nÃ o?"
+      question: "Resinous fragrant agarwood chips dÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¹ng lÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â m incense thuÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚Â»ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢c mÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â£ nÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â o?"
     });
 
     expect(result.answer).toBe("Sản phẩm là Agarwood (Gaharu) chips, HS Code: 1211.90.95.");
@@ -344,10 +344,10 @@ describe("qaAnswerFormatter", () => {
     expect(result.answer).toContain("0207.45.10");
     expect(result.answer).toContain("hoặc");
     expect(result.answer).toContain("tùy trạng thái hàng hóa");
-    expect(result.answer).not.toContain("Nguá»“n:");
+    expect(result.answer).not.toContain("Nguồn:");
   });
 
-  it("renders definition answers with selected HS code metadata", () => {
+  it("renders definition answers from selected text with a concise HS Code attachment", () => {
     const section = sectionFixture({
       document: "Chapter01.pdf",
       hsCode: "0102.29.11",
@@ -359,8 +359,7 @@ describe("qaAnswerFormatter", () => {
     const result = renderHsCodeAnswer(undefined, section, [], { question: "What is Oxen?" });
 
     expect(result.answer).toBe("Oxen are castrated adult male bovine animals. HS Code: 0102.29.11.");
-    expect(result.answer).toContain("HS Code: 0102.29.11");
-    expect(result.answer).not.toContain("Nguá»“n:");
+    expect(result.answer).not.toContain("NguÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚Â»ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œn:");
   });
 
   it("uses Vietnamese definition wrapper for mixed-language definition questions", () => {
@@ -372,10 +371,9 @@ describe("qaAnswerFormatter", () => {
       text: "Oxen are castrated adult male bovine animals. They are commonly used as draught animals."
     });
 
-    const result = renderHsCodeAnswer(undefined, section, [], { question: "Oxen là gì?" });
+    const result = renderHsCodeAnswer(undefined, section, [], { question: "Oxen lÃƒÆ’Ã‚Â  gÃƒÆ’Ã‚Â¬?" });
 
     expect(result.answer).toBe("Oxen là castrated adult male bovine animals. HS Code: 0102.29.11.");
-    expect(result.answer).toContain("HS Code: 0102.29.11");
   });
 
   it("keeps metadata template when definition-like wording explicitly asks for HS code", () => {
@@ -387,7 +385,7 @@ describe("qaAnswerFormatter", () => {
       text: "Oxen are castrated adult male bovine animals. They are commonly used as draught animals."
     });
 
-    const result = renderHsCodeAnswer(undefined, section, [], { question: "Oxen HS Code là gì?" });
+    const result = renderHsCodeAnswer(undefined, section, [], { question: "Oxen HS Code lÃƒÆ’Ã‚Â  gÃƒÆ’Ã‚Â¬?" });
 
     expect(result.answer).toBe("Sản phẩm là Oxen, HS Code: 0102.29.11.");
   });
@@ -428,7 +426,7 @@ describe("qaAnswerFormatter", () => {
 
     expect(result.answer).toContain("HS Code: 0901.11.30");
     expect(result.answer).not.toContain("0901.21.12");
-    expect(result.answer).not.toContain("MÃ£ liÃªn quan");
+    expect(result.answer).not.toContain("MÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â£ liÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Âªn quan");
   });
 
   it("extracts distinctive signals and selects an attribute-heavy candidate by properties", () => {
@@ -499,7 +497,7 @@ describe("qaAnswerFormatter", () => {
       text: "Grouped HS code set: 1211.90.11, 1211.90.19. Medicinal roots may be fresh or dried."
     });
 
-    const result = renderHsCodeAnswer(undefined, section, [], { question: "What are medicinal roots?" });
+    const result = renderHsCodeAnswer(undefined, section, [], { question: "What HS Code are medicinal roots?" });
 
     expect(result.finalHsCodes).toEqual(["1211.90.11", "1211.90.19"]);
     expect(result.answer).toContain("1211.90.11");
@@ -584,7 +582,7 @@ describe("qaAnswerFormatter", () => {
       text: "Chapter 10 content summary."
     });
 
-    const relevance = evaluateCandidateRelevance(candidate, "chapter 10 ná»™i dung");
+    const relevance = evaluateCandidateRelevance(candidate, "chapter 10 nÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚Â»ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢i dung");
 
     expect(relevance.rejected).toBe(true);
     expect(relevance.rejectedReason).toContain("weak generic");
