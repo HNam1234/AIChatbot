@@ -461,6 +461,93 @@ describe("qaAnswerFormatter", () => {
     expect(answer.answer).not.toContain("Chapter09.pdf");
   });
 
+  it("expands Cambodia fragrant rice queries to curated Malys aliases only inside the rice scope", () => {
+    const query = "Một loại gạo thơm của Cambodia, có hạt dài, mùi thơm tự nhiên và thường được gọi là premium fragrant rice. HS Code đúng là gì?";
+    const signals = extractQuerySignals(query);
+    const unrelatedSignals = extractQuerySignals("Cambodia agarwood chips");
+
+    expect(signals.originTerms).toContain("cambodia");
+    expect(signals.domainAliasTerms).toContain("malys rice");
+    expect(signals.domainAliasTerms).toContain("malys angkor");
+    expect(unrelatedSignals.domainAliasTerms).not.toContain("malys rice");
+    expect(unrelatedSignals.domainAliasTerms).toEqual([]);
+  });
+
+  it("promotes Malys rice over generic other fragrant rice when Cambodia rice aliases match", () => {
+    const query = "Một loại gạo thơm của Cambodia, có hạt dài, mùi thơm tự nhiên và thường được gọi là premium fragrant rice. HS Code đúng là gì?";
+    const malys = sectionFixture({
+      document: "Chapter10.pdf",
+      hsCode: "1006.30.60",
+      title: "MALYS RICE",
+      section: "1006.30.60 - MALYS RICE",
+      text: "Malys rice, also known as Malys Angkor rice, refers to premium aromatic rice varieties. The kernel is extra-long and has a strong natural unique scent. Varieties include Phka Rumduol, Phka Rumdeng, Phka Romeat and Somaly.",
+      score: 2
+    });
+    const otherFragrant = sectionFixture({
+      document: "Chapter10.pdf",
+      hsCode: "1006.30.70",
+      title: "OTHER FRAGRANT RICE",
+      section: "1006.30.70 - OTHER FRAGRANT RICE",
+      text: "Fragrant rice, also known as aromatic rice, is a type of premium rice which has a natural fragrance and a medium to long grain shape.",
+      score: 30
+    });
+    const basmati = sectionFixture({
+      document: "Chapter10.pdf",
+      hsCode: "1006.30.50",
+      title: "BASMATI RICE",
+      section: "1006.30.50 - BASMATI RICE",
+      text: "Basmati rice is a long slender-grained fragrant rice with distinctive fragrance.",
+      score: 12
+    });
+
+    const selection = selectRelevantSections([otherFragrant, basmati, malys], query, { requireHsMetadata: true });
+    const selectedRelevance = evaluateCandidateRelevance(selection.ranked[0], query, selection.signals);
+    const selectedCandidate = selection.candidates.find((candidate) => candidate.hsCode === "1006.30.60");
+    const answer = renderHsCodeAnswer(undefined, selection.ranked[0], [], { question: query });
+
+    expect(selection.ranked[0].title).toBe("MALYS RICE");
+    expect(selectedRelevance.candidateAliasSignals).toContain("malys rice");
+    expect(selectedCandidate?.validation?.strongSignals).toContain("country_product_alias_match");
+    expect(answer.finalHsCodes).toEqual(["1006.30.60"]);
+    expect(answer.answer).toContain("HS Code: 1006.30.60");
+  });
+
+  it("keeps generic and Thailand fragrant rice queries out of the Cambodia Malys alias path", () => {
+    const malys = sectionFixture({
+      document: "Chapter10.pdf",
+      hsCode: "1006.30.60",
+      title: "MALYS RICE",
+      section: "1006.30.60 - MALYS RICE",
+      text: "Malys rice, also known as Malys Angkor rice, is premium aromatic rice with extra-long kernels.",
+      score: 2
+    });
+    const otherFragrant = sectionFixture({
+      document: "Chapter10.pdf",
+      hsCode: "1006.30.70",
+      title: "OTHER FRAGRANT RICE",
+      section: "1006.30.70 - OTHER FRAGRANT RICE",
+      text: "Fragrant rice, also known as aromatic rice, is a type of premium fragrant rice with a natural fragrance.",
+      score: 2
+    });
+    const homMali = sectionFixture({
+      document: "Chapter10.pdf",
+      hsCode: "1006.30.40",
+      title: "HOM MALI RICE",
+      section: "1006.30.40 - HOM MALI RICE",
+      text: "Hom Mali rice, also known as Thai Hom Mali rice, means non-glutinous fragrant rice varieties with long grain kernels.",
+      source: "Thailand",
+      score: 2
+    });
+
+    const genericSelection = selectRelevantSections([malys, otherFragrant], "premium fragrant rice HS Code?", { requireHsMetadata: true });
+    const thaiSelection = selectRelevantSections([malys, homMali], "Thai Hom Mali fragrant rice long grain HS Code?", { requireHsMetadata: true });
+
+    expect(extractQuerySignals("premium fragrant rice HS Code?").domainAliasTerms).toEqual([]);
+    expect(genericSelection.ranked[0].title).toBe("OTHER FRAGRANT RICE");
+    expect(extractQuerySignals("Thai Hom Mali fragrant rice long grain HS Code?").domainAliasTerms).toEqual([]);
+    expect(thaiSelection.ranked[0].title).toBe("HOM MALI RICE");
+  });
+
   it("penalizes contrast-only candidates and promotes positive attribute evidence", () => {
     const baselineOnly = sectionFixture({
       document: "Chapter09.pdf",
@@ -486,6 +573,18 @@ describe("qaAnswerFormatter", () => {
 
     expect(selection.ranked[0].hsCode).toBe(target.hsCode);
     expect(baselineRelevance.rejected || baselineRelevance.relevanceScore < targetRelevance.relevanceScore).toBe(true);
+  });
+
+  it("keeps comparison baselines out of positive query signals", () => {
+    const contrast = detectContrastTerms("Which coffee is more bitter than Arabica and has higher caffeine?");
+    const signals = extractQuerySignals("Which coffee is more bitter than Arabica and has higher caffeine?");
+
+    expect(contrast.baselineTokens).toEqual(["arabica"]);
+    expect(signals.queryTokens).toContain("bitter");
+    expect(signals.queryTokens).toContain("high");
+    expect(signals.queryTokens).toContain("caffeine");
+    expect(signals.queryTokens).not.toContain("arabica");
+    expect(signals.scientificNames).toEqual([]);
   });
 
   it("keeps grouped codes for unspecified subtype/state", () => {

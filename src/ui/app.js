@@ -38,6 +38,12 @@ const questionDocIdInput = document.querySelector("#question-doc-id");
 const questionDocScopeEl = document.querySelector("#question-doc-scope");
 const answerEl = document.querySelector("#answer");
 const pageIndexKeyInput = document.querySelector("#pageindex-key");
+const llmProviderSelect = document.querySelector("#llm-provider");
+const enableLlmQaInput = document.querySelector("#enable-llm-qa");
+const enableLlmQueryExpansionInput = document.querySelector("#enable-llm-query-expansion");
+const bifrostKeyInput = document.querySelector("#bifrost-key");
+const bifrostBaseUrlInput = document.querySelector("#bifrost-base-url");
+const bifrostModelInput = document.querySelector("#bifrost-model");
 const geminiKeyInputs = [...document.querySelectorAll("[data-gemini-key-input]")];
 const geminiKeyEnabledInputs = [...document.querySelectorAll("[data-gemini-key-enabled]")];
 const temporaryPageIndexKeyInput = document.querySelector("#temporary-pageindex-key");
@@ -46,8 +52,11 @@ const uploadPageIndexInput = document.querySelector("#upload-pageindex");
 const reusePageIndexCacheInput = document.querySelector("#reuse-pageindex-cache");
 const pageIndexSettingsStatusEl = document.querySelector("#pageindex-settings-status");
 const geminiSettingsStatusEl = document.querySelector("#gemini-settings-status");
+const bifrostSettingsStatusEl = document.querySelector("#bifrost-settings-status");
 const savePageIndexKeyButton = document.querySelector("#save-pageindex-key");
+const saveBifrostSettingsButton = document.querySelector("#save-bifrost-settings");
 const togglePageIndexKeyButton = document.querySelector("#toggle-pageindex-key");
+const toggleBifrostKeyButton = document.querySelector("#toggle-bifrost-key");
 const toggleGeminiKeyButtons = [...document.querySelectorAll("[data-toggle-gemini-key]")];
 const saveGeminiKeyButtons = [...document.querySelectorAll("[data-save-gemini-key]")];
 const pageIndexWarningEl = document.querySelector("#pageindex-warning");
@@ -127,7 +136,15 @@ let settings = {
   maskedLegacyGeminiApiKey: null,
   geminiKeySlots: [],
   configuredGeminiKeyCount: 0,
-  enabledGeminiKeyCount: 0
+  enabledGeminiKeyCount: 0,
+  llmProvider: "gemini",
+  hasBifrostApiKey: false,
+  maskedBifrostApiKey: null,
+  bifrostBaseUrl: null,
+  bifrostModel: "gpt-5.5",
+  enableLlmQa: false,
+  enableLlmQueryExpansion: false,
+  queryExpansionProvider: "none"
 };
 
 void loadSettings();
@@ -204,6 +221,15 @@ nextPageButton.addEventListener("click", () => setPdfPage(currentPage + 1));
 pageNumberInput.addEventListener("change", () => setPdfPage(Number(pageNumberInput.value) || 1));
 
 togglePageIndexKeyButton.addEventListener("click", () => togglePasswordInput(pageIndexKeyInput, togglePageIndexKeyButton));
+toggleBifrostKeyButton.addEventListener("click", () => togglePasswordInput(bifrostKeyInput, toggleBifrostKeyButton));
+llmProviderSelect.addEventListener("change", () => {
+  if (llmProviderSelect.value === "bifrost") {
+    enableLlmQaInput.checked = true;
+    if (bifrostModelInput && !bifrostModelInput.value.trim()) {
+      bifrostModelInput.value = settings.bifrostModel || "gpt-5.5";
+    }
+  }
+});
 toggleGeminiKeyButtons.forEach((button) => {
   button.addEventListener("click", () => {
     const input = document.querySelector(`#${button.dataset.target}`);
@@ -224,6 +250,50 @@ savePageIndexKeyButton.addEventListener("click", async () => {
   settings.maskedPageIndexApiKey = payload.maskedKey;
   pageIndexSettingsStatusEl.textContent = `PageIndex key configured: yes (${payload.maskedKey})`;
   updatePageIndexWarning();
+});
+
+saveBifrostSettingsButton.addEventListener("click", async () => {
+  const apiKey = bifrostKeyInput.value.trim();
+  const baseUrl = bifrostBaseUrlInput.value.trim();
+  const model = bifrostModelInput.value.trim() || "gpt-5.5";
+  const llmProvider = llmProviderSelect.value || "gemini";
+  const enableLlmQa = enableLlmQaInput.checked;
+  const enableLlmQueryExpansion = enableLlmQueryExpansionInput.checked;
+  const queryExpansionProvider = enableLlmQueryExpansion
+    ? llmProvider === "bifrost" ? "openai" : "gemini"
+    : "none";
+
+  if (llmProvider === "bifrost" && !apiKey && !settings.hasBifrostApiKey) {
+    bifrostSettingsStatusEl.textContent = "Enter a Bifrost API key before switching to Bifrost.";
+    return;
+  }
+  if (llmProvider === "bifrost" && !baseUrl && !settings.bifrostBaseUrl) {
+    bifrostSettingsStatusEl.textContent = "Enter a Bifrost base URL before switching to Bifrost.";
+    return;
+  }
+
+  const payload = await saveBifrostSettings({
+    apiKey,
+    baseUrl,
+    model,
+    llmProvider,
+    enableLlmQa,
+    enableLlmQueryExpansion,
+    queryExpansionProvider
+  });
+  if (!payload) return;
+
+  bifrostKeyInput.value = "";
+  settings.llmProvider = payload.llmProvider;
+  settings.hasBifrostApiKey = Boolean(payload.maskedKey);
+  settings.maskedBifrostApiKey = payload.maskedKey;
+  settings.bifrostBaseUrl = payload.baseUrl;
+  settings.bifrostModel = payload.model;
+  settings.enableLlmQa = payload.enableLlmQa;
+  settings.enableLlmQueryExpansion = payload.enableLlmQueryExpansion;
+  settings.queryExpansionProvider = payload.queryExpansionProvider;
+  syncBifrostSettingsInputs();
+  renderBifrostSettingsStatus();
 });
 
 saveGeminiKeyButtons.forEach((button) => {
@@ -884,6 +954,13 @@ function renderDebugPanel(debug, indexSource, retrieval, payload = {}) {
         <dt>Scope</dt><dd><pre>${escapeHtml(JSON.stringify(payload.scope || debug.scope || {}, null, 2))}</pre></dd>
         <dt>Cache freshness</dt><dd><pre>${escapeHtml(JSON.stringify(payload.cacheFreshness || {}, null, 2))}</pre></dd>
         <dt>Answer generation</dt><dd>${escapeHtml(payload.answerGeneration || debug.answerGeneration || "unknown")}</dd>
+        <dt>LLM called</dt><dd>${escapeHtml(String(payload.llmCalled ?? debug.llmCalled ?? false))}</dd>
+        <dt>LLM skipped reason</dt><dd>${escapeHtml(payload.llmSkippedReason || debug.llmSkippedReason || "n/a")}</dd>
+        <dt>LLM error type</dt><dd>${escapeHtml(payload.llmErrorType || debug.llmErrorType || "n/a")}</dd>
+        <dt>Fallback reason</dt><dd>${escapeHtml(payload.fallbackReason || debug.fallbackReason || "n/a")}</dd>
+        <dt>Section text chars</dt><dd>${escapeHtml(String(payload.sectionTextChars ?? debug.sectionTextChars ?? 0))}</dd>
+        <dt>Context chars</dt><dd>${escapeHtml(String(payload.contextChars ?? debug.contextChars ?? 0))}</dd>
+        <dt>Field extraction</dt><dd><pre>${escapeHtml(JSON.stringify(debug.fieldExtraction || {}, null, 2))}</pre></dd>
         <dt>Signals</dt><dd><pre>${escapeHtml(JSON.stringify(debug.extractedSignals || {}, null, 2))}</pre></dd>
         <dt>Retrieval</dt><dd><pre>${escapeHtml(JSON.stringify(debug.retrieval || {}, null, 2))}</pre></dd>
       </dl>
@@ -2300,6 +2377,20 @@ async function saveApiKey(endpoint, apiKey, statusElement, extraPayload = {}) {
   return payload;
 }
 
+async function saveBifrostSettings(payload) {
+  const response = await fetch("/api/settings/bifrost", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const result = await response.json();
+  if (!response.ok) {
+    bifrostSettingsStatusEl.textContent = result.error || "Failed to save Bifrost settings.";
+    return null;
+  }
+  return result;
+}
+
 function uploadFormData(url, body, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -2360,6 +2451,14 @@ function syncGeminiEnabledInputs() {
   });
 }
 
+function syncBifrostSettingsInputs() {
+  llmProviderSelect.value = settings.llmProvider || "gemini";
+  enableLlmQaInput.checked = Boolean(settings.enableLlmQa);
+  enableLlmQueryExpansionInput.checked = Boolean(settings.enableLlmQueryExpansion);
+  bifrostBaseUrlInput.value = settings.bifrostBaseUrl || "";
+  bifrostModelInput.value = settings.bifrostModel || "gpt-5.5";
+}
+
 function selectedGeminiKeys() {
   if (!temporaryGeminiKeyInput.checked) {
     return [];
@@ -2382,10 +2481,12 @@ async function loadSettings() {
   if (!response.ok) {
     pageIndexSettingsStatusEl.textContent = "Could not load settings.";
     geminiSettingsStatusEl.textContent = "Could not load settings.";
+    bifrostSettingsStatusEl.textContent = "Could not load settings.";
     return;
   }
   settings = payload;
   syncGeminiEnabledInputs();
+  syncBifrostSettingsInputs();
   const secretWriteNote = payload.localDemoSecretWriteEnabled === false
     ? " Save disabled unless env variables are set outside the UI."
     : "";
@@ -2396,6 +2497,7 @@ async function loadSettings() {
     ? `Gemini keys configured: ${payload.configuredGeminiKeyCount || 1} (${payload.maskedGeminiApiKey})`
     : "Gemini keys configured: no";
   renderGeminiSettingsStatus();
+  renderBifrostSettingsStatus();
   updatePageIndexWarning();
 }
 
@@ -2462,6 +2564,24 @@ function renderGeminiSettingsStatus() {
   const legacy = settings.legacyGeminiKeyConfigured ? ` | legacy: ${settings.maskedLegacyGeminiApiKey}` : "";
   const enabledCount = settings.enabledGeminiKeyCount ?? slots.filter((slot) => slot.configured && slot.enabled !== false).length;
   geminiSettingsStatusEl.textContent = `Gemini slots: ${summary}${legacy} | active saved slots: ${enabledCount}`;
+}
+
+function renderBifrostSettingsStatus() {
+  const provider = settings.llmProvider || "gemini";
+  const keyLabel = settings.hasBifrostApiKey
+    ? `yes (${settings.maskedBifrostApiKey})`
+    : "no";
+  const baseUrl = settings.bifrostBaseUrl || "base URL not set";
+  const model = settings.bifrostModel || "gpt-5.5";
+  const qaState = settings.enableLlmQa ? "on" : "off";
+  const expansionState = settings.enableLlmQueryExpansion
+    ? `on (${settings.queryExpansionProvider || "none"})`
+    : "off";
+  const secretWriteNote = settings.localDemoSecretWriteEnabled === false
+    ? " | save disabled"
+    : "";
+
+  bifrostSettingsStatusEl.textContent = `Provider: ${provider} | LLM QA: ${qaState} | query expansion: ${expansionState} | Bifrost key: ${keyLabel} | ${baseUrl} | model: ${model}${secretWriteNote}`;
 }
 
 function updatePageIndexWarning() {

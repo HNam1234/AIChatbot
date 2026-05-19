@@ -6,9 +6,12 @@ interface QaEvalItem {
   id: string;
   question: string;
   expectedIntent: string;
+  expectedAnswerMode?: string;
   mustContainAll?: string[];
   mustContainAny?: string[];
   mustNotContain?: string[];
+  scopeDocuments?: string[];
+  shouldNotCallLlm?: boolean;
   expectedHsCodes?: string[];
   expectedDocument?: string | null;
   expectedTitleContains?: string | null;
@@ -28,7 +31,10 @@ async function main(): Promise<void> {
   const results: EvalResult[] = [];
 
   for (const item of items) {
-    const response = await answerQuestionForEval(item.question, { debug: true });
+    const response = await answerQuestionForEval(item.question, {
+      debug: true,
+      localSectionDocuments: item.scopeDocuments
+    });
     results.push(evaluateItem(item, response));
   }
 
@@ -52,6 +58,9 @@ function evaluateItem(item: QaEvalItem, response: Record<string, unknown>): Eval
 
   if (response.intent !== item.expectedIntent) {
     reasons.push(`expected intent ${item.expectedIntent}, got ${String(response.intent)}`);
+  }
+  if (item.expectedAnswerMode && response.answerMode !== item.expectedAnswerMode) {
+    reasons.push(`expected answer mode ${item.expectedAnswerMode}, got ${String(response.answerMode)}`);
   }
   for (const expected of item.mustContainAll ?? []) {
     if (!answerIncludes(answer, expected)) {
@@ -80,6 +89,9 @@ function evaluateItem(item: QaEvalItem, response: Record<string, unknown>): Eval
     if (!answerIncludes(title, item.expectedTitleContains) && !answerIncludes(answer, item.expectedTitleContains)) {
       reasons.push(`expected selected title/answer to contain ${item.expectedTitleContains}`);
     }
+  }
+  if (item.shouldNotCallLlm && response.llmCalled === true) {
+    reasons.push("expected no LLM call");
   }
 
   return { item, passed: reasons.length === 0, reasons, response };

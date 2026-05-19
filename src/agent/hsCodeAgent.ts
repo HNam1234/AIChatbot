@@ -1,4 +1,4 @@
-import { GeminiRoundRobinClient } from "./geminiClient";
+import { createLlmClient } from "./llmFactory";
 import { PageIndexMCP } from "./mcpClient";
 import { TokenValidator } from "../validators/tokenValidator";
 import type { ValidationMarkerResult } from "../types";
@@ -35,9 +35,9 @@ export async function runAgenticQuery(options: AgenticQueryOptions): Promise<Age
     apiKey: options.pageIndexApiKey,
     url: options.pageIndexMcpUrl
   });
-  const llm = new GeminiRoundRobinClient({
+  const llm = createLlmClient({
     apiKeys: options.geminiApiKeys,
-    model: options.geminiModel
+    geminiModel: options.geminiModel
   });
 
   try {

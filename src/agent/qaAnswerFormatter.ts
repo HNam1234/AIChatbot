@@ -1,3 +1,5 @@
+import type { QueryExpansionConfidence } from "./queryExpansion";
+
 export const HS_CODE_PATTERN = /\b\d{4}\.\d{2}\.\d{2}\b/;
 
 export interface SectionMetadata {
@@ -37,6 +39,9 @@ export interface EnrichedRetrievedSection {
   captions: string[];
   score: number;
   metadataWarnings: string[];
+  selectedEvidence?: string[];
+  scoreBreakdown?: ScoreBreakdown;
+  hydrationSource?: "retrieval" | "section-metadata" | "markdown";
 }
 
 export interface RenderedHsCodeAnswer {
@@ -72,6 +77,8 @@ export interface ContrastDetection {
 export interface QuerySignals {
   domainTerms: string[];
   productTerms: string[];
+  originTerms: string[];
+  domainAliasTerms: string[];
   physicalAttributes: string[];
   numericRanges: string[];
   usageTerms: string[];
@@ -82,6 +89,19 @@ export interface QuerySignals {
   queryPhrases: string[];
   quotedTerms: string[];
   capitalizedTerms: string[];
+}
+
+export interface ScoreBreakdown {
+  hsCode: number;
+  alias: number;
+  title: number;
+  heading: number;
+  body: number;
+  captions: number;
+  source: number;
+  numeric: number;
+  scientific: number;
+  contrastPenalty: number;
 }
 
 export interface CandidateRelevance {
@@ -103,11 +123,18 @@ export interface CandidateRelevance {
   queryPhrases: string[];
   candidateMatchedTokens: string[];
   candidateMatchedPhrases: string[];
+  matchedOriginalTerms?: string[];
+  matchedExpansionTerms?: string[];
+  matchedPhrases?: string[];
+  candidateAliasSignals?: string[];
+  expansionConfidence?: QueryExpansionConfidence;
   numericMatches: string[];
   contrastTerms: string[];
   finalScore: number;
   rejected: boolean;
   rejectedReason: string | null;
+  validation?: CandidateValidationResult;
+  scoreBreakdown?: ScoreBreakdown;
 }
 
 export interface RelevanceSelection {
@@ -115,6 +142,34 @@ export interface RelevanceSelection {
   ranked: EnrichedRetrievedSection[];
   candidates: CandidateRelevance[];
 }
+
+export type CandidateValidationResult = {
+  accepted: boolean;
+  confidence: "high" | "medium" | "low";
+  reason: string;
+  strongSignals: string[];
+  weakSignals: string[];
+  missingEvidence: string[];
+};
+
+export interface AllowedScope {
+  mode?: "all" | "selected";
+  allowedDocuments?: string[];
+  allowedDocumentSet?: Set<string>;
+}
+
+export type RetrievedCandidate = EnrichedRetrievedSection & {
+  relevance?: CandidateRelevance;
+  similarCandidateCount?: number;
+  dominanceMargin?: number;
+  selectedEvidence?: string[];
+  scoreBreakdown?: ScoreBreakdown;
+  hydrationSource?: "retrieval" | "section-metadata" | "markdown";
+};
+
+export type ValidatedCandidate = RetrievedCandidate & {
+  validation: CandidateValidationResult;
+};
 
 export function normalizeSectionMetadata(raw: Record<string, unknown>, fallbackDocument?: string): SectionMetadata {
   const document = stringValue(raw.document) ?? fallbackDocument ?? "";
@@ -350,24 +405,47 @@ export function extractQuerySignals(question: string): QuerySignals {
   const contrast = detectContrastTerms(question);
   const contrastTokenSet = new Set(contrast.baselineTokens);
   const quotedTerms = extractQuotedTerms(question);
-  const capitalizedTerms = extractCapitalizedTerms(question);
+  const capitalizedTerms = extractCapitalizedSignalTerms(question);
+  const physicalAttributes = extractKnownTerms(question, PHYSICAL_ATTRIBUTE_TERMS);
+  const usageTerms = extractKnownTerms(question, USAGE_TERMS);
+  const tradeForms = extractKnownTerms(question, TRADE_FORM_TERMS);
+  const originTerms = extractKnownTerms(question, COUNTRY_PRODUCT_ALIAS_ORIGIN_TERMS);
+  const domainAliasTerms = extractDomainAliasTerms(question, originTerms);
   const queryTokens = uniqueStrings([
     ...meaningfulTokens(question),
     ...quotedTerms.flatMap(tokenizeForRanking),
-    ...capitalizedTerms.flatMap(tokenizeForRanking)
+    ...capitalizedTerms.flatMap(tokenizeForRanking),
+    ...physicalAttributes.flatMap(tokenizeForRanking),
+    ...usageTerms.flatMap(tokenizeForRanking),
+    ...tradeForms.flatMap(tokenizeForRanking)
   ]).filter((token) => !contrastTokenSet.has(token));
-  const queryPhrases = buildUsefulPhrases(queryTokens, question);
   const numericRanges = extractNumericRanges(question);
-  const scientificNames = extractScientificNames(question);
+  const scientificNames = extractScientificNameSignals(question);
+  const queryPhrases = uniqueStrings([
+    ...buildUsefulPhrases(queryTokens, question),
+    ...quotedTerms,
+    ...capitalizedTerms,
+    ...physicalAttributes.filter((term) => meaningfulTokens(term).length >= 2),
+    ...usageTerms.filter((term) => meaningfulTokens(term).length >= 2),
+    ...tradeForms.filter((term) => meaningfulTokens(term).length >= 2),
+    ...scientificNames,
+    ...domainAliasTerms
+  ]).filter((phrase) => !contrast.baselineTokens.some((token) => includesSignal(normalizeForSearch(phrase), token)));
 
   return {
     domainTerms: queryTokens,
-    productTerms: queryTokens,
-    physicalAttributes: [],
+    productTerms: queryTokens.filter((token) =>
+      !physicalAttributes.some((term) => tokenizeForRanking(term).includes(token)) &&
+      !usageTerms.some((term) => tokenizeForRanking(term).includes(token)) &&
+      !tradeForms.some((term) => tokenizeForRanking(term).includes(token))
+    ),
+    originTerms,
+    domainAliasTerms,
+    physicalAttributes,
     numericRanges,
-    usageTerms: [],
+    usageTerms,
     scientificNames,
-    tradeForms: [],
+    tradeForms,
     contrastTerms: uniqueStrings([...contrast.terms, ...contrast.baselineTokens]),
     queryTokens,
     queryPhrases,
@@ -382,24 +460,51 @@ export function evaluateCandidateRelevance(
   signals: QuerySignals = extractQuerySignals(question)
 ): CandidateRelevance {
   const titleSource = `${section.title ?? ""} ${section.section ?? ""}`;
-  const bodySource = `${section.text} ${(section.captions ?? []).join(" ")}`;
+  const headingSource = `${section.section ?? ""} ${section.title ?? ""}`;
+  const bodySource = `${section.text}`;
+  const captionSource = (section.captions ?? []).join(" ");
   const sourceSource = `${section.source ?? ""} ${section.chapter ?? ""} ${section.document}`;
   const titleText = normalizeForSearch(titleSource);
+  const headingText = normalizeForSearch(headingSource);
   const bodyText = normalizeForSearch(bodySource);
+  const captionText = normalizeForSearch(captionSource);
   const sourceText = normalizeForSearch(sourceSource);
-  const allText = `${titleText} ${bodyText} ${sourceText}`;
-  const candidateTokens = new Set(meaningfulTokens(`${titleSource} ${bodySource} ${sourceSource}`));
+  const allText = `${titleText} ${headingText} ${bodyText} ${captionText} ${sourceText}`;
+  const aliasText = `${titleText} ${headingText} ${bodyText} ${captionText}`;
+  const candidateTokens = new Set(meaningfulTokens(`${titleSource} ${headingSource} ${bodySource} ${captionSource} ${sourceSource}`));
   const candidateTitleTokens = new Set(meaningfulTokens(titleSource));
+  const candidateHeadingTokens = new Set(meaningfulTokens(headingSource));
   const candidateBodyTokens = new Set(meaningfulTokens(bodySource));
+  const candidateCaptionTokens = new Set(meaningfulTokens(captionSource));
   const candidatePhrases = new Set([
     ...buildUsefulPhrases([...candidateTitleTokens], titleSource),
-    ...buildUsefulPhrases([...candidateBodyTokens], bodySource)
+    ...buildUsefulPhrases([...candidateHeadingTokens], headingSource),
+    ...buildUsefulPhrases([...candidateBodyTokens], bodySource),
+    ...buildUsefulPhrases([...candidateCaptionTokens], captionSource)
   ]);
   const titleTokenMatches = signals.queryTokens.filter((token) => candidateTitleTokens.has(token));
-  const bodyTokenMatches = signals.queryTokens.filter((token) => !candidateTitleTokens.has(token) && candidateBodyTokens.has(token));
-  const sourceTokenMatches = signals.queryTokens.filter((token) => !candidateTitleTokens.has(token) && !candidateBodyTokens.has(token) && includesSignal(sourceText, token));
+  const headingTokenMatches = signals.queryTokens.filter((token) => !candidateTitleTokens.has(token) && candidateHeadingTokens.has(token));
+  const bodyTokenMatches = signals.queryTokens.filter((token) => !candidateTitleTokens.has(token) && !candidateHeadingTokens.has(token) && candidateBodyTokens.has(token));
+  const captionTokenMatches = signals.queryTokens.filter((token) =>
+    !candidateTitleTokens.has(token) &&
+    !candidateHeadingTokens.has(token) &&
+    !candidateBodyTokens.has(token) &&
+    candidateCaptionTokens.has(token)
+  );
+  const sourceTokenMatches = signals.queryTokens.filter((token) =>
+    !candidateTitleTokens.has(token) &&
+    !candidateHeadingTokens.has(token) &&
+    !candidateBodyTokens.has(token) &&
+    !candidateCaptionTokens.has(token) &&
+    includesSignal(sourceText, token)
+  );
   const phraseMatches = signals.queryPhrases.filter((phrase) => candidatePhrases.has(phrase) || includesSignal(allText, phrase));
-  const titlePhraseMatches = phraseMatches.filter((phrase) => includesSignal(titleText, phrase));
+  const candidateAliasSignals = signals.domainAliasTerms.filter((alias) => includesSignal(aliasText, alias));
+  const allPhraseMatches = uniqueStrings([...phraseMatches, ...candidateAliasSignals]);
+  const titlePhraseMatches = allPhraseMatches.filter((phrase) => includesSignal(titleText, phrase));
+  const headingPhraseMatches = allPhraseMatches.filter((phrase) => !includesSignal(titleText, phrase) && includesSignal(headingText, phrase));
+  const bodyPhraseMatches = allPhraseMatches.filter((phrase) => includesSignal(bodyText, phrase));
+  const captionPhraseMatches = allPhraseMatches.filter((phrase) => includesSignal(captionText, phrase));
   const rareTokenMatches = signals.queryTokens.filter((token) => candidateTokens.has(token) && isRareQueryToken(token));
   const scientificMatches = signals.scientificNames.filter((term) => includesSignal(allText, term));
   const numericMatches = signals.numericRanges.filter((range) => candidateMatchesNumericRange(section, range));
@@ -407,7 +512,9 @@ export function evaluateCandidateRelevance(
   const hsCodeMatches = hsCodesForSection(section).filter((code) => normalizeForSearch(question).includes(code));
   const meaningfulEvidenceTokens = uniqueStrings([
     ...titleTokenMatches,
+    ...headingTokenMatches,
     ...bodyTokenMatches,
+    ...captionTokenMatches,
     ...sourceTokenMatches,
     ...rareTokenMatches
   ]).filter((token) => !isWeakGenericQueryToken(token));
@@ -419,12 +526,15 @@ export function evaluateCandidateRelevance(
     meaningfulPhraseMatches.length === 0 &&
     numericMatches.length === 0 &&
     scientificMatches.length === 0 &&
+    candidateAliasSignals.length === 0 &&
     meaningfulEvidenceTokens.length === 0 &&
-    titleTokenMatches.length + bodyTokenMatches.length + sourceTokenMatches.length + phraseMatches.length > 0;
+    titleTokenMatches.length + headingTokenMatches.length + bodyTokenMatches.length + captionTokenMatches.length + sourceTokenMatches.length + allPhraseMatches.length > 0;
   const matchedTerms = uniqueStrings([
     ...hsCodeMatches,
     ...titleTokenMatches,
+    ...headingTokenMatches,
     ...bodyTokenMatches,
+    ...captionTokenMatches,
     ...sourceTokenMatches,
     ...scientificMatches,
     ...rareTokenMatches
@@ -432,43 +542,53 @@ export function evaluateCandidateRelevance(
   const importantTerms = uniqueStrings([...signals.queryTokens, ...signals.queryPhrases, ...signals.scientificNames, ...signals.numericRanges]);
   const matchedImportant = new Set([
     ...matchedTerms,
-    ...phraseMatches,
+    ...allPhraseMatches,
     ...numericMatches
   ]);
   const missingImportantTerms = importantTerms.filter((term) => !matchedImportant.has(term) && !signals.contrastTerms.includes(term));
 
   let relevanceScore = section.score;
-  relevanceScore += hsCodeMatches.length * 20;
-  relevanceScore += titlePhraseMatches.length * 12;
-  relevanceScore += phraseMatches.length * 9;
-  relevanceScore += titleTokenMatches.length * 7;
-  relevanceScore += numericMatches.length * 9;
-  relevanceScore += rareTokenMatches.length * 6;
-  relevanceScore += scientificMatches.length * 8;
-  relevanceScore += bodyTokenMatches.length * 3;
-  relevanceScore += sourceTokenMatches.length * 1;
-  relevanceScore += signals.queryTokens.filter((term) => section.captions.some((caption) => includesSignal(normalizeForSearch(caption), term))).length * 4;
+  const scoreBreakdown: ScoreBreakdown = {
+    hsCode: hsCodeMatches.length * 24,
+    alias: candidateAliasSignals.length * 34,
+    title: titlePhraseMatches.length * 14 + titleTokenMatches.length * 8,
+    heading: headingPhraseMatches.length * 11 + headingTokenMatches.length * 6,
+    body: bodyPhraseMatches.length * 8 + bodyTokenMatches.length * 3,
+    captions: captionPhraseMatches.length * 6 + captionTokenMatches.length * 4,
+    source: sourceTokenMatches.length,
+    numeric: numericMatches.length * 10,
+    scientific: scientificMatches.length * 9,
+    contrastPenalty: 0
+  };
+  relevanceScore += Object.values(scoreBreakdown).reduce((sum, value) => sum + value, 0);
+  relevanceScore += rareTokenMatches.length * 5;
 
   const positiveEvidence =
     hsCodeMatches.length +
     titleTokenMatches.length +
+    headingTokenMatches.length +
     bodyTokenMatches.length +
+    captionTokenMatches.length +
     sourceTokenMatches.length +
-    phraseMatches.length +
+    allPhraseMatches.length +
+    candidateAliasSignals.length +
     scientificMatches.length +
     numericMatches.length;
   const contrastTermOnlyMatch = positiveEvidence === 0 && contrastMatches.length > 0;
-  const hasStrongMatch = hsCodeMatches.length + titlePhraseMatches.length + numericMatches.length + meaningfulPhraseMatches.length + rareTokenMatches.length + scientificMatches.length > 0;
-  const lowGenericOverlap = titleTokenMatches.length + bodyTokenMatches.length + phraseMatches.length + numericMatches.length === 0;
+  const hasStrongMatch = hsCodeMatches.length + candidateAliasSignals.length + titlePhraseMatches.length + headingPhraseMatches.length + numericMatches.length + meaningfulPhraseMatches.length + rareTokenMatches.length + scientificMatches.length > 0;
+  const lowGenericOverlap = titleTokenMatches.length + headingTokenMatches.length + bodyTokenMatches.length + captionTokenMatches.length + allPhraseMatches.length + numericMatches.length + candidateAliasSignals.length === 0;
 
   if (contrastTermOnlyMatch) {
-    relevanceScore -= 25;
+    relevanceScore -= 20;
+    scoreBreakdown.contrastPenalty -= 20;
   }
   if (contrastMatches.length > 0 && positiveEvidence <= contrastMatches.length) {
-    relevanceScore -= contrastMatches.length * 6;
+    const penalty = contrastMatches.length * 3;
+    relevanceScore -= penalty;
+    scoreBreakdown.contrastPenalty -= penalty;
   }
   if (lowGenericOverlap) {
-    relevanceScore -= 12;
+    relevanceScore -= 10;
   }
 
   let rejectedReason: string | null = null;
@@ -494,36 +614,83 @@ export function evaluateCandidateRelevance(
     pageEnd: section.pageEnd ?? null,
     matchedTerms,
     matchedNumericRanges: numericMatches,
-    matchedAttributes: phraseMatches,
+    matchedAttributes: allPhraseMatches,
     missingImportantTerms,
     contrastTermOnlyMatch,
     relevanceScore,
     queryTokens: signals.queryTokens,
     queryPhrases: signals.queryPhrases,
     candidateMatchedTokens: matchedTerms,
-    candidateMatchedPhrases: phraseMatches,
+    candidateMatchedPhrases: allPhraseMatches,
+    matchedOriginalTerms: matchedTerms,
+    matchedExpansionTerms: [],
+    matchedPhrases: allPhraseMatches,
+    candidateAliasSignals,
     numericMatches,
     contrastTerms: contrastMatches,
     finalScore: relevanceScore,
     rejected: Boolean(rejectedReason),
-    rejectedReason
+    rejectedReason,
+    scoreBreakdown
   };
 }
 
 export function selectRelevantSections(
   sections: EnrichedRetrievedSection[],
   question: string,
-  options: { requireHsMetadata?: boolean } = {}
+  options: {
+    requireHsMetadata?: boolean;
+    originalQuestion?: string;
+    expansionTerms?: string[];
+    expansionConfidence?: QueryExpansionConfidence;
+    scope?: AllowedScope;
+  } = {}
 ): RelevanceSelection {
   const signals = extractQuerySignals(question);
-  const evaluated = sections.map((section) => ({
+  const originalQuestion = options.originalQuestion ?? question;
+  const originalSignals = originalQuestion === question ? signals : extractQuerySignals(originalQuestion);
+  const evaluatedBeforeValidation = sections.map((section) => ({
     section,
-    relevance: evaluateCandidateRelevance(section, question, signals)
+    relevance: annotateExpansionMatches(
+      evaluateCandidateRelevance(section, question, signals),
+      originalQuestion === question ? undefined : evaluateCandidateRelevance(section, originalQuestion, originalSignals),
+      options.expansionTerms ?? [],
+      options.expansionConfidence
+    )
   }));
+  const ambiguityContext = buildValidationAmbiguityContext(evaluatedBeforeValidation);
+  const evaluated = evaluatedBeforeValidation.map((item) => {
+    const validation = validateCandidateForQuery({
+      originalQuery: originalQuestion,
+      expandedQuery: question,
+      candidate: {
+        ...item.section,
+        relevance: item.relevance,
+        similarCandidateCount: ambiguityContext.similarCandidateCount,
+        dominanceMargin: ambiguityContext.dominanceMarginByCandidate.get(candidateValidationKey(item.relevance)) ?? 0
+      },
+      querySignals: originalSignals,
+      scope: options.scope
+    });
+    const rejectedByValidation = !validation.accepted;
+    return {
+      section: item.section,
+      relevance: {
+        ...item.relevance,
+        validation,
+        rejected: item.relevance.rejected || rejectedByValidation,
+        rejectedReason: rejectedByValidation ? validation.reason : item.relevance.rejectedReason
+      }
+    };
+  });
   const ranked = evaluated
     .sort((left, right) => {
       if (left.relevance.rejected !== right.relevance.rejected) {
         return left.relevance.rejected ? 1 : -1;
+      }
+      const confidenceOrder = validationConfidenceRank(right.relevance.validation?.confidence) - validationConfidenceRank(left.relevance.validation?.confidence);
+      if (confidenceOrder !== 0) {
+        return confidenceOrder;
       }
       return right.relevance.relevanceScore - left.relevance.relevanceScore ||
         right.section.score - left.section.score ||
@@ -542,11 +709,302 @@ export function selectRelevantSections(
   };
 }
 
+export function validateCandidateForQuery(args: {
+  originalQuery: string;
+  expandedQuery?: string;
+  candidate: RetrievedCandidate;
+  querySignals: QuerySignals;
+  scope?: AllowedScope;
+}): CandidateValidationResult {
+  const { originalQuery, expandedQuery, candidate, querySignals, scope } = args;
+  const relevance = candidate.relevance ?? evaluateCandidateRelevance(candidate, expandedQuery ?? originalQuery, querySignals);
+  const strongSignals = new Set<string>();
+  const weakSignals = new Set<string>();
+  const missingEvidence = new Set<string>();
+  const candidateCodes = hsCodesForSection(candidate);
+  const exactQueryCodes = uniqueStrings([...originalQuery.matchAll(new RegExp(HS_CODE_PATTERN.source, "g"))].map((match) => match[0]));
+
+  if (!candidateInsideScope(candidate, scope)) {
+    return validationResult(false, "low", "candidate is outside selected scope", [], ["outside_selected_scope"], ["inside_selected_scope"]);
+  }
+
+  if (exactQueryCodes.length > 0) {
+    const matchedCode = exactQueryCodes.find((code) => candidateCodes.includes(code));
+    if (matchedCode) {
+      return validationResult(true, "high", "exact HS code matches candidate metadata", ["exact_hscode_match"], [], []);
+    }
+    return validationResult(false, "low", "exact HS code query does not match candidate code", [], ["exact_hscode_mismatch"], ["exact_hscode_match"]);
+  }
+
+  if (relevance.rejected && relevance.numericMatches.length > 0) {
+    return validationResult(
+      false,
+      "low",
+      "numeric evidence is not supported by product or attribute terms",
+      [],
+      ["existing_relevance_rejection", "numeric_match_without_product_or_attribute_evidence"],
+      ["product_or_attribute_evidence_for_numeric_match"]
+    );
+  }
+
+  if (relevance.rejected) {
+    return validationResult(false, "low", relevance.rejectedReason ?? "candidate was already rejected by relevance evaluator", [], ["existing_relevance_rejection"], ["accepted_relevance_gate"]);
+  }
+
+  const titleText = normalizeForSearch(`${candidate.title ?? ""} ${candidate.section ?? ""}`);
+  const bodyText = normalizeForSearch(`${candidate.text ?? ""}`);
+  const captionText = normalizeForSearch((candidate.captions ?? []).join(" "));
+  const allText = `${titleText} ${bodyText} ${captionText}`;
+  const originalMatches = uniqueStrings(relevance.matchedOriginalTerms ?? relevance.matchedTerms ?? []);
+  const expansionMatches = uniqueStrings(relevance.matchedExpansionTerms ?? []);
+  const aliasMatches = uniqueStrings([
+    ...(relevance.candidateAliasSignals ?? []),
+    ...querySignals.domainAliasTerms.filter((alias) => includesSignal(allText, alias))
+  ]);
+  const phraseMatches = uniqueStrings([...(relevance.matchedPhrases ?? relevance.candidateMatchedPhrases ?? []), ...aliasMatches]);
+  const distinctiveOriginalMatches = originalMatches.filter(isDistinctiveValidationToken);
+  const distinctiveAllMatches = uniqueStrings([...originalMatches, ...expansionMatches, ...relevance.matchedTerms, ...aliasMatches].filter(isDistinctiveValidationToken));
+  const titlePhraseMatches = phraseMatches.filter((phrase) => includesSignal(titleText, phrase));
+  const bodyOrCaptionPhraseMatches = phraseMatches.filter((phrase) => includesSignal(`${bodyText} ${captionText}`, phrase));
+  const scientificMatches = querySignals.scientificNames.filter((term) => includesSignal(allText, term));
+  const originalTokenCount = querySignals.queryTokens.length;
+  const expansionOnly = expansionMatches.length > 0 && originalMatches.length === 0;
+  const hasTextSupport = [...originalMatches, ...expansionMatches, ...phraseMatches, ...relevance.numericMatches]
+    .some((term) => includesSignal(allText, term));
+  const hasTitleOrBodySupport = [...originalMatches, ...expansionMatches, ...phraseMatches]
+    .some((term) => includesSignal(`${titleText} ${bodyText}`, term));
+  const hasPhraseEvidence = phraseMatches.some((phrase) => meaningfulTokens(phrase).length >= 2);
+  const hasProductOrAttributeEvidence = hasPhraseEvidence || aliasMatches.length > 0 || distinctiveOriginalMatches.length > 0 || distinctiveAllMatches.length >= 2;
+
+  if (aliasMatches.length > 0) {
+    strongSignals.add("country_product_alias_match");
+  }
+  if (titlePhraseMatches.length > 0 || nearExactTitleMatch(originalQuery, candidate)) {
+    strongSignals.add("exact_or_near_exact_title_phrase_match");
+  }
+  if (phraseMatches.some((phrase) => meaningfulTokens(phrase).filter(isDistinctiveValidationToken).length >= 2)) {
+    strongSignals.add("distinctive_multi_token_phrase_overlap");
+  }
+  if (distinctiveOriginalMatches.length >= 2) {
+    strongSignals.add("multiple_distinctive_original_token_overlaps");
+  }
+  if (relevance.numericMatches.length > 0 && hasProductOrAttributeEvidence) {
+    strongSignals.add("numeric_unit_match_plus_product_or_attribute_evidence");
+  }
+  if (scientificMatches.length > 0) {
+    strongSignals.add("scientific_or_latin_like_term_match");
+  }
+  if (bodyOrCaptionPhraseMatches.length > 0) {
+    strongSignals.add("caption_or_body_distinctive_phrase_match");
+  }
+  if (expansionOnly && hasTitleOrBodySupport && phraseMatches.length > 0 && relevance.expansionConfidence !== "low") {
+    strongSignals.add("expansion_phrase_supported_by_candidate_text");
+  }
+
+  if (originalTokenCount <= 1) {
+    weakSignals.add("very_short_query");
+  }
+  if (originalTokenCount <= 1 && candidate.similarCandidateCount && candidate.similarCandidateCount > 1) {
+    weakSignals.add("single_token_query_matches_multiple_candidates");
+  }
+  if (candidate.dominanceMargin !== undefined && candidate.similarCandidateCount && candidate.similarCandidateCount > 1 && candidate.dominanceMargin < 10) {
+    weakSignals.add("top_candidate_does_not_dominate_similar_candidates");
+  }
+  if (expansionOnly) {
+    weakSignals.add("expansion_only_match");
+  }
+  if (relevance.numericMatches.length > 0 && !hasProductOrAttributeEvidence) {
+    weakSignals.add("numeric_match_without_product_or_attribute_evidence");
+  }
+  if (phraseMatches.length === 0) {
+    weakSignals.add("no_phrase_match");
+  }
+  if (!hasTextSupport) {
+    weakSignals.add("no_title_body_or_caption_support");
+  }
+  if (distinctiveAllMatches.length <= 1 && phraseMatches.length === 0 && relevance.numericMatches.length === 0) {
+    weakSignals.add("only_one_broad_or_common_token_matched");
+  }
+  if (relevance.contrastTermOnlyMatch) {
+    weakSignals.add("contrast_term_only_match");
+  }
+  if (relevance.finalScore >= 70 && strongSignals.size === 0) {
+    weakSignals.add("high_score_without_strong_signal");
+  }
+
+  if (relevance.contrastTermOnlyMatch) {
+    return validationResult(false, "low", "candidate only matches contrast baseline terms", [...strongSignals], [...weakSignals], ["positive_query_evidence"]);
+  }
+  if (relevance.numericMatches.length > 0 && !hasProductOrAttributeEvidence) {
+    missingEvidence.add("product_or_attribute_evidence_for_numeric_match");
+    return validationResult(false, "low", "numeric evidence is not supported by product or attribute terms", [...strongSignals], [...weakSignals], [...missingEvidence]);
+  }
+  if (strongSignals.size === 0) {
+    missingEvidence.add("distinctive_phrase_title_or_body_evidence");
+    if (originalTokenCount <= 1 && hasTextSupport) {
+      return validationResult(true, "low", "broad query candidate kept only for broad lookup", [], [...weakSignals], [...missingEvidence]);
+    }
+    return validationResult(false, "low", "candidate only matches weak evidence", [], [...weakSignals], [...missingEvidence]);
+  }
+
+  if (expansionOnly) {
+    if (strongSignals.has("expansion_phrase_supported_by_candidate_text")) {
+      return validationResult(true, "medium", "candidate accepted with expansion phrase support in candidate text", [...strongSignals], [...weakSignals], []);
+    }
+    if (relevance.expansionConfidence === "high" && (phraseMatches.length >= 2 || strongSignals.size >= 1)) {
+      return validationResult(true, "medium", "high-confidence expansion with strong phrase or signal evidence", [...strongSignals], [...weakSignals], []);
+    }
+    if (relevance.expansionConfidence !== "low" && hasTitleOrBodySupport && strongSignals.size >= 1) {
+      return validationResult(true, "medium", "expansion match supported by title/body text and strong signal", [...strongSignals], [...weakSignals], []);
+    }
+    return validationResult(false, "low", "expansion-only match lacks supporting candidate evidence", [...strongSignals], [...weakSignals], ["original_query_evidence_or_supported_expansion_phrase"]);
+  }
+
+  if (strongSignals.size >= 2 && weakSignals.size === 0) {
+    return validationResult(true, "high", "candidate has multiple strong validation signals", [...strongSignals], [], []);
+  }
+
+  const confidence = strongSignals.size >= 2 || relevance.finalScore >= 50 ? "high" : "medium";
+  return validationResult(true, confidence, "candidate has sufficient validation evidence", [...strongSignals], [...weakSignals], []);
+}
+
+function buildValidationAmbiguityContext(
+  evaluated: Array<{ section: EnrichedRetrievedSection; relevance: CandidateRelevance }>
+): { similarCandidateCount: number; dominanceMarginByCandidate: Map<string, number> } {
+  const viable = evaluated
+    .filter((item) => !item.relevance.rejected)
+    .filter((item) => item.relevance.matchedTerms.length + item.relevance.candidateMatchedPhrases.length + item.relevance.numericMatches.length > 0)
+    .sort((left, right) => right.relevance.relevanceScore - left.relevance.relevanceScore);
+  const dominanceMarginByCandidate = new Map<string, number>();
+  for (let index = 0; index < viable.length; index += 1) {
+    const current = viable[index];
+    const next = viable[index + 1];
+    dominanceMarginByCandidate.set(
+      candidateValidationKey(current.relevance),
+      current.relevance.relevanceScore - (next?.relevance.relevanceScore ?? 0)
+    );
+  }
+  return {
+    similarCandidateCount: viable.length,
+    dominanceMarginByCandidate
+  };
+}
+
+function candidateValidationKey(candidate: Pick<CandidateRelevance, "document" | "hsCode" | "section" | "title">): string {
+  return [
+    candidate.document,
+    candidate.hsCode ?? "",
+    normalizeForSearch(candidate.section ?? ""),
+    normalizeForSearch(candidate.title ?? "")
+  ].join("|");
+}
+
+function validationResult(
+  accepted: boolean,
+  confidence: CandidateValidationResult["confidence"],
+  reason: string,
+  strongSignals: string[],
+  weakSignals: string[],
+  missingEvidence: string[]
+): CandidateValidationResult {
+  return {
+    accepted,
+    confidence,
+    reason,
+    strongSignals: uniqueStrings(strongSignals),
+    weakSignals: uniqueStrings(weakSignals),
+    missingEvidence: uniqueStrings(missingEvidence)
+  };
+}
+
+function candidateInsideScope(candidate: RetrievedCandidate, scope: AllowedScope | undefined): boolean {
+  if (!scope || scope.mode !== "selected") {
+    return true;
+  }
+  if (scope.allowedDocumentSet?.has(candidate.document)) {
+    return true;
+  }
+  return Boolean(scope.allowedDocuments?.includes(candidate.document));
+}
+
+function nearExactTitleMatch(query: string, candidate: RetrievedCandidate): boolean {
+  const titleTokens = meaningfulTokens(`${candidate.title ?? ""} ${candidate.section ?? ""}`)
+    .filter(isDistinctiveValidationToken)
+    .filter((token) => !HS_CODE_PATTERN.test(token) && !/^\d+(?:\.\d+)*$/.test(token));
+  if (titleTokens.length === 0) {
+    return false;
+  }
+  const queryTokens = new Set(meaningfulTokens(query).filter(isDistinctiveValidationToken));
+  const overlap = titleTokens.filter((token) => queryTokens.has(token));
+  return overlap.length >= 2 || (titleTokens.length === 1 && overlap.length === 1);
+}
+
+function isDistinctiveValidationToken(token: string): boolean {
+  const normalized = normalizeForSearch(token);
+  if (!normalized || QUERY_STOPWORDS.has(normalized) || isWeakGenericQueryToken(normalized)) {
+    return false;
+  }
+  return normalized.length >= 4 || /\d/.test(normalized);
+}
+
+function validationConfidenceRank(confidence: CandidateValidationResult["confidence"] | undefined): number {
+  if (confidence === "high") return 3;
+  if (confidence === "medium") return 2;
+  if (confidence === "low") return 1;
+  return 0;
+}
+
+function annotateExpansionMatches(
+  relevance: CandidateRelevance,
+  originalRelevance: CandidateRelevance | undefined,
+  expansionTerms: string[],
+  expansionConfidence: QueryExpansionConfidence | undefined
+): CandidateRelevance {
+  if (!originalRelevance) {
+    return {
+      ...relevance,
+      matchedOriginalTerms: relevance.matchedTerms,
+      matchedExpansionTerms: [],
+      matchedPhrases: relevance.candidateMatchedPhrases,
+      expansionConfidence
+    };
+  }
+
+  const originalMatches = uniqueStrings([
+    ...originalRelevance.matchedTerms,
+    ...originalRelevance.candidateMatchedPhrases,
+    ...originalRelevance.numericMatches
+  ]);
+  const originalKeys = new Set(originalMatches.map(normalizeForSearch));
+  const expansionKeys = new Set(expansionTerms.flatMap((term) => [
+    normalizeForSearch(term),
+    ...tokenizeForRanking(term)
+  ]).filter(Boolean));
+  const expandedMatches = uniqueStrings([
+    ...relevance.matchedTerms,
+    ...relevance.candidateMatchedPhrases,
+    ...relevance.numericMatches
+  ]);
+  const matchedExpansionTerms = expandedMatches.filter((term) => {
+    const normalized = normalizeForSearch(term);
+    return !originalKeys.has(normalized) && (expansionKeys.size === 0 || expansionKeys.has(normalized) || [...expansionKeys].some((key) => key.includes(normalized) || normalized.includes(key)));
+  });
+
+  return {
+    ...relevance,
+    matchedOriginalTerms: originalMatches,
+    matchedExpansionTerms,
+    matchedPhrases: relevance.candidateMatchedPhrases,
+    expansionConfidence
+  };
+}
+
 export function rankSectionsForQuestion(
   sections: EnrichedRetrievedSection[],
   question: string
 ): EnrichedRetrievedSection[] {
   const contrast = detectContrastTerms(question);
+  const signals = extractQuerySignals(question);
   const queryTokens = tokenizeForRanking(question);
   const baselineTokens = new Set(contrast.baselineTokens);
   const positiveTokens = queryTokens.filter((token) => !baselineTokens.has(token));
@@ -557,11 +1015,16 @@ export function rankSectionsForQuestion(
       const bodyText = normalizeForSearch(`${section.text} ${(section.captions ?? []).join(" ")}`);
       const positiveTitleScore = positiveTokens.reduce((sum, token) => sum + countToken(titleText, token), 0) * 8;
       const positiveBodyScore = positiveTokens.reduce((sum, token) => sum + countToken(bodyText, token), 0);
+      const aliasScore = signals.domainAliasTerms.reduce((sum, alias) => {
+        if (includesSignal(titleText, alias)) return sum + 42;
+        if (includesSignal(bodyText, alias)) return sum + 24;
+        return sum;
+      }, 0);
       const baselineTitlePenalty = contrast.baselineTokens.reduce((sum, token) => sum + countToken(titleText, token), 0) * 7;
       const metadataBoost = hsCodesForSection(section).length > 0 ? 3 : 0;
       return {
         section,
-        adjustedScore: section.score + positiveTitleScore + positiveBodyScore + metadataBoost - baselineTitlePenalty
+        adjustedScore: section.score + positiveTitleScore + positiveBodyScore + aliasScore + metadataBoost - baselineTitlePenalty
       };
     })
     .sort((left, right) => right.adjustedScore - left.adjustedScore || left.section.document.localeCompare(right.section.document))
@@ -984,11 +1447,15 @@ function normalizeForSearch(value: string): string {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
-    .replace(/\bca\s+phe\b/g, "coffee");
+    .replace(/\bca\s+phe\b/g, "coffee")
+    .replace(/\bwoodchips\b/g, "wood chips");
 }
 
 function tokenizeForRanking(value: string): string[] {
-  return uniqueStrings(normalizeForSearch(value).split(/[^a-z0-9.]+/g).filter((token) => token.length >= 3));
+  return uniqueStrings(normalizeForSearch(value)
+    .split(/[^a-z0-9.]+/g)
+    .map(normalizeQueryToken)
+    .filter((token) => token.length >= 3));
 }
 
 function baselineTokensAfterTerm(normalizedQuestion: string, term: string): string[] {
@@ -1004,7 +1471,9 @@ function baselineTokensFromComparativeThan(normalizedQuestion: string): string[]
   const tokens: string[] = [];
   const comparativePattern = /\b(?:more|less|higher|lower|longer|shorter|bigger|smaller|stronger|weaker|sweeter|bitterer|milder|drier|fresher)\s+(?:[a-z0-9.]+\s+){0,4}?than\s+([a-z0-9.]+(?:\s+[a-z0-9.]+){0,3})/g;
   for (const match of normalizedQuestion.matchAll(comparativePattern)) {
-    tokens.push(...match[1].split(/[^a-z0-9.]+/g).filter((token) => token.length >= 3).slice(0, 4));
+    const baseline = match[1]
+      .split(/\b(?:and|or|but|with|without|has|have|having|plus|also)\b/g)[0] ?? "";
+    tokens.push(...baseline.split(/[^a-z0-9.]+/g).filter((token) => token.length >= 3).slice(0, 3));
   }
   return uniqueStrings(tokens);
 }
@@ -1060,6 +1529,27 @@ function questionSpecifiesState(question: string): boolean {
     /tươi|đông lạnh|khô|rang|sống|chế biến|giống|cây con|mảnh|bột/i.test(question);
 }
 
+const COUNTRY_PRODUCT_ALIAS_RULES = [
+  {
+    originTriggers: ["cambodia", "cambodian", "campuchia", "khmer"],
+    productGuards: ["rice", "gao", "fragrant", "aromatic", "premium fragrant"],
+    aliases: [
+      "malys rice",
+      "malys angkor",
+      "phka rumduol",
+      "phka rumdeng",
+      "phka romeat",
+      "somaly",
+      "premium aromatic",
+      "extra-long"
+    ]
+  }
+];
+
+const COUNTRY_PRODUCT_ALIAS_ORIGIN_TERMS = uniqueStrings(
+  COUNTRY_PRODUCT_ALIAS_RULES.flatMap((rule) => rule.originTriggers)
+);
+
 const QUERY_STOPWORDS = new Set([
   "the",
   "and",
@@ -1067,6 +1557,8 @@ const QUERY_STOPWORDS = new Set([
   "with",
   "what",
   "which",
+  "how",
+  "does",
   "define",
   "defined",
   "definition",
@@ -1093,6 +1585,18 @@ const QUERY_STOPWORDS = new Set([
   "thay",
   "khong",
   "phai",
+  "more",
+  "less",
+  "than",
+  "compared",
+  "compare",
+  "versus",
+  "which",
+  "has",
+  "have",
+  "having",
+  "belong",
+  "belongs",
   "is",
   "are",
   "was",
@@ -1118,6 +1622,102 @@ const WEAK_MATCH_TOKENS = new Set([
 ]);
 
 const SMALL_TITLE_WORDS = new Set(["of", "the", "and", "or", "for", "to", "in", "on", "with", "not"]);
+const QUESTION_STARTERS = new Set(["what", "which", "who", "where", "when", "why", "how", "does", "do", "is", "are"]);
+const QUERY_TOKEN_NORMALIZATION = new Map([
+  ["higher", "high"],
+  ["highest", "high"],
+  ["lower", "low"],
+  ["lowest", "low"],
+  ["larger", "large"],
+  ["largest", "large"],
+  ["longer", "long"],
+  ["shorter", "short"],
+  ["rounder", "round"],
+  ["bitterer", "bitter"],
+  ["milder", "mild"],
+  ["smoother", "smooth"],
+  ["coarser", "coarse"],
+  ["fresher", "fresh"],
+  ["drier", "dry"],
+  ["dried", "dry"],
+  ["roasted", "roast"],
+  ["processed", "process"]
+]);
+
+const PHYSICAL_ATTRIBUTE_TERMS = [
+  "bitter",
+  "sweet",
+  "mild",
+  "smooth",
+  "coarse",
+  "coarser",
+  "aroma",
+  "texture",
+  "caffeine",
+  "high caffeine",
+  "higher caffeine",
+  "low acidity",
+  "higher acidity",
+  "acidity",
+  "round",
+  "rounder",
+  "oval",
+  "long",
+  "longer",
+  "large",
+  "larger",
+  "balanced",
+  "deformity",
+  "wound",
+  "disease",
+  "appearance",
+  "physical",
+  "shape",
+  "size",
+  "weight",
+  "moisture",
+  "content"
+];
+
+const USAGE_TERMS = [
+  "usage",
+  "used",
+  "use",
+  "ingredient",
+  "instant coffee",
+  "specialty coffee",
+  "espresso",
+  "breeding",
+  "sowing",
+  "planting",
+  "incense",
+  "perfume",
+  "human consumption",
+  "laboratory",
+  "demonstration"
+];
+
+const TRADE_FORM_TERMS = [
+  "fresh",
+  "frozen",
+  "dry",
+  "dried",
+  "roast",
+  "roasted",
+  "raw",
+  "processed",
+  "beans",
+  "chips",
+  "wood chips",
+  "powder",
+  "seedling",
+  "seedlings",
+  "budwood",
+  "stumps",
+  "meat paste",
+  "deboned",
+  "separated"
+];
 
 function extractScientificNames(question: string): string[] {
   const names: string[] = [];
@@ -1153,13 +1753,78 @@ function extractCapitalizedTerms(value: string): string[] {
   return uniqueStrings(terms);
 }
 
+function extractScientificNameSignals(question: string): string[] {
+  const names: string[] = [];
+  for (const match of question.matchAll(/\b[A-Z][a-z]{2,}(?:\s+[A-Z]?[a-z]{2,}){1,2}\b/g)) {
+    const normalized = normalizeForSearch(match[0]);
+    const tokens = normalized.split(/[^a-z0-9.]+/g).filter(Boolean);
+    if (tokens.length >= 2 && !QUESTION_STARTERS.has(tokens[0]) && !tokens.slice(1).some((token) => QUERY_STOPWORDS.has(token))) {
+      names.push(match[0]);
+    }
+  }
+  for (const quoted of extractQuotedTerms(question)) {
+    names.push(quoted);
+  }
+  return uniqueStrings(names.map((name) => normalizeForSearch(name)).filter((name) => {
+    const tokens = name.split(/[^a-z0-9.]+/g).filter(Boolean);
+    return tokens.length > 0 &&
+      !QUESTION_STARTERS.has(tokens[0]) &&
+      tokens.some((token) => !QUERY_STOPWORDS.has(token));
+  }));
+}
+
+function extractCapitalizedSignalTerms(value: string): string[] {
+  const terms: string[] = [];
+  for (const match of value.matchAll(/\b[A-Z][a-z]{2,}(?:\s+[A-Z]?[a-z]{2,}){0,2}\b/g)) {
+    const normalized = normalizeForSearch(match[0]);
+    const rawTokens = normalized.split(/[^a-z0-9.]+/g).filter(Boolean);
+    const tokens = meaningfulTokens(normalized);
+    if (
+      tokens.length > 0 &&
+      rawTokens.length > 0 &&
+      !QUESTION_STARTERS.has(rawTokens[0]) &&
+      !rawTokens.some((token) => ["and", "or", "has", "have", "is", "are"].includes(token))
+    ) {
+      terms.push(normalized);
+    }
+  }
+  return uniqueStrings(terms);
+}
+
 function meaningfulTokens(value: string): string[] {
   return uniqueStrings(
     normalizeForSearch(value)
       .split(/[^a-z0-9.]+/g)
+      .map(normalizeQueryToken)
       .filter((token) => token.length >= 3 || /^\d+(?:\.\d+)?$/.test(token))
       .filter((token) => !QUERY_STOPWORDS.has(token))
   );
+}
+
+function normalizeQueryToken(token: string): string {
+  return QUERY_TOKEN_NORMALIZATION.get(token) ?? token;
+}
+
+function extractKnownTerms(question: string, terms: string[]): string[] {
+  const normalized = normalizeForSearch(question);
+  return uniqueStrings(terms
+    .filter((term) => includesSignal(normalized, term))
+    .map((term) => normalizeForSearch(term))
+    .filter(Boolean));
+}
+
+function extractDomainAliasTerms(question: string, originTerms: string[]): string[] {
+  const normalizedQuestion = normalizeForSearch(question);
+  return uniqueStrings(COUNTRY_PRODUCT_ALIAS_RULES.flatMap((rule) => {
+    const hasOrigin = rule.originTriggers.some((trigger) =>
+      originTerms.includes(normalizeForSearch(trigger)) || includesSignal(normalizedQuestion, trigger)
+    );
+    if (!hasOrigin) {
+      return [];
+    }
+    const hasProductGuard = rule.productGuards.some((guard) => includesSignal(normalizedQuestion, guard));
+    return hasProductGuard ? rule.aliases.map((alias) => normalizeForSearch(alias)) : [];
+  }).filter(Boolean));
 }
 
 function buildUsefulPhrases(tokens: string[], sourceText: string): string[] {
@@ -1188,6 +1853,7 @@ function extractNumericRanges(question: string): string[] {
   const normalized = normalizeForSearch(question).replace(/,/g, ".");
   const ranges: string[] = [];
   const patterns = [
+    /\b\d+(?:\.\d+)?\s*%(?=$|[^a-z0-9])/g,
     /\b\d+(?:\.\d+)?\s*(?:-|–|to|den|toi)\s*\d+(?:\.\d+)?\s*(?:%|cm|mm|m|kg|g|mg|ppm|do|degree|percent)?\b/g,
     /\b(?:less than|more than|at least|at most|under|over|duoi|tren|hon|it hon|nhieu hon|toi thieu|toi da)\s+\d+(?:\.\d+)?\s*(?:%|cm|mm|m|kg|g|mg|ppm)?\b/g,
     /\b\d+(?:\.\d+)?\s*(?:%|cm|mm|m|kg|g|mg|ppm)\b/g

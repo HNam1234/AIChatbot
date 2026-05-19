@@ -1,5 +1,4 @@
-import { resolveGeminiApiKeys } from "../config/gemini";
-import { GeminiRoundRobinClient } from "./geminiClient";
+import { createLlmClient, getLlmAvailability } from "./llmFactory";
 import { HS_CODE_PATTERN } from "./qaAnswerFormatter";
 import { FIELD_SYNONYM_GROUPS, canonicalRequestedFieldFromText, normalizeFieldText } from "./fieldExtractor";
 
@@ -284,24 +283,13 @@ async function runLlmPlanner(query: string, options: QueryPlannerOptions): Promi
     return await options.llmPlanner.planQuery(buildQueryPlannerPrompt(query));
   }
 
-  const apiKeys = plannerApiKeys(options);
-  if (apiKeys.length === 0) {
+  const availability = getLlmAvailability({ apiKeys: options.geminiApiKeys });
+  if (!availability.configured) {
     return null;
   }
 
-  const client = new GeminiRoundRobinClient({ apiKeys });
+  const client = createLlmClient({ apiKeys: options.geminiApiKeys });
   return await client.planQuery(buildQueryPlannerPrompt(query), { temperature: 0, maxOutputTokens: 384 });
-}
-
-function plannerApiKeys(options: QueryPlannerOptions): string[] {
-  if (options.geminiApiKeys !== undefined) {
-    return uniqueStrings(options.geminiApiKeys.map((key) => key.trim()).filter(Boolean));
-  }
-  try {
-    return resolveGeminiApiKeys();
-  } catch {
-    return [];
-  }
 }
 
 function extractJsonObject(raw: string): string {

@@ -115,6 +115,33 @@
                   <label class="check"><input id="temporary-gemini-key" type="checkbox" checked /> Use typed keys only for this run</label>
                   <span id="gemini-settings-status" class="muted">Loading...</span>
                 </div>
+
+                <div class="field-group">
+                  <label for="llm-provider">LLM Provider</label>
+                  <select id="llm-provider" name="llmProvider">
+                    <option value="gemini">Gemini</option>
+                    <option value="bifrost">Bifrost</option>
+                  </select>
+                  <label class="check"><input id="enable-llm-qa" type="checkbox" /> Use LLM for QA answers</label>
+                  <label class="check"><input id="enable-llm-query-expansion" type="checkbox" /> Use LLM query expansion</label>
+
+                  <label for="bifrost-key">Bifrost API Key</label>
+                  <div class="settings-row">
+                    <input id="bifrost-key" type="password" autocomplete="off" placeholder="Bifrost API key" />
+                    <button id="toggle-bifrost-key" type="button" class="secondary compact">Show</button>
+                  </div>
+
+                  <label for="bifrost-base-url">Bifrost Base URL</label>
+                  <input id="bifrost-base-url" type="url" autocomplete="off" placeholder="https://bifrost.company.com/v1" />
+
+                  <label for="bifrost-model">Bifrost Model</label>
+                  <input id="bifrost-model" type="text" autocomplete="off" placeholder="gpt-5.5" />
+
+                  <div class="actions">
+                    <button id="save-bifrost-settings" type="button" class="secondary">Save Bifrost Settings</button>
+                    <span id="bifrost-settings-status" class="muted">Loading...</span>
+                  </div>
+                </div>
               </div>
             </section>
           </div>

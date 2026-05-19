@@ -11,7 +11,6 @@ import {
 } from "./cache/cacheManifest";
 import { askChatQuestion, startChatSession } from "./cli/repl";
 import { resolvePageIndexSettings } from "./config/env";
-import { resolveGeminiApiKeys } from "./config/gemini";
 import { ArtifactFilter } from "./orchestrator/artifactFilter";
 import { HSCodeReconstructor } from "./orchestrator/hsCodeReconstructor";
 import { ImageAssetExporter } from "./orchestrator/imageAssetExporter";
@@ -785,7 +784,6 @@ async function executeAgentCli(argv: string[]): Promise<void> {
   const pageIndexSettings = resolvePageIndexSettings({
     apiKey: args.pageIndexApiKey
   });
-  const geminiApiKeys = resolveGeminiApiKeys(args.geminiApiKeys);
   const result = await runAgenticQuery({
     pageIndexApiKey: pageIndexSettings.pageIndexApiKey,
     pageIndexMcpUrl: args.pageIndexMcpUrl,
@@ -795,7 +793,7 @@ async function executeAgentCli(argv: string[]): Promise<void> {
     pages: args.pages,
     folderId: args.folderId,
     mcpToolName: args.mcpToolName,
-    geminiApiKeys,
+    geminiApiKeys: args.geminiApiKeys.length > 0 ? args.geminiApiKeys : undefined,
     geminiModel: args.geminiModel,
     maxContextChars: args.maxContextChars,
     maxAnswerWords: args.maxAnswerWords

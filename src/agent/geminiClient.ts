@@ -104,6 +104,19 @@ export class GeminiRoundRobinClient {
     return await this.generateWithFailover(prompt, config);
   }
 
+  public async synthesizeComparisonAnswer(
+    sections: SelectedSectionAnswerContext[],
+    query: string,
+    options: GeminiSynthesisOptions = {}
+  ): Promise<string> {
+    const prompt = buildComparisonAnswerPrompt(sections, query);
+    const config: GenerateContentConfig = {
+      temperature: options.temperature ?? this.temperature,
+      maxOutputTokens: options.maxOutputTokens ?? this.maxOutputTokens
+    };
+    return await this.generateWithFailover(prompt, config);
+  }
+
   public async planQuery(prompt: string, options: GeminiQueryPlannerOptions = {}): Promise<string> {
     const config: GenerateContentConfig = {
       temperature: options.temperature ?? 0,
@@ -209,6 +222,39 @@ export function buildSelectedSectionAnswerPrompt(section: SelectedSectionAnswerC
     query,
     "",
     "Return a concise answer."
+  ].join("\n");
+}
+
+export function buildComparisonAnswerPrompt(sections: SelectedSectionAnswerContext[], query: string): string {
+  const sectionBlocks = sections.map((section, index) => [
+    `Section ${index + 1} metadata:`,
+    `- document: ${section.document ?? ""}`,
+    `- section: ${section.section ?? ""}`,
+    `- title: ${section.title ?? ""}`,
+    `- hsCode: ${section.hsCode ?? ""}`,
+    `- source: ${section.source ?? ""}`,
+    "",
+    `Section ${index + 1} text:`,
+    "---",
+    section.text,
+    "---"
+  ].join("\n"));
+
+  return [
+    "You are answering a comparison or contrast question using multiple HSCode document sections.",
+    "Use ONLY the provided sections as evidence. Do not use outside knowledge.",
+    "Do not invent information.",
+    "Prefer Vietnamese for Vietnamese or mixed-language questions.",
+    "Compare and contrast the sections based on what the user asks.",
+    "Highlight key differences and similarities.",
+    "Do not output HS Code unless the user explicitly asks for HS Code or classification.",
+    "",
+    ...sectionBlocks,
+    "",
+    "User question:",
+    query,
+    "",
+    "Return a concise comparative answer."
   ].join("\n");
 }
 

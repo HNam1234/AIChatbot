@@ -121,9 +121,11 @@ describe("qaIntentRouter", () => {
       candidateFor(arabica, { finalScore: 68, matchedTerms: ["coffee"], candidateMatchedTokens: ["coffee"] })
     ], detectIntent("coffee"));
 
-    expect(result.answerMode).toBe("ambiguous_lookup");
-    expect(result.answer).toContain("Robusta coffee - HS Code: 0901.11.30.");
-    expect(result.answer).toContain("Arabica coffee - HS Code: 0901.21.12.");
+    expect(result.answerMode).toBe("broad_lookup");
+    expect(result.answer).toContain("Robusta coffee");
+    expect(result.answer).toContain("HS Code: 0901.11.30");
+    expect(result.answer).toContain("Arabica coffee");
+    expect(result.answer).toContain("HS Code: 0901.21.12");
     expect(result.answer).not.toContain("Sản phẩm là");
   });
 
@@ -217,7 +219,7 @@ describe("qaIntentRouter", () => {
     expect(result.answer).not.toMatch(/Index source|PageIndex|cache freshness|final score|candidate debug/i);
   });
 
-  it("uses safe fallback for selected-section QA when LLM answer is unavailable", () => {
+  it("uses local field extraction for selected-section QA when LLM answer is unavailable", () => {
     const selected = retrievedFixture({
       document: "Chapter03.pdf",
       hsCode: "0301.99.10",
@@ -234,7 +236,8 @@ describe("qaIntentRouter", () => {
       detectIntent("Breeding sample appearance requirements?")
     );
 
-    expect(result.answer).toBe("Tôi đã tìm thấy section liên quan, nhưng chưa thể trích xuất câu trả lời từ nội dung section. Vui lòng thử lại hoặc bật API key.");
+    expect(result.answer).toContain("Appearance: the body is balanced and fins are normal.");
+    expect(result.debug.answerGeneration).toBe("extractive-field");
     expect(result.answer).not.toContain("Sản phẩm là");
     expect(result.answer).not.toContain("HS Code");
   });
@@ -404,6 +407,33 @@ describe("qaIntentRouter", () => {
 
     expect(["lookup", "clarification"]).toContain(result.answerMode);
     expect(result.answerMode).not.toBe("classification");
+  });
+
+  it("does not classify candidates that only match weak expansion terms", () => {
+    const query = "phan loai hang hoa nhap khau dac biet";
+    const selected = retrievedFixture({
+      document: "Chapter03.pdf",
+      hsCode: "0301.99.10",
+      title: "FISH",
+      section: "0301.99.10 - FISH",
+      text: "Fish.",
+      score: 90
+    });
+    const result = handleProductClassification(query, selected, [], undefined, [candidateFor(selected, {
+      finalScore: 90,
+      relevanceScore: 90,
+      matchedTerms: ["fish"],
+      matchedOriginalTerms: [],
+      matchedExpansionTerms: ["fish"],
+      candidateMatchedTokens: ["fish"],
+      candidateMatchedPhrases: [],
+      matchedPhrases: [],
+      expansionConfidence: "low"
+    })], detectIntent(query));
+
+    expect(result.answerMode).not.toBe("classification");
+    expect(result.answerConfidence).toBe("low");
+    expect(result.debug.confidenceReason).toContain("weak query expansion");
   });
 
   it("allows medium score with strong title and phrase signals", () => {

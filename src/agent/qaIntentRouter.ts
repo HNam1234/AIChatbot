@@ -9,14 +9,21 @@ import {
   renderHsCodeAnswer,
   type CandidateRelevance,
   type EnrichedRetrievedSection,
+  type QuerySignals,
   type RenderedHsCodeAnswer,
-  type SectionMetadata
+  type SectionMetadata,
+  type ValidatedCandidate
 } from "./qaAnswerFormatter";
 import {
   planQueryWithRules,
   type PlannerSource,
   type QueryPlan
 } from "./queryPlanner";
+import {
+  canonicalRequestedFieldFromText,
+  extractRequestedField,
+  type FieldExtractionConfidence
+} from "./fieldExtractor";
 
 export type QaIntent =
   | "exact_hscode_lookup"
@@ -33,6 +40,7 @@ export type AnswerMode =
   | "classification"
   | "lookup"
   | "numeric_lookup"
+  | "broad_lookup"
   | "ambiguous_lookup"
   | "clarification"
   | "exact_hscode_lookup"
@@ -45,6 +53,13 @@ export type AnswerMode =
   | "clarification_needed";
 
 export type AnswerConfidence = "high" | "medium" | "low";
+export type QaAnswerGenerationMode =
+  | "template-classification"
+  | "extractive-definition"
+  | "extractive-field"
+  | "broad-lookup"
+  | "llm-selected-section"
+  | "safe-fallback";
 
 export interface GateResult {
   answerMode: AnswerMode;
@@ -61,6 +76,12 @@ export interface AmbiguousLookupDetection {
   reason: string;
   candidates: CandidateRelevance[];
 }
+
+export type BroadQueryDecision = {
+  isBroad: boolean;
+  reason: string;
+  suggestedMode: "broad_lookup" | "clarification" | "normal";
+};
 
 export interface IntentDetection {
   intent: QaIntent;
@@ -86,6 +107,18 @@ export interface QaDocumentMetadata {
   rootText?: string;
 }
 
+export interface LocalSelectedSectionAnswer {
+  answer: string | undefined;
+  answerGeneration: QaAnswerGenerationMode | null;
+  fallbackReason: string | null;
+  fieldExtraction?: {
+    requestedField: string | null;
+    matchedHeading: string | null;
+    confidence: FieldExtractionConfidence;
+    fallbackUsed: boolean;
+  };
+}
+
 export interface QaDebugInfo {
   detectedIntent: QaIntent;
   intentConfidence: number;
@@ -105,13 +138,21 @@ export interface QaDebugInfo {
   fieldExtraction?: {
     requestedField: string | null;
     matchedHeading: string | null;
-    confidence: AnswerConfidence;
+    confidence: FieldExtractionConfidence;
     fallbackUsed: boolean;
   };
-  answerGeneration?: "llm-selected-section" | "template-classification" | "safe-fallback" | string;
+  answerGeneration?: QaAnswerGenerationMode | string;
   llmCalled?: boolean;
+  llmSkippedReason?: string | null;
+  llmErrorType?: string | null;
   sectionTextChars?: number;
+  selectedSectionTextChars?: number;
+  contextChars?: number;
   fallbackReason?: string | null;
+  localExtractorUsed?: boolean;
+  localExtractorConfidence?: AnswerConfidence | null;
+  localExtractorReason?: string | null;
+  hsCodeAttached?: boolean;
   candidateRejectionReasons: Array<Record<string, unknown>>;
   indexSource?: Record<string, unknown>;
   cacheStatus?: Record<string, unknown>;
@@ -149,6 +190,32 @@ export function detectIntent(query: string): IntentDetection {
       confidence: 0.75,
       reason: "query asks for a definition or meaning",
       definitionTerm: extractDefinitionTarget(query),
+      plannerSource: "fallback"
+    };
+  }
+  const requestedField = canonicalRequestedFieldFromText(query);
+  if (!explicitHsQuestion && requestedField) {
+    return {
+      intent: "section_attribute_question",
+      confidence: 0.78,
+      reason: "query asks for a specific section attribute or field",
+      queryPlan: {
+        intent: "section_attribute_question",
+        target: null,
+        requestedField,
+        needsHsCode: false,
+        language: "unknown",
+        confidence: "medium",
+        reason: "rule-based attribute field detection"
+      },
+      plannerSource: "fallback"
+    };
+  }
+  if (!explicitHsQuestion && isComparisonIntentQuestion(query)) {
+    return {
+      intent: "comparison",
+      confidence: 0.72,
+      reason: "query asks for comparison or contrast evidence",
       plannerSource: "fallback"
     };
   }
@@ -210,7 +277,7 @@ export function handleExactHsCodeLookup(
     intent: "exact_hscode_lookup",
     answerMode: gate.answerMode,
     answerConfidence: gate.answerConfidence,
-    answer: finalAnswer,
+    answer: sanitizeFinalAnswer(finalAnswer),
     selectedPrimary,
     documentSummary: null,
     citations: selectedPrimary ? [selectedPrimary] : [],
@@ -219,6 +286,10 @@ export function handleExactHsCodeLookup(
       selectedPrimary,
       candidateRejectionReasons: [],
       exactHsCode: exactCode,
+      answerGeneration: baseDebug.answerGeneration ?? "template-classification",
+      broadQueryDecision: { isBroad: false, reason: "exact HS code lookup bypasses broad handling", suggestedMode: "normal" },
+      finalAnswerSanitized: true,
+      scopeApplied: true,
       ...debugGateFields(gate)
     })
   };
@@ -254,7 +325,7 @@ export function handleChapterSummary(
     intent: "chapter_summary",
     answerMode: "chapter_summary",
     answerConfidence: items.length > 0 ? "high" : "low",
-    answer: formatChapterSummaryAnswer(chapterNumber, items, answer),
+    answer: sanitizeFinalAnswer(formatChapterSummaryAnswer(chapterNumber, items, answer)),
     selectedPrimary: null,
     documentSummary,
     citations: [],
@@ -263,6 +334,9 @@ export function handleChapterSummary(
       resolvedDocument: resolved,
       selectedPrimary: null,
       candidateRejectionReasons: [],
+      broadQueryDecision: { isBroad: false, reason: "chapter summary bypasses broad handling", suggestedMode: "normal" },
+      finalAnswerSanitized: true,
+      scopeApplied: true,
       ...debugGateFields(deterministicGate(
         "chapter_summary",
         items.length > 0 ? "high" : "low",
@@ -313,7 +387,7 @@ export function handleDocumentSummary(
     intent: "document_summary",
     answerMode: "document_summary",
     answerConfidence: resolved ? "high" : "low",
-    answer,
+    answer: sanitizeFinalAnswer(answer),
     selectedPrimary: null,
     documentSummary,
     citations: [],
@@ -322,6 +396,9 @@ export function handleDocumentSummary(
       resolvedDocument: resolved,
       selectedPrimary: null,
       candidateRejectionReasons: [],
+      broadQueryDecision: { isBroad: false, reason: "document summary bypasses broad handling", suggestedMode: "normal" },
+      finalAnswerSanitized: true,
+      scopeApplied: true,
       ...debugGateFields(deterministicGate(
         "document_summary",
         resolved ? "high" : "low",
@@ -338,7 +415,8 @@ export function handleDefinition(
   selectedSection: EnrichedRetrievedSection | undefined,
   candidates: CandidateRelevance[] = [],
   detection: IntentDetection = detectIntent(query),
-  baseDebug: Partial<QaDebugInfo> = {}
+  baseDebug: Partial<QaDebugInfo> = {},
+  localAnswer?: string
 ): RoutedQaAnswer {
   if (detection.queryPlan?.confidence === "low") {
     return emptyIntentAnswer("definition", clarificationAnswer(), detection, candidates, baseDebug, {
@@ -366,6 +444,33 @@ export function handleDefinition(
   if (gate.shouldAskClarification) {
     return emptyIntentAnswer("definition", clarificationAnswer(), detection, candidates, baseDebug, gate);
   }
+  const cleanedLocalAnswer = cleanDefinitionLocalAnswer(localAnswer);
+  if (cleanedLocalAnswer) {
+    const selectedPrimary = publicSection(selectedSection);
+    return {
+      intent: "definition",
+      answerMode: gate.answerMode,
+      answerConfidence: gate.answerConfidence,
+      answer: sanitizeFinalAnswer(cleanedLocalAnswer),
+      selectedPrimary,
+      documentSummary: null,
+      citations: [selectedPrimary],
+      debug: buildDebug(baseDebug, detection, {
+        selectedHandler: "definition",
+        selectedPrimary,
+        selectedPrimaryId: sectionIdentity(selectedSection),
+        candidateRejectionReasons: candidateRejections(candidates),
+        finalHsCodes: answerMentionsHsCode(cleanedLocalAnswer) ? hsCodesForSection(selectedSection) : [],
+        answerGeneration: baseDebug.answerGeneration ?? "extractive-definition",
+        answerRepairApplied: false,
+        structuredAnswer: buildStructuredAnswer(selectedSection, undefined, query),
+        rejectedReason: selectedCandidate(candidates, selectedSection)?.rejectedReason ?? null,
+        finalAnswerSanitized: true,
+        scopeApplied: true,
+        ...debugGateFields(gate)
+      })
+    };
+  }
   const rendered = renderHsCodeAnswer(undefined, selectedSection, [], { question: query, answerStyle: "class-eval" });
   return renderedIntentAnswer("definition", rendered, selectedSection, candidates, detection, baseDebug, gate);
 }
@@ -379,15 +484,25 @@ export function handleProductClassification(
   detection: IntentDetection = detectIntent(query),
   baseDebug: Partial<QaDebugInfo> = {}
 ): RoutedQaAnswer {
-  const ambiguity = detectAmbiguousLookup(query, candidates);
-  if (ambiguity) {
-    return ambiguousLookupIntentAnswer("product_classification", query, ambiguity, detection, baseDebug);
-  }
-
   if (!selectedSection) {
     const gate = productGate(query, undefined, candidates);
     return emptyIntentAnswer("product_classification", gate.answerMode === "numeric_lookup" ? numericOnlyClarificationAnswer(query) : clarificationAnswer(), detection, candidates, baseDebug, gate);
   }
+  const broadDecision = detectBroadQuery({
+    originalQuery: query,
+    querySignals: querySignalsFromCandidates(query, candidates),
+    validatedCandidates: validatedCandidatesFromRelevance(candidates)
+  });
+  const hasTemplateAnswer = Boolean(llmAnswer?.trim()) && baseDebug.answerGeneration === "template-classification";
+  if (broadDecision.isBroad && !hasTemplateAnswer) {
+    const lookupCandidates = lookupCandidatesForAnswer(selectedSection, alternatives, candidates);
+    if (broadDecision.suggestedMode === "broad_lookup" && lookupCandidates.length > 0) {
+      return broadLookupIntentAnswer("product_classification", query, lookupCandidates, selectedSection, detection, baseDebug, broadDecision);
+    }
+    const gate = deterministicGate("clarification", "low", topCandidate(candidates)?.finalScore ?? 0, [], broadDecision.reason);
+    return emptyIntentAnswer("product_classification", numericOnlyClarificationAnswer(query, selectedSection), detection, candidates, baseDebug, gate, broadDecision);
+  }
+
   const gate = productGate(query, selectedSection, candidates);
   if (gate.answerMode === "numeric_lookup") {
     return lookupIntentAnswer("product_classification", numericOnlyClarificationAnswer(query, selectedSection), selectedSection, candidates, detection, baseDebug, gate);
@@ -406,6 +521,67 @@ export function handleProductClassification(
   return renderedIntentAnswer("product_classification", rendered, selectedSection, candidates, detection, baseDebug, gate);
 }
 
+export function extractLocalSelectedSectionAnswer(
+  query: string,
+  selectedSection: EnrichedRetrievedSection | undefined,
+  detection: IntentDetection = detectIntent(query)
+): LocalSelectedSectionAnswer {
+  if (!selectedSection) {
+    return {
+      answer: undefined,
+      answerGeneration: null,
+      fallbackReason: "no_selected_section"
+    };
+  }
+
+  const sectionText = [selectedSection.text, ...(selectedSection.captions ?? [])]
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+  if (!sectionText) {
+    return {
+      answer: undefined,
+      answerGeneration: null,
+      fallbackReason: "missing_section_text"
+    };
+  }
+
+  const requestedField = detection.queryPlan?.requestedField ??
+    canonicalRequestedFieldFromText(query) ??
+    (isDefinitionStyleQuestion(query) ? "definition" : null);
+  if (!requestedField) {
+    return {
+      answer: undefined,
+      answerGeneration: null,
+      fallbackReason: "local_extractor_no_requested_field"
+    };
+  }
+
+  const extracted = extractRequestedField(sectionText, requestedField);
+  const fieldExtraction = {
+    requestedField,
+    matchedHeading: extracted.matchedHeading,
+    confidence: extracted.confidence,
+    fallbackUsed: extracted.fallbackUsed
+  };
+  const answer = cleanSelectedSectionAnswer(extracted.extractedText, query);
+  if (answer) {
+    return {
+      answer,
+      answerGeneration: requestedField === "definition" ? "extractive-definition" : "extractive-field",
+      fallbackReason: null,
+      fieldExtraction
+    };
+  }
+
+  return {
+    answer: undefined,
+    answerGeneration: null,
+    fallbackReason: "local_extractor_no_match",
+    fieldExtraction
+  };
+}
+
 export function handleSelectedSectionQa(
   query: string,
   selectedSection: EnrichedRetrievedSection | undefined,
@@ -414,11 +590,6 @@ export function handleSelectedSectionQa(
   detection: IntentDetection = detectIntent(query),
   baseDebug: Partial<QaDebugInfo> = {}
 ): RoutedQaAnswer {
-  const ambiguity = detectAmbiguousLookup(query, candidates);
-  if (ambiguity) {
-    return ambiguousLookupIntentAnswer("selected_section_qa", query, ambiguity, detection, baseDebug);
-  }
-
   if (asksForHsCodeOrClassification(query)) {
     return handleProductClassification(query, selectedSection, [], undefined, candidates, detection, baseDebug);
   }
@@ -435,14 +606,44 @@ export function handleSelectedSectionQa(
     });
   }
 
+  const broadDecision = meaningfulIntentTokens(query).length <= 1 ? detectBroadQuery({
+    originalQuery: query,
+    querySignals: querySignalsFromCandidates(query, candidates),
+    validatedCandidates: validatedCandidatesFromRelevance(candidates)
+  }) : { isBroad: false, reason: "multi-token selected-section question uses normal QA", suggestedMode: "normal" } satisfies BroadQueryDecision;
+  if (broadDecision.isBroad) {
+    const lookupCandidates = lookupCandidatesForAnswer(selectedSection, [], candidates);
+    if (broadDecision.suggestedMode === "broad_lookup" && lookupCandidates.length > 0) {
+      return broadLookupIntentAnswer("selected_section_qa", query, lookupCandidates, selectedSection, detection, baseDebug, broadDecision);
+    }
+    const gate = deterministicGate("clarification", "low", topCandidate(candidates)?.finalScore ?? 0, [], broadDecision.reason);
+    return emptyIntentAnswer("selected_section_qa", isNumericOnlyQuery(query) ? numericOnlyClarificationAnswer(query, selectedSection) : clarificationAnswer(), detection, candidates, baseDebug, gate, broadDecision);
+  }
+
   const gate = selectedSectionGate(selectedSection, candidates);
   if (gate.shouldAskClarification) {
     return emptyIntentAnswer("selected_section_qa", clarificationAnswer(), detection, candidates, baseDebug, gate);
   }
 
   const selectedPrimary = publicSection(selectedSection);
-  const cleanedAnswer = cleanSelectedSectionAnswer(llmAnswer, query);
-  const usedGeneratedAnswer = Boolean(cleanedAnswer) && !baseDebug.fallbackReason && baseDebug.answerGeneration !== "safe-fallback";
+  let cleanedAnswer = cleanSelectedSectionAnswer(llmAnswer, query);
+  let effectiveFallbackReason = baseDebug.fallbackReason ?? null;
+  let effectiveAnswerGeneration = typeof baseDebug.answerGeneration === "string" ? baseDebug.answerGeneration : undefined;
+  let fieldExtraction = baseDebug.fieldExtraction;
+  if (!cleanedAnswer && baseDebug.answerGeneration !== "safe-fallback") {
+    const localAnswer = extractLocalSelectedSectionAnswer(query, selectedSection, detection);
+    if (localAnswer.answer) {
+      cleanedAnswer = cleanSelectedSectionAnswer(localAnswer.answer, query);
+      effectiveAnswerGeneration = localAnswer.answerGeneration ?? effectiveAnswerGeneration;
+      effectiveFallbackReason = null;
+      fieldExtraction = localAnswer.fieldExtraction;
+    } else {
+      effectiveFallbackReason = effectiveFallbackReason ?? localAnswer.fallbackReason;
+      fieldExtraction = fieldExtraction ?? localAnswer.fieldExtraction;
+    }
+  }
+  effectiveAnswerGeneration = effectiveAnswerGeneration ?? (cleanedAnswer ? "llm-selected-section" : "safe-fallback");
+  const usedGeneratedAnswer = Boolean(cleanedAnswer) && !effectiveFallbackReason && effectiveAnswerGeneration !== "safe-fallback";
   const answer = maybeAppendRelatedHsCode(
     cleanedAnswer || safeSelectedSectionFallbackAnswer(selectedSection),
     query,
@@ -455,7 +656,7 @@ export function handleSelectedSectionQa(
     intent: "selected_section_qa",
     answerMode: "selected_section_qa",
     answerConfidence: gate.answerConfidence,
-    answer,
+    answer: sanitizeFinalAnswer(answer),
     selectedPrimary,
     documentSummary: null,
     citations: [selectedPrimary],
@@ -465,7 +666,12 @@ export function handleSelectedSectionQa(
       selectedPrimaryId: sectionIdentity(selectedSection),
       candidateRejectionReasons: candidateRejections(candidates),
       finalHsCodes,
+      answerGeneration: effectiveAnswerGeneration,
+      fallbackReason: effectiveFallbackReason,
+      fieldExtraction,
       rejectedReason: selectedCandidate(candidates, selectedSection)?.rejectedReason ?? null,
+      finalAnswerSanitized: true,
+      scopeApplied: true,
       ...debugGateFields(gate)
     })
   };
@@ -487,7 +693,7 @@ export function handleClarificationNeeded(
     intent: detection.intent,
     answerMode: gate.answerMode,
     answerConfidence: gate.answerConfidence,
-    answer: clarificationAnswer(),
+    answer: sanitizeFinalAnswer(clarificationAnswer()),
     selectedPrimary: null,
     documentSummary: null,
     citations: [],
@@ -532,7 +738,7 @@ function renderedIntentAnswer(
     intent,
     answerMode: gate.answerMode,
     answerConfidence: gate.answerConfidence,
-    answer: rendered.answer,
+    answer: sanitizeFinalAnswer(rendered.answer),
     selectedPrimary,
     documentSummary: null,
     citations: rendered.citations.map(publicSection),
@@ -542,9 +748,13 @@ function renderedIntentAnswer(
       selectedPrimaryId: sectionIdentity(selectedSection),
       candidateRejectionReasons: candidateRejections(candidates),
       finalHsCodes: rendered.finalHsCodes,
+      answerGeneration: baseDebug.answerGeneration ??
+        (intent === "definition" ? "extractive-definition" : intent === "product_classification" ? "template-classification" : undefined),
       answerRepairApplied: rendered.answerRepairApplied,
       structuredAnswer: buildStructuredAnswer(selectedSection, undefined),
       rejectedReason: selectedCandidate(candidates, selectedSection)?.rejectedReason ?? null,
+      finalAnswerSanitized: true,
+      scopeApplied: true,
       ...debugGateFields(gate)
     })
   };
@@ -564,7 +774,7 @@ function lookupIntentAnswer(
     intent,
     answerMode: gate.answerMode,
     answerConfidence: gate.answerConfidence,
-    answer,
+    answer: sanitizeFinalAnswer(answer),
     selectedPrimary,
     documentSummary: null,
     citations: [selectedPrimary],
@@ -575,6 +785,8 @@ function lookupIntentAnswer(
       candidateRejectionReasons: candidateRejections(candidates),
       finalHsCodes: hsCodesForSection(selectedSection),
       rejectedReason: selectedCandidate(candidates, selectedSection)?.rejectedReason ?? null,
+      finalAnswerSanitized: true,
+      scopeApplied: true,
       ...debugGateFields(gate)
     })
   };
@@ -589,15 +801,15 @@ function multiResultLookupIntentAnswer(
   baseDebug: Partial<QaDebugInfo>,
   gate: GateResult
 ): RoutedQaAnswer {
-  const listedCandidates = distinctCandidateSections(candidates)
+  const listedCandidates = groupDistinctBroadLookupCandidates(candidates)
     .sort((left, right) => right.finalScore - left.finalScore)
-    .slice(0, 8);
+    .slice(0, 5);
   const selectedPrimary = selectedSection ? publicSection(selectedSection) : null;
   return {
     intent,
     answerMode: gate.answerMode,
     answerConfidence: gate.answerConfidence,
-    answer: broadLookupAnswer(query, listedCandidates),
+    answer: sanitizeFinalAnswer(broadLookupUserAnswer(query, listedCandidates)),
     selectedPrimary,
     documentSummary: null,
     citations: listedCandidates.map(publicCandidate),
@@ -607,46 +819,58 @@ function multiResultLookupIntentAnswer(
       selectedPrimaryId: selectedSection ? sectionIdentity(selectedSection) : undefined,
       candidateRejectionReasons: candidateRejections(candidates),
       finalHsCodes: selectedSection ? hsCodesForSection(selectedSection) : [],
-      answerGeneration: "lookup-list",
-      listedCandidates: listedCandidates.map(publicCandidate),
+      answerGeneration: "broad-lookup",
+      broadQueryDecision: { isBroad: true, reason: gate.confidenceReason, suggestedMode: "broad_lookup" },
+      broadLookupCandidates: listedCandidates.map(publicCandidate),
       rejectedReason: selectedSection ? selectedCandidate(candidates, selectedSection)?.rejectedReason ?? null : topCandidate(candidates)?.rejectedReason ?? null,
+      finalAnswerSanitized: true,
+      scopeApplied: true,
       ...debugGateFields(gate)
     })
   };
 }
 
-function ambiguousLookupIntentAnswer(
+function broadLookupIntentAnswer(
   intent: QaIntent,
   query: string,
-  ambiguity: AmbiguousLookupDetection,
+  candidates: CandidateRelevance[],
+  selectedSection: EnrichedRetrievedSection | undefined,
   detection: IntentDetection,
-  baseDebug: Partial<QaDebugInfo>
+  baseDebug: Partial<QaDebugInfo>,
+  decision: BroadQueryDecision
 ): RoutedQaAnswer {
+  const listedCandidates = groupDistinctBroadLookupCandidates(candidates)
+    .sort((left, right) => right.finalScore - left.finalScore)
+    .slice(0, 5);
   const gate = deterministicGate(
-    "ambiguous_lookup",
+    decision.suggestedMode === "clarification" ? "clarification" : "broad_lookup",
     "low",
-    topCandidate(ambiguity.candidates)?.finalScore ?? 0,
-    [ambiguity.token],
-    ambiguity.reason
+    topCandidate(listedCandidates)?.finalScore ?? 0,
+    [],
+    decision.reason
   );
-  const listedCandidates = ambiguity.candidates.slice(0, 8);
+  const selectedPrimary = selectedSection ? publicSection(selectedSection) : null;
   return {
     intent,
     answerMode: gate.answerMode,
     answerConfidence: gate.answerConfidence,
-    answer: broadLookupAnswer(query, listedCandidates),
+    answer: sanitizeFinalAnswer(decision.suggestedMode === "clarification"
+      ? numericOnlyClarificationAnswer(query, selectedSection)
+      : broadLookupUserAnswer(query, listedCandidates)),
     selectedPrimary: null,
     documentSummary: null,
     citations: listedCandidates.map(publicCandidate),
     debug: buildDebug(baseDebug, detection, {
       selectedHandler: intent,
-      selectedPrimary: null,
+      selectedPrimary,
       candidateRejectionReasons: [],
       finalHsCodes: [],
-      answerGeneration: "ambiguous-lookup",
-      ambiguityReason: ambiguity.reason,
-      candidateCount: ambiguity.candidates.length,
-      ambiguousCandidates: listedCandidates.map(publicCandidate),
+      answerGeneration: "broad-lookup",
+      broadQueryDecision: decision,
+      broadLookupCandidates: listedCandidates.map(publicCandidate),
+      candidateCount: candidates.length,
+      finalAnswerSanitized: true,
+      scopeApplied: true,
       ...debugGateFields(gate)
     })
   };
@@ -658,13 +882,14 @@ function emptyIntentAnswer(
   detection: IntentDetection,
   candidates: CandidateRelevance[],
   baseDebug: Partial<QaDebugInfo>,
-  gate: GateResult = deterministicGate("clarification", "low", 0, [], "no selected section")
+  gate: GateResult = deterministicGate("clarification", "low", 0, [], "no selected section"),
+  broadQueryDecision: BroadQueryDecision = { isBroad: false, reason: "not evaluated", suggestedMode: "normal" }
 ): RoutedQaAnswer {
   return {
     intent,
     answerMode: gate.answerMode,
     answerConfidence: gate.answerConfidence,
-    answer,
+    answer: sanitizeFinalAnswer(answer),
     selectedPrimary: null,
     documentSummary: null,
     citations: [],
@@ -673,6 +898,9 @@ function emptyIntentAnswer(
       selectedPrimary: null,
       candidateRejectionReasons: candidateRejections(candidates),
       rejectedReason: topCandidate(candidates)?.rejectedReason ?? null,
+      broadQueryDecision,
+      finalAnswerSanitized: true,
+      scopeApplied: true,
       ...debugGateFields(gate)
     })
   };
@@ -692,13 +920,17 @@ function buildDebug(
     resolvedDocument: null,
     selectedPrimary: null,
     candidateRejectionReasons: [],
+    broadQueryDecision: { isBroad: false, reason: "not evaluated", suggestedMode: "normal" },
+    broadLookupCandidates: [],
+    finalAnswerSanitized: true,
+    scopeApplied: true,
     ...baseDebug,
     ...overrides
   };
 }
 
-const CLASSIFICATION_MIN_SCORE = 50;
-const MIN_STRONG_SIGNALS = 2;
+const CLASSIFICATION_MIN_SCORE = 35;
+const MIN_STRONG_SIGNALS = 1;
 
 function productGate(
   query: string,
@@ -710,13 +942,18 @@ function productGate(
     : candidates;
   const selected = selectedSection ? selectedCandidate(effectiveCandidates, selectedSection) : topCandidate(effectiveCandidates);
   const finalScore = selected?.finalScore ?? selectedSection?.score ?? 0;
-  const strongSignals = selectedSection && selected ? strongSignalsForCandidate(query, selectedSection, selected) : [];
+  const strongSignals = selectedSection && selected ? uniqueStrings([
+    ...strongSignalsForCandidate(query, selectedSection, selected),
+    ...(selected.validation?.strongSignals ?? [])
+  ]) : [];
   const contradictions = selectedSection && selected ? contradictionsForCandidate(query, selectedSection, selected) : [];
   const shortQuery = isAmbiguousProductQuery(query);
   const numericOnly = isNumericOnlyQuery(query);
   const rejectedReason = selected?.rejectedReason ?? null;
   const rejected = Boolean(selected?.rejected);
   const weakOnly = Boolean(rejectedReason && /weak generic|bare numbers|contrast baseline/i.test(rejectedReason));
+  const weakExpansionOnly = candidateMatchesOnlyWeakExpansion(selected);
+  const validation = selected?.validation;
 
   if (numericOnly) {
     return {
@@ -766,6 +1003,42 @@ function productGate(
     };
   }
 
+  if (validation && !validation.accepted) {
+    return {
+      answerMode: "clarification",
+      answerConfidence: "low",
+      confidenceReason: validation.reason,
+      finalScore,
+      strongSignals,
+      contradictions,
+      shouldAskClarification: true
+    };
+  }
+
+  if (weakExpansionOnly) {
+    return {
+      answerMode: "lookup",
+      answerConfidence: "low",
+      confidenceReason: "candidate matched only weak query expansion terms",
+      finalScore,
+      strongSignals,
+      contradictions,
+      shouldAskClarification: false
+    };
+  }
+
+  if (validation?.confidence === "low") {
+    return {
+      answerMode: "lookup",
+      answerConfidence: "low",
+      confidenceReason: validation.reason,
+      finalScore,
+      strongSignals,
+      contradictions,
+      shouldAskClarification: false
+    };
+  }
+
   if (contradictions.length > 0) {
     return {
       answerMode: "clarification",
@@ -778,9 +1051,9 @@ function productGate(
     };
   }
 
-  const lowerThresholdAllowed = finalScore >= 40 &&
-    (strongSignals.includes("title_phrase_match") || strongSignals.includes("scientific_name_match"));
-  const signalMinimum = finalScore >= 70 ? 1 : MIN_STRONG_SIGNALS;
+  const lowerThresholdAllowed = finalScore >= 30 &&
+    (strongSignals.includes("title_phrase_match") || strongSignals.includes("scientific_name_match") || strongSignals.includes("product_name_phrase_match"));
+  const signalMinimum = MIN_STRONG_SIGNALS;
   const enoughScore = finalScore >= CLASSIFICATION_MIN_SCORE || lowerThresholdAllowed;
   const enoughSignals = strongSignals.length >= signalMinimum;
 
@@ -827,13 +1100,19 @@ function definitionGate(
   const effectiveCandidates = candidates.length === 0 ? [evaluateCandidateRelevance(selectedSection, query)] : candidates;
   const selected = selectedCandidate(effectiveCandidates, selectedSection);
   const finalScore = selected?.finalScore ?? selectedSection.score;
-  const strongSignals = selected ? strongSignalsForCandidate(query, selectedSection, selected) : ["definition_selected"];
+  const strongSignals = selected ? uniqueStrings([
+    ...strongSignalsForCandidate(query, selectedSection, selected),
+    ...(selected.validation?.strongSignals ?? [])
+  ]) : ["definition_selected"];
   const rejectedReason = selected?.rejectedReason ?? null;
-  const shouldAsk = Boolean(selected?.rejected) || finalScore < 8 || isAmbiguousDefinitionQuery(query);
+  const weakExpansionOnly = candidateMatchesOnlyWeakExpansion(selected);
+  const validation = selected?.validation;
+  const validationRejects = validation ? !validation.accepted || validation.confidence === "low" : false;
+  const shouldAsk = Boolean(selected?.rejected) || validationRejects || weakExpansionOnly || finalScore < 8 || isAmbiguousDefinitionQuery(query);
   return {
     answerMode: shouldAsk ? "clarification" : "definition",
     answerConfidence: shouldAsk ? "low" : finalScore >= 50 ? "high" : "medium",
-    confidenceReason: shouldAsk ? rejectedReason ?? "definition query is too ambiguous" : "definition section is relevant",
+    confidenceReason: shouldAsk ? rejectedReason ?? validation?.reason ?? (weakExpansionOnly ? "candidate matched only weak query expansion terms" : "definition query is too ambiguous") : "definition section is relevant",
     finalScore,
     strongSignals,
     contradictions: [],
@@ -849,13 +1128,16 @@ function sectionAttributeGate(
   const finalScore = selected?.finalScore ?? selectedSection.score ?? 0;
   const rejectedReason = selected?.rejectedReason ?? null;
   const rejected = Boolean(selected?.rejected);
-  const shouldAsk = rejected || finalScore < 8;
+  const weakExpansionOnly = candidateMatchesOnlyWeakExpansion(selected);
+  const validation = selected?.validation;
+  const validationRejects = validation ? !validation.accepted || validation.confidence === "low" : false;
+  const shouldAsk = rejected || validationRejects || weakExpansionOnly || finalScore < 8;
   return {
     answerMode: shouldAsk ? "clarification" : "section_attribute_question",
     answerConfidence: shouldAsk ? "low" : finalScore >= 50 ? "high" : "medium",
-    confidenceReason: shouldAsk ? rejectedReason ?? "selected section relevance is low" : "selected section is relevant for requested field extraction",
+    confidenceReason: shouldAsk ? rejectedReason ?? validation?.reason ?? (weakExpansionOnly ? "candidate matched only weak query expansion terms" : "selected section relevance is low") : "selected section is relevant for requested field extraction",
     finalScore,
-    strongSignals: selected ? uniqueStrings([...selected.candidateMatchedPhrases, ...selected.candidateMatchedTokens]).slice(0, 8) : [],
+    strongSignals: selected ? uniqueStrings([...selected.candidateMatchedPhrases, ...selected.candidateMatchedTokens, ...(selected.validation?.strongSignals ?? [])]).slice(0, 8) : [],
     contradictions: selected?.contrastTermOnlyMatch ? ["contrast_term_only_match"] : [],
     shouldAskClarification: shouldAsk
   };
@@ -869,13 +1151,16 @@ function selectedSectionGate(
   const finalScore = selected?.finalScore ?? selectedSection.score ?? 0;
   const rejectedReason = selected?.rejectedReason ?? null;
   const rejected = Boolean(selected?.rejected);
-  const shouldAsk = rejected || finalScore < 8;
+  const weakExpansionOnly = candidateMatchesOnlyWeakExpansion(selected);
+  const validation = selected?.validation;
+  const validationRejects = validation ? !validation.accepted || validation.confidence === "low" : false;
+  const shouldAsk = rejected || validationRejects || weakExpansionOnly || finalScore < 8;
   return {
     answerMode: shouldAsk ? "clarification" : "selected_section_qa",
     answerConfidence: shouldAsk ? "low" : finalScore >= 50 ? "high" : "medium",
-    confidenceReason: shouldAsk ? rejectedReason ?? "selected section relevance is low" : "selected section is relevant",
+    confidenceReason: shouldAsk ? rejectedReason ?? validation?.reason ?? (weakExpansionOnly ? "candidate matched only weak query expansion terms" : "selected section relevance is low") : "selected section is relevant",
     finalScore,
-    strongSignals: selected ? uniqueStrings([...selected.candidateMatchedPhrases, ...selected.candidateMatchedTokens]).slice(0, 8) : [],
+    strongSignals: selected ? uniqueStrings([...selected.candidateMatchedPhrases, ...selected.candidateMatchedTokens, ...(selected.validation?.strongSignals ?? [])]).slice(0, 8) : [],
     contradictions: selected?.contrastTermOnlyMatch ? ["contrast_term_only_match"] : [],
     shouldAskClarification: shouldAsk
   };
@@ -909,6 +1194,79 @@ export function detectAmbiguousLookup(
     reason: "single broad token matched multiple sections",
     candidates: matches
   };
+}
+
+export function detectBroadQuery(args: {
+  originalQuery: string;
+  querySignals: QuerySignals;
+  validatedCandidates: ValidatedCandidate[];
+}): BroadQueryDecision {
+  const query = args.originalQuery.trim();
+  const tokens = meaningfulIntentTokens(query);
+  const accepted = groupDistinctValidatedCandidates(args.validatedCandidates
+    .filter((candidate) => candidate.validation.accepted)
+    .filter((candidate) => hsCodesForSection(candidate).length > 0));
+  const top = accepted[0];
+  const second = accepted[1];
+  const topRelevance = top?.relevance;
+  const exactCodeMatch = Boolean(query.match(HS_CODE_PATTERN) && accepted.some((candidate) => hsCodesForSection(candidate).some((code) => query.includes(code))));
+  const strongTitlePhrase = accepted.some((candidate) =>
+    candidate.validation.strongSignals.includes("exact_or_near_exact_title_phrase_match") ||
+    candidate.validation.strongSignals.includes("distinctive_multi_token_phrase_overlap") ||
+    candidate.validation.strongSignals.includes("caption_or_body_distinctive_phrase_match") ||
+    candidate.validation.strongSignals.includes("numeric_unit_match_plus_product_or_attribute_evidence") ||
+    candidate.validation.strongSignals.includes("scientific_or_latin_like_term_match")
+  );
+  if (exactCodeMatch) {
+    return { isBroad: false, reason: "exact HS code match exists", suggestedMode: "normal" };
+  }
+  if (accepted.length === 1 && (strongTitlePhrase || top?.validation.confidence !== "low")) {
+    return { isBroad: false, reason: "single accepted candidate after validation", suggestedMode: "normal" };
+  }
+  if (strongTitlePhrase && !multipleSimilarCandidates(accepted)) {
+    return { isBroad: false, reason: "strong distinctive phrase/title/numeric evidence exists", suggestedMode: "normal" };
+  }
+  if (isNumericOnlyQuery(query)) {
+    return {
+      isBroad: true,
+      reason: accepted.length > 0 ? "numeric-only query has related evidence but no product context" : "numeric-only query lacks product context",
+      suggestedMode: "clarification"
+    };
+  }
+  if (tokens.length <= 1 && accepted.length >= 2) {
+    return {
+      isBroad: true,
+      reason: "single broad token matched multiple distinct candidates",
+      suggestedMode: "broad_lookup"
+    };
+  }
+  if (tokens.length <= 1 && accepted.length <= 1 && !strongTitlePhrase) {
+    return {
+      isBroad: true,
+      reason: "query has fewer than two meaningful distinctive tokens",
+      suggestedMode: accepted.length > 0 ? "broad_lookup" : "clarification"
+    };
+  }
+  if (accepted.length >= 2 && topRelevance && second?.relevance) {
+    const margin = topRelevance.finalScore - second.relevance.finalScore;
+    const lowConfidenceAccepted = accepted.filter((candidate) => candidate.validation.confidence === "low").length;
+    const onlyBroadEvidence = accepted.slice(0, 5).every((candidate) => candidateEvidenceIsBroadOnly(candidate.relevance, tokens));
+    if (margin >= 15 && !onlyBroadEvidence && lowConfidenceAccepted < 2) {
+      return { isBroad: false, reason: "top candidate dominates with sufficient margin", suggestedMode: "normal" };
+    }
+    if (margin < 10 || lowConfidenceAccepted >= 2 || onlyBroadEvidence) {
+      return {
+        isBroad: true,
+        reason: margin < 10
+          ? "top candidate does not clearly dominate similar candidates"
+          : onlyBroadEvidence
+            ? "evidence is broad/common token only"
+            : "multiple accepted candidates have similar low-confidence evidence",
+        suggestedMode: "broad_lookup"
+      };
+    }
+  }
+  return { isBroad: false, reason: "query has enough distinctive support for normal routing", suggestedMode: "normal" };
 }
 
 export function asksForHsCodeOrClassification(query: string): boolean {
@@ -962,6 +1320,26 @@ function contradictionsForCandidate(
   return uniqueStrings(contradictions);
 }
 
+function candidateMatchesOnlyWeakExpansion(candidate: CandidateRelevance | undefined): boolean {
+  if (!candidate) {
+    return false;
+  }
+  const originalMatches = candidate.matchedOriginalTerms ?? [];
+  const expansionMatches = candidate.matchedExpansionTerms ?? [];
+  if (originalMatches.length > 0 || expansionMatches.length === 0) {
+    return false;
+  }
+  if (candidate.expansionConfidence !== "high") {
+    return true;
+  }
+  const hasExactCode = candidate.matchedTerms.some((term) => HS_CODE_PATTERN.test(term));
+  const hasNumericEvidence = candidate.numericMatches.length > 0 || candidate.matchedNumericRanges.length > 0;
+  const hasSpecificPhrase = candidate.candidateMatchedPhrases.some((phrase) => meaningfulIntentTokens(phrase).length >= 2);
+  const specificExpansionTokens = uniqueStrings(expansionMatches.flatMap(meaningfulIntentTokens))
+    .filter((token) => token.length >= 4 && !/^\d+$/.test(token));
+  return !(hasExactCode || hasNumericEvidence || hasSpecificPhrase || specificExpansionTokens.length >= 2);
+}
+
 function numericOnlyClarificationAnswer(query: string, section?: EnrichedRetrievedSection): string {
   const value = query.trim();
   return section
@@ -981,12 +1359,22 @@ function cleanSelectedSectionAnswer(answer: string | undefined, query: string): 
     return "";
   }
   if (asksForHsCodeOrClassification(query)) {
-    return ensureSentence(cleaned);
+    return sanitizeFinalAnswer(ensureSentence(cleaned), { stripHsCode: false });
   }
-  return ensureSentence(cleaned
+  return sanitizeFinalAnswer(ensureSentence(cleaned
     .replace(/(?:^|\s)HS Code:\s*\d{4}\.\d{2}\.\d{2}\.?/gi, " ")
     .replace(/\s+/g, " ")
-    .trim());
+    .trim()), { stripHsCode: false });
+}
+
+function cleanDefinitionLocalAnswer(answer: string | undefined): string {
+  const cleaned = answer
+    ?.replace(/<doc=[^>]+>/gi, "")
+    .replace(/^\s*(NguÃ¡Â»â€œn|Citation|Source):.*$/gim, "")
+    .replace(/\b(Index source|PageIndex logs?|cache freshness|final score|candidate debug|candidate|cache status|Primary citation|Related citation|Retrieval|PageIndex):[\s\S]*$/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim() ?? "";
+  return cleaned ? sanitizeFinalAnswer(ensureSentence(cleaned), { stripHsCode: false }) : "";
 }
 
 function maybeAppendRelatedHsCode(
@@ -1049,6 +1437,14 @@ function broadLookupAnswer(query: string, candidates: CandidateRelevance[]): str
 
 function clarificationAnswer(): string {
   return "Chưa đủ thông tin để xác định HS Code chắc chắn. Vui lòng cung cấp thêm mô tả sản phẩm, thành phần, công dụng, trạng thái hàng hóa hoặc thông số kỹ thuật.";
+}
+
+function broadLookupUserAnswer(query: string, candidates: CandidateRelevance[]): string {
+  return [
+    `Tìm thấy nhiều mục liên quan đến '${query.trim()}':`,
+    ...candidates.map((candidate) => `- ${candidateTitle(candidate)} — HS Code: ${formatCodes(hsCodesForCandidate(candidate))}`),
+    "Vui lòng nói rõ bạn muốn tra mục nào."
+  ].join("\n");
 }
 
 function deterministicGate(
@@ -1246,9 +1642,12 @@ function candidateRejections(candidates: CandidateRelevance[]): Array<Record<str
       section: candidate.section,
       reason: candidate.rejectedReason,
       matchedTerms: candidate.matchedTerms,
-      matchedPhrases: candidate.candidateMatchedPhrases,
+      matchedOriginalTerms: candidate.matchedOriginalTerms ?? [],
+      matchedExpansionTerms: candidate.matchedExpansionTerms ?? [],
+      matchedPhrases: candidate.matchedPhrases ?? candidate.candidateMatchedPhrases,
       numericMatches: candidate.numericMatches,
-      finalScore: candidate.finalScore
+      finalScore: candidate.finalScore,
+      validation: candidate.validation ?? null
     }));
 }
 
@@ -1269,6 +1668,29 @@ function distinctCandidateSections(candidates: CandidateRelevance[]): CandidateR
     distinct.push(candidate);
   }
   return distinct;
+}
+
+export function groupDistinctBroadLookupCandidates(candidates: CandidateRelevance[]): CandidateRelevance[] {
+  const byKey = new Map<string, CandidateRelevance>();
+  for (const candidate of candidates.filter((item) => !item.rejected && hsCodesForCandidate(item).length > 0)) {
+    const key = distinctCandidateGroupKey(candidate);
+    const existing = byKey.get(key);
+    if (!existing || candidate.finalScore > existing.finalScore) {
+      byKey.set(key, candidate);
+    }
+  }
+  return [...byKey.values()];
+}
+
+export function applyCandidateDocumentScope<T extends { document: string }>(
+  candidates: T[],
+  allowedDocuments: string[] | undefined
+): T[] {
+  const allowed = new Set(allowedDocuments ?? []);
+  if (allowed.size === 0) {
+    return candidates;
+  }
+  return candidates.filter((candidate) => allowed.has(candidate.document));
 }
 
 function lookupCandidatesForAnswer(
@@ -1328,6 +1750,18 @@ function candidateSharesOnlyBroadToken(candidate: CandidateRelevance, token: str
     candidate.matchedNumericRanges.length === 0;
 }
 
+function distinctCandidateGroupKey(candidate: CandidateRelevance): string {
+  const codes = hsCodesForCandidate(candidate).sort().join("|");
+  const title = normalizeForIntent(candidate.title ?? titleFromSection(candidate.section) ?? "");
+  const section = normalizeForIntent(candidate.section ?? "");
+  return [
+    candidate.document,
+    codes,
+    title,
+    section || `${candidate.pageStart ?? ""}-${candidate.pageEnd ?? ""}`
+  ].join("|");
+}
+
 function hsCodesForCandidate(candidate: CandidateRelevance): string[] {
   return uniqueStrings([
     ...candidate.groupedHsCodes,
@@ -1381,6 +1815,12 @@ function isAmbiguousProductQuery(query: string): boolean {
 function isAmbiguousDefinitionQuery(query: string): boolean {
   const normalized = normalizeForIntent(query).replace(/\b(what|define|definition|la|gi|duoc|dinh|nghia|is|are)\b/g, " ");
   return meaningfulIntentTokens(normalized).length < 1;
+}
+
+function isComparisonIntentQuestion(query: string): boolean {
+  const normalized = normalizeForIntent(query);
+  return /\b(vs|versus|compare|comparison|difference|different|distinguish|more|less|higher|lower|longer|shorter)\b/.test(normalized) ||
+    /\b(?:so\s+sanh|khac|phan\s+biet|hon|it\s+hon|nhieu\s+hon)\b/.test(normalized);
 }
 
 function meaningfulIntentTokens(value: string): string[] {
@@ -1447,4 +1887,162 @@ function ensureSentence(value: string): string {
 
 function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
+}
+
+function querySignalsFromCandidates(query: string, candidates: CandidateRelevance[]): QuerySignals {
+  const candidate = candidates[0];
+  if (candidate) {
+    return {
+      domainTerms: candidate.queryTokens,
+      productTerms: candidate.queryTokens,
+      originTerms: [],
+      domainAliasTerms: candidate.candidateAliasSignals ?? [],
+      physicalAttributes: [],
+      numericRanges: candidate.queryPhrases.filter((phrase) => /^\d/.test(phrase)),
+      usageTerms: [],
+      scientificNames: [],
+      tradeForms: [],
+      contrastTerms: candidate.contrastTerms,
+      queryTokens: candidate.queryTokens.length > 0 ? candidate.queryTokens : meaningfulIntentTokens(query),
+      queryPhrases: candidate.queryPhrases,
+      quotedTerms: [],
+      capitalizedTerms: []
+    };
+  }
+  const tokens = meaningfulIntentTokens(query);
+  return {
+    domainTerms: tokens,
+    productTerms: tokens,
+    originTerms: [],
+    domainAliasTerms: [],
+    physicalAttributes: [],
+    numericRanges: [],
+    usageTerms: [],
+    scientificNames: [],
+    tradeForms: [],
+    contrastTerms: [],
+    queryTokens: tokens,
+    queryPhrases: [],
+    quotedTerms: [],
+    capitalizedTerms: []
+  };
+}
+
+function validatedCandidatesFromRelevance(candidates: CandidateRelevance[]): ValidatedCandidate[] {
+  return candidates.map((candidate) => ({
+    document: candidate.document,
+    hsCode: candidate.hsCode,
+    groupedHsCodes: candidate.groupedHsCodes,
+    title: candidate.title,
+    section: candidate.section,
+    pageStart: candidate.pageStart ?? undefined,
+    pageEnd: candidate.pageEnd ?? undefined,
+    source: candidate.source,
+    text: "",
+    captions: [],
+    score: candidate.finalScore,
+    metadataWarnings: [],
+    relevance: candidate,
+    validation: candidate.validation ?? {
+      accepted: !candidate.rejected,
+      confidence: candidate.rejected ? "low" : "medium",
+      reason: candidate.rejectedReason ?? "candidate accepted by relevance",
+      strongSignals: [],
+      weakSignals: [],
+      missingEvidence: []
+    }
+  }));
+}
+
+function groupDistinctValidatedCandidates(candidates: ValidatedCandidate[]): ValidatedCandidate[] {
+  const byKey = new Map<string, ValidatedCandidate>();
+  for (const candidate of candidates) {
+    const key = [
+      candidate.document,
+      hsCodesForSection(candidate).sort().join("|"),
+      normalizeForIntent(candidate.title ?? titleFromSection(candidate.section) ?? ""),
+      normalizeForIntent(candidate.section ?? "") || `${candidate.pageStart ?? ""}-${candidate.pageEnd ?? ""}`
+    ].join("|");
+    const existing = byKey.get(key);
+    if (!existing || (candidate.relevance?.finalScore ?? candidate.score) > (existing.relevance?.finalScore ?? existing.score)) {
+      byKey.set(key, candidate);
+    }
+  }
+  return [...byKey.values()].sort((left, right) => (right.relevance?.finalScore ?? right.score) - (left.relevance?.finalScore ?? left.score));
+}
+
+function multipleSimilarCandidates(candidates: ValidatedCandidate[]): boolean {
+  if (candidates.length < 2) {
+    return false;
+  }
+  const [top, second] = candidates;
+  return ((top.relevance?.finalScore ?? top.score) - (second.relevance?.finalScore ?? second.score)) < 10;
+}
+
+function candidateEvidenceIsBroadOnly(candidate: CandidateRelevance | undefined, queryTokens: string[]): boolean {
+  if (!candidate) {
+    return true;
+  }
+  if (candidate.numericMatches.length > 0 || candidate.matchedNumericRanges.length > 0) {
+    return false;
+  }
+  if (candidate.candidateMatchedPhrases.some((phrase) => meaningfulIntentTokens(phrase).length >= 2)) {
+    return false;
+  }
+  const evidence = uniqueStrings([...candidate.matchedTerms, ...candidate.candidateMatchedTokens]
+    .flatMap(meaningfulIntentTokens));
+  return evidence.length <= 1 && evidence.every((token) => queryTokens.includes(token));
+}
+
+export function sanitizeFinalAnswer(answer: string, options: { stripHsCode?: boolean; maxWords?: number } = {}): string {
+  const stripHsCode = options.stripHsCode ?? false;
+  const lines = answer
+    .replace(/<doc=[^>]+>/gi, " ")
+    .replace(/```(?:json)?[\s\S]*?```/gi, " ")
+    .split(/\r?\n/g)
+    .filter((line) => !/^\s*(?:Index source|PageIndex(?: tree result)?|cache freshness|cache status|final score|candidate debug|raw JSON|backend logs?|Primary citation|Related citation|Citation card|Retrieval|Marker\s+\d+)\b/i.test(line))
+    .join("\n");
+  let cleaned = lines
+    .replace(/\b(Index source|PageIndex(?: tree result)?|cache freshness|cache status|final score|candidate debug|raw JSON|backend logs?|Primary citation|Related citation|Citation card labels?|Retrieval):[\s\S]*$/gi, " ")
+    .replace(/\{[\s\S]*"[^"]+"\s*:[\s\S]*\}/g, " ")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (stripHsCode) {
+    cleaned = cleaned.replace(/(?:^|\s)HS Code:\s*\d{4}\.\d{2}\.\d{2}\.?/gi, " ");
+  }
+  cleaned = removeDuplicateHsCodeSentences(cleaned)
+    .replace(/[ \t]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .trim();
+  if (options.maxWords && cleaned.split(/\s+/).filter(Boolean).length > options.maxWords) {
+    cleaned = cleaned.split(/\s+/).slice(0, options.maxWords).join(" ").replace(/[,\s]+$/g, "");
+    cleaned = ensureSentence(cleaned);
+  }
+  return cleaned;
+}
+
+function removeDuplicateHsCodeSentences(answer: string): string {
+  let collapsed = answer;
+  const duplicateCodePattern = /\bHS Code:\s*(\d{4}\.\d{2}\.\d{2})\.\s+HS Code:\s*\1\./gi;
+  while (duplicateCodePattern.test(collapsed)) {
+    collapsed = collapsed.replace(duplicateCodePattern, "HS Code: $1.");
+    duplicateCodePattern.lastIndex = 0;
+  }
+  answer = collapsed;
+  const sentences = answer.match(/[^.!?\n]+[.!?]?|\n+/g) ?? [answer];
+  const seenHsCodeSentences = new Set<string>();
+  const kept: string[] = [];
+  for (const sentence of sentences) {
+    const codes = sentence.match(new RegExp(HS_CODE_PATTERN.source, "g")) ?? [];
+    if (codes.length > 0 && /\bHS Code:/i.test(sentence)) {
+      const key = uniqueStrings(codes).join("|");
+      if (seenHsCodeSentences.has(key)) {
+        continue;
+      }
+      seenHsCodeSentences.add(key);
+    }
+    kept.push(sentence);
+  }
+  return kept.join("").trim();
 }

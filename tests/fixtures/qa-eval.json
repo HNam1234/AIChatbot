@@ -1,7 +1,7 @@
 [
   {
     "id": "exact-code-001",
-    "question": "Tra cá»©u HS Code 0102.29.11",
+    "question": "Tra cuu HS Code 0102.29.11",
     "expectedIntent": "exact_hscode_lookup",
     "mustContainAll": [
       "0102.29.11"
@@ -48,11 +48,10 @@
     "expectedIntent": "selected_section_qa",
     "mustContainAll": [],
     "mustContainAny": [
-      "Tôi đã tìm thấy section liên quan",
-      "bật API key"
+      "General requirements on appearance",
+      "Well-proportioned body"
     ],
     "mustNotContain": [
-      "SÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â£n phÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â ",
       "Retrieval:",
       "PageIndex:",
       "Primary citation",
@@ -72,7 +71,6 @@
       "mô tả"
     ],
     "mustNotContain": [
-      "SÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â£n phÃƒÆ’Ã‚Â¡Ãƒâ€šÃ‚ÂºÃƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â ",
       "HS Code:",
       "Retrieval:",
       "PageIndex:"
@@ -85,16 +83,19 @@
     "id": "coffee-attribute-001",
     "question": "Which coffee is more bitter than Arabica and has higher caffeine?",
     "expectedIntent": "selected_section_qa",
-    "mustContainAll": [],
+    "mustContainAll": [
+      "caffeine"
+    ],
     "mustContainAny": [
-      "Tôi đã tìm thấy section liên quan",
-      "bật API key"
+      "bitter",
+      "1.7 - 4%"
     ],
     "mustNotContain": [
-      "NguÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â»ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“n:",
       "Related citation",
       "Retrieval:",
-      "HS Code:"
+      "HS Code:",
+      "API key",
+      "section"
     ],
     "expectedHsCodes": [],
     "expectedDocument": "Chapter09.pdf",
@@ -112,7 +113,6 @@
       "bovine"
     ],
     "mustNotContain": [
-      "NguÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â»ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“n:",
       "Primary citation"
     ],
     "expectedHsCodes": [
@@ -133,7 +133,6 @@
       "WHEAT"
     ],
     "mustNotContain": [
-      "SÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£n phÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ",
       "Primary citation"
     ],
     "expectedHsCodes": [],
@@ -153,7 +152,6 @@
       "Introduction"
     ],
     "mustNotContain": [
-      "SÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£n phÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ",
       "Primary citation"
     ],
     "expectedHsCodes": [],
@@ -162,7 +160,7 @@
   },
   {
     "id": "grouped-code-001",
-    "question": "Mechanically deboned or separated meat lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â  gÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬?",
+    "question": "Mechanically deboned or separated meat la gi?",
     "expectedIntent": "definition",
     "mustContainAll": [
       "0207.14.91",
@@ -173,7 +171,6 @@
       "meat"
     ],
     "mustNotContain": [
-      "NguÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â»ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“n:",
       "Related citation"
     ],
     "expectedHsCodes": [
@@ -192,7 +189,6 @@
     ],
     "mustContainAny": [],
     "mustNotContain": [
-      "SÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£n phÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ",
       "HS Code:"
     ],
     "expectedHsCodes": [],
@@ -211,7 +207,6 @@
       "WHEAT"
     ],
     "mustNotContain": [
-      "SÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â£n phÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚ÂºÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©m lÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â  Oxen",
       "Primary citation"
     ],
     "expectedHsCodes": [],

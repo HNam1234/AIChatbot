@@ -8,6 +8,10 @@ export interface AppConfig {
   pageIndexApiKey?: string;
   geminiApiKey?: string;
   geminiApiKeys: string[];
+  bifrostApiKey?: string;
+  bifrostBaseUrl?: string;
+  bifrostModel: string;
+  llmProvider: LlmProviderName;
   pageIndexBaseUrl: string;
   pageIndexPollIntervalMs: number;
   pageIndexPollMaxAttempts: number;
@@ -18,13 +22,33 @@ export interface AppConfig {
   tmpRetentionHours: number;
   tmpCleanupOnStart: boolean;
   allowLocalSecretWrite: boolean;
+  enableLlmQa: boolean;
+  enableLlmQueryExpansion: boolean;
+  queryExpansionProvider: QueryExpansionProviderName;
+  queryExpansionMaxTerms: number;
+  queryExpansionTimeoutMs: number;
+  queryExpansionCacheEnabled: boolean;
 }
 
+export type LlmProviderName = "gemini" | "bifrost";
+export type QueryExpansionProviderName = "none" | "gemini" | "openai" | "translation";
 export type GeminiKeySlotName = "GEMINI_KEY_1" | "GEMINI_KEY_2" | "GEMINI_KEY_3";
 export type GeminiKeySlotEnabledName =
   | "GEMINI_KEY_1_ENABLED"
   | "GEMINI_KEY_2_ENABLED"
   | "GEMINI_KEY_3_ENABLED";
+type WritableEnvKeyName =
+  | "PAGEINDEX_API_KEY"
+  | "GEMINI_API_KEY"
+  | "BIFROST_API_KEY"
+  | "BIFROST_BASE_URL"
+  | "BIFROST_MODEL"
+  | "LLM_PROVIDER"
+  | "ENABLE_LLM_QA"
+  | "ENABLE_LLM_QUERY_EXPANSION"
+  | "QUERY_EXPANSION_PROVIDER"
+  | GeminiKeySlotName
+  | GeminiKeySlotEnabledName;
 
 export interface GeminiKeySlotStatus {
   name: GeminiKeySlotName;
@@ -41,6 +65,7 @@ const DEFAULT_PORT = 3000;
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_MAX_CONCURRENT_JOBS = 1;
 const DEFAULT_TMP_RETENTION_HOURS = 24;
+const DEFAULT_BIFROST_MODEL = "gpt-5.5";
 const GEMINI_KEY_SLOTS: Array<{ name: GeminiKeySlotName; enabledName: GeminiKeySlotEnabledName }> = [
   { name: "GEMINI_KEY_1", enabledName: "GEMINI_KEY_1_ENABLED" },
   { name: "GEMINI_KEY_2", enabledName: "GEMINI_KEY_2_ENABLED" },
@@ -52,6 +77,10 @@ export function loadEnvConfig(): AppConfig {
     pageIndexApiKey: nonEmpty(process.env.PAGEINDEX_API_KEY),
     geminiApiKey: nonEmpty(process.env.GEMINI_API_KEY),
     geminiApiKeys: resolveGeminiEnvKeys(),
+    bifrostApiKey: nonEmpty(process.env.BIFROST_API_KEY),
+    bifrostBaseUrl: nonEmpty(process.env.BIFROST_BASE_URL),
+    bifrostModel: nonEmpty(process.env.BIFROST_MODEL) ?? DEFAULT_BIFROST_MODEL,
+    llmProvider: readLlmProvider(process.env.LLM_PROVIDER),
     pageIndexBaseUrl: nonEmpty(process.env.PAGEINDEX_API_BASE_URL) ?? DEFAULT_PAGEINDEX_BASE_URL,
     pageIndexPollIntervalMs: readPositiveInteger(
       process.env.PAGEINDEX_POLL_INTERVAL_MS,
@@ -67,7 +96,13 @@ export function loadEnvConfig(): AppConfig {
     maxConcurrentJobs: readPositiveInteger(process.env.MAX_CONCURRENT_JOBS, DEFAULT_MAX_CONCURRENT_JOBS),
     tmpRetentionHours: readPositiveInteger(process.env.TMP_RETENTION_HOURS, DEFAULT_TMP_RETENTION_HOURS),
     tmpCleanupOnStart: readBoolean(process.env.TMP_CLEANUP_ON_START, true),
-    allowLocalSecretWrite: readBoolean(process.env.ALLOW_LOCAL_SECRET_WRITE, false)
+    allowLocalSecretWrite: readBoolean(process.env.ALLOW_LOCAL_SECRET_WRITE, false),
+    enableLlmQa: readBoolean(process.env.ENABLE_LLM_QA, false),
+    enableLlmQueryExpansion: readBoolean(process.env.ENABLE_LLM_QUERY_EXPANSION, false),
+    queryExpansionProvider: readQueryExpansionProvider(process.env.QUERY_EXPANSION_PROVIDER),
+    queryExpansionMaxTerms: readPositiveInteger(process.env.QUERY_EXPANSION_MAX_TERMS, 12),
+    queryExpansionTimeoutMs: readPositiveInteger(process.env.QUERY_EXPANSION_TIMEOUT_MS, 3000),
+    queryExpansionCacheEnabled: readBoolean(process.env.QUERY_EXPANSION_CACHE_ENABLED, true)
   };
 }
 
@@ -106,6 +141,14 @@ export function getApiSettingsStatus(): {
   geminiKeySlots: GeminiKeySlotStatus[];
   configuredGeminiKeyCount: number;
   enabledGeminiKeyCount: number;
+  llmProvider: LlmProviderName;
+  hasBifrostApiKey: boolean;
+  maskedBifrostApiKey: string | null;
+  bifrostBaseUrl: string | null;
+  bifrostModel: string;
+  enableLlmQa: boolean;
+  enableLlmQueryExpansion: boolean;
+  queryExpansionProvider: QueryExpansionProviderName;
   pageIndexBaseUrl: string;
   pollIntervalMs: number;
   pollMaxAttempts: number;
@@ -134,6 +177,14 @@ export function getApiSettingsStatus(): {
     geminiKeySlots,
     configuredGeminiKeyCount: geminiKeySlots.filter((slot) => slot.configured).length,
     enabledGeminiKeyCount: geminiKeySlots.filter((slot) => slot.configured && slot.enabled).length,
+    llmProvider: config.llmProvider,
+    hasBifrostApiKey: Boolean(config.bifrostApiKey),
+    maskedBifrostApiKey: maskSecret(config.bifrostApiKey),
+    bifrostBaseUrl: config.bifrostBaseUrl ?? null,
+    bifrostModel: config.bifrostModel,
+    enableLlmQa: config.enableLlmQa,
+    enableLlmQueryExpansion: config.enableLlmQueryExpansion,
+    queryExpansionProvider: config.queryExpansionProvider,
     pageIndexBaseUrl: config.pageIndexBaseUrl,
     pollIntervalMs: config.pageIndexPollIntervalMs,
     pollMaxAttempts: config.pageIndexPollMaxAttempts,
@@ -176,14 +227,93 @@ export async function saveGeminiKeySlotEnabledToEnv(
   return { slotName, enabled };
 }
 
+export async function saveBifrostSettingsToEnv(settings: {
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  llmProvider?: LlmProviderName;
+  enableLlmQa?: boolean;
+  enableLlmQueryExpansion?: boolean;
+  queryExpansionProvider?: QueryExpansionProviderName;
+}): Promise<{
+  maskedKey: string | null;
+  baseUrl: string | null;
+  model: string;
+  llmProvider: LlmProviderName;
+  enableLlmQa: boolean;
+  enableLlmQueryExpansion: boolean;
+  queryExpansionProvider: QueryExpansionProviderName;
+}> {
+  const apiKey = nonEmpty(settings.apiKey);
+  const baseUrl = nonEmpty(settings.baseUrl);
+  const model = nonEmpty(settings.model);
+  const llmProvider = settings.llmProvider;
+  const queryExpansionProvider = settings.queryExpansionProvider;
+
+  if (
+    !apiKey &&
+    !baseUrl &&
+    !model &&
+    !llmProvider &&
+    settings.enableLlmQa === undefined &&
+    settings.enableLlmQueryExpansion === undefined &&
+    !queryExpansionProvider
+  ) {
+    throw new Error("No Bifrost settings were provided.");
+  }
+
+  if (llmProvider && llmProvider !== "gemini" && llmProvider !== "bifrost") {
+    throw new Error("Invalid LLM provider.");
+  }
+  if (
+    queryExpansionProvider &&
+    queryExpansionProvider !== "none" &&
+    queryExpansionProvider !== "gemini" &&
+    queryExpansionProvider !== "openai" &&
+    queryExpansionProvider !== "translation"
+  ) {
+    throw new Error("Invalid query expansion provider.");
+  }
+
+  if (apiKey) {
+    await saveEnvValueToEnv("BIFROST_API_KEY", apiKey);
+  }
+  if (baseUrl) {
+    await saveEnvValueToEnv("BIFROST_BASE_URL", baseUrl);
+  }
+  if (model) {
+    await saveEnvValueToEnv("BIFROST_MODEL", model);
+  }
+  if (llmProvider) {
+    await saveEnvValueToEnv("LLM_PROVIDER", llmProvider);
+  }
+  if (settings.enableLlmQa !== undefined) {
+    await saveEnvValueToEnv("ENABLE_LLM_QA", settings.enableLlmQa ? "true" : "false");
+  }
+  if (settings.enableLlmQueryExpansion !== undefined) {
+    await saveEnvValueToEnv("ENABLE_LLM_QUERY_EXPANSION", settings.enableLlmQueryExpansion ? "true" : "false");
+  }
+  if (queryExpansionProvider) {
+    await saveEnvValueToEnv("QUERY_EXPANSION_PROVIDER", queryExpansionProvider);
+  }
+
+  const config = loadEnvConfig();
+  return {
+    maskedKey: maskSecret(config.bifrostApiKey),
+    baseUrl: config.bifrostBaseUrl ?? null,
+    model: config.bifrostModel,
+    llmProvider: config.llmProvider,
+    enableLlmQa: config.enableLlmQa,
+    enableLlmQueryExpansion: config.enableLlmQueryExpansion,
+    queryExpansionProvider: config.queryExpansionProvider
+  };
+}
+
 export function isGeminiKeySlotName(value: unknown): value is GeminiKeySlotName {
   return typeof value === "string" && GEMINI_KEY_SLOTS.some((slot) => slot.name === value);
 }
 
-async function saveApiKeyToEnv(
-  keyName: "PAGEINDEX_API_KEY" | "GEMINI_API_KEY" | GeminiKeySlotName | GeminiKeySlotEnabledName,
-  apiKey: string
-): Promise<{ maskedKey: string }> {
+async function saveApiKeyToEnv(keyName: WritableEnvKeyName, apiKey: string): Promise<{ maskedKey: string }> {
   const trimmed = nonEmpty(apiKey);
   if (!trimmed) {
     throw new Error(`${keyName} cannot be empty.`);
@@ -196,10 +326,7 @@ async function saveApiKeyToEnv(
   };
 }
 
-async function saveEnvValueToEnv(
-  keyName: "PAGEINDEX_API_KEY" | "GEMINI_API_KEY" | GeminiKeySlotName | GeminiKeySlotEnabledName,
-  value: string
-): Promise<void> {
+async function saveEnvValueToEnv(keyName: WritableEnvKeyName, value: string): Promise<void> {
   const envPath = path.resolve(process.cwd(), ".env");
   const current = await readFile(envPath, "utf8").catch(() => "");
   const next = upsertEnvValue(current, keyName, value);
@@ -274,6 +401,22 @@ function readBoolean(value: string | undefined, fallback: boolean): boolean {
   if (["true", "1", "on", "yes"].includes(normalized)) return true;
   if (["false", "0", "off", "no"].includes(normalized)) return false;
   return fallback;
+}
+
+function readQueryExpansionProvider(value: string | undefined): QueryExpansionProviderName {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "gemini" || normalized === "openai" || normalized === "translation") {
+    return normalized;
+  }
+  return "none";
+}
+
+function readLlmProvider(value: string | undefined): LlmProviderName {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "bifrost") {
+    return "bifrost";
+  }
+  return "gemini";
 }
 
 function upsertEnvValue(envText: string, key: string, value: string): string {

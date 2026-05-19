@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { answerFromCachedTrees, answerQuestionForEval } from "../src/server/routes";
+import type { QueryExpansionProvider } from "../src/agent/queryExpansion";
 
 describe("Q&A scope isolation", () => {
   it("does not return Chapter10 results when local scope is Chapter01", async () => {
@@ -73,11 +74,12 @@ describe("Q&A scope isolation", () => {
     expect(JSON.stringify(response)).not.toContain("Chapter10.pdf");
   });
 
-  it("uses selected-section LLM generation for non-HS appearance questions", async () => {
+  it("uses local extractive generation before selected-section LLM for non-HS appearance questions", async () => {
     let capturedTextLength = 0;
     const response = await answerFromCachedTrees("Breeding fish appearance requirements?", {
       localSectionDocuments: ["Chapter03.pdf"],
       geminiApiKeys: [],
+      enableLlmQa: true,
       debug: true,
       selectedSectionAnswerer: {
         async synthesizeSectionAnswer(section) {
@@ -88,28 +90,146 @@ describe("Q&A scope isolation", () => {
     });
 
     expect(response.intent).toBe("selected_section_qa");
-    expect(response.answerGeneration).toBe("llm-selected-section");
-    expect((response.debug as { answerGeneration?: string; llmCalled?: boolean; sectionTextChars?: number }).answerGeneration).toBe("llm-selected-section");
-    expect((response.debug as { llmCalled?: boolean }).llmCalled).toBe(true);
+    expect(response.answerGeneration).toBe("extractive-field");
+    expect((response.debug as { answerGeneration?: string; llmCalled?: boolean; sectionTextChars?: number }).answerGeneration).toBe("extractive-field");
+    expect((response.debug as { llmCalled?: boolean }).llmCalled).toBe(false);
+    expect((response.debug as { localExtractorUsed?: boolean }).localExtractorUsed).toBe(true);
+    expect((response.debug as { llmSkippedReason?: string | null }).llmSkippedReason).toBe("local_extractor_succeeded");
     expect((response.debug as { sectionTextChars?: number }).sectionTextChars ?? 0).toBeGreaterThan(0);
-    expect(capturedTextLength).toBeGreaterThan(0);
-    expect(String(response.answer)).toContain("Yêu cầu ngoại quan");
+    expect(capturedTextLength).toBe(0);
+    expect(String(response.answer)).toContain("General requirements on appearance");
+    expect(String(response.answer)).toContain("Well-proportioned body");
     expect(String(response.answer)).not.toContain("Sản phẩm là");
     expect(String(response.answer)).not.toContain("HS Code");
   });
 
-  it("uses safe fallback for non-HS selected-section questions when LLM is unavailable", async () => {
-    const response = await answerQuestionForEval("Breeding fish appearance requirements?", {
+  it("does not call selected-section LLM generation by default", async () => {
+    let callCount = 0;
+    const response = await answerFromCachedTrees("Breeding fish appearance requirements?", {
+      localSectionDocuments: ["Chapter03.pdf"],
+      geminiApiKeys: [],
+      debug: true,
+      selectedSectionAnswerer: {
+        async synthesizeSectionAnswer() {
+          callCount += 1;
+          return "This should not be used.";
+        }
+      }
+    });
+
+    expect(response.intent).toBe("selected_section_qa");
+    expect(response.answerGeneration).toBe("extractive-field");
+    expect(response.llmCalled).toBe(false);
+    expect((response.debug as { llmCalled?: boolean; llmSkippedReason?: string | null }).llmCalled).toBe(false);
+    expect((response.debug as { llmSkippedReason?: string | null }).llmSkippedReason).toBe("local_extractor_succeeded");
+    expect((response.debug as { localExtractorUsed?: boolean }).localExtractorUsed).toBe(true);
+    expect(callCount).toBe(0);
+    expect(String(response.answer)).not.toContain("This should not be used");
+    expect(String(response.answer)).not.toMatch(/Answer generation|llmCalled|llmSkippedReason|fallbackReason/i);
+  });
+
+  it("uses expanded query for retrieval while keeping the original query for answer generation", async () => {
+    const originalQuery = "ca giong thong tin?";
+    let expansionCallCount = 0;
+    let capturedAnswerQuery = "";
+    const queryExpansionProvider = mockQueryExpansionProvider(async (query, prompt) => {
+      expansionCallCount += 1;
+      expect(query).toBe(originalQuery);
+      expect(prompt).toContain("Do not answer the question.");
+      return {
+        englishQuery: "breeding fish requirements",
+        keywords: ["breeding fish", "requirements"],
+        phrases: ["breeding fish"],
+        confidence: "high"
+      };
+    });
+
+    const response = await answerFromCachedTrees(originalQuery, {
+      localSectionDocuments: ["Chapter03.pdf"],
+      enableLlmQa: true,
+      debug: true,
+      queryExpansionProvider,
+      queryExpansionConfig: {
+        enabled: true,
+        provider: "gemini",
+        maxTerms: 12,
+        timeoutMs: 3000,
+        cacheEnabled: false
+      },
+      selectedSectionAnswerer: {
+        async synthesizeSectionAnswer(_section, query) {
+          capturedAnswerQuery = query;
+          return "Thong tin ve section breeding fish.";
+        }
+      }
+    });
+
+    const debug = response.debug as {
+      queryExpansion?: { expandedQuery?: string; expansionTerms?: string[]; expansionSource?: string };
+      candidates?: Array<{ matchedOriginalTerms?: string[]; matchedExpansionTerms?: string[] }>;
+    };
+
+    expect(expansionCallCount).toBe(1);
+    expect(capturedAnswerQuery).toBe(originalQuery);
+    expect(response.selectedPrimary).toMatchObject({ document: "Chapter03.pdf" });
+    expect(debug.queryExpansion?.expandedQuery).toContain(originalQuery);
+    expect(debug.queryExpansion?.expandedQuery).toContain("breeding fish");
+    expect(debug.queryExpansion?.expansionSource).toBe("llm");
+    expect((debug.candidates ?? []).some((candidate) => (candidate.matchedExpansionTerms ?? []).length > 0)).toBe(true);
+  });
+
+  it("uses safe fallback for non-HS selected-section questions when local extraction fails and LLM is unavailable", async () => {
+    const response = await answerQuestionForEval("Breeding fish warranty handling details?", {
       localSectionDocuments: ["Chapter03.pdf"],
       debug: true
     });
 
     expect(response.intent).toBe("selected_section_qa");
     expect(response.answerGeneration).toBe("safe-fallback");
-    expect((response.debug as { answerGeneration?: string; llmCalled?: boolean; fallbackReason?: string | null }).answerGeneration).toBe("safe-fallback");
+    expect((response.debug as { answerGeneration?: string; llmCalled?: boolean; fallbackReason?: string | null; llmSkippedReason?: string | null }).answerGeneration).toBe("safe-fallback");
     expect((response.debug as { llmCalled?: boolean }).llmCalled).toBe(false);
-    expect((response.debug as { fallbackReason?: string | null }).fallbackReason).toBe("llm_unavailable");
+    expect((response.debug as { llmSkippedReason?: string | null }).llmSkippedReason).toBe("ENABLE_LLM_QA=false");
+    expect((response.debug as { fallbackReason?: string | null }).fallbackReason).toBe("local_extractor_no_requested_field");
     expect(String(response.answer)).toBe("Tôi đã tìm thấy section liên quan, nhưng chưa thể trích xuất câu trả lời từ nội dung section. Vui lòng thử lại hoặc bật API key.");
+    expect(String(response.answer)).not.toContain("Sản phẩm là");
+    expect(String(response.answer)).not.toContain("HS Code");
+  });
+
+  it("does not treat safe fallback as local extractor success", async () => {
+    const response = await answerQuestionForEval("Breeding fish warranty handling details?", {
+      localSectionDocuments: ["Chapter03.pdf"],
+      debug: true
+    });
+
+    expect(response.answerGeneration).toBe("safe-fallback");
+    expect((response.debug as { localExtractorUsed?: boolean }).localExtractorUsed).toBe(false);
+    expect((response.debug as { llmSkippedReason?: string | null }).llmSkippedReason).toBe("ENABLE_LLM_QA=false");
+    expect((response.debug as { fallbackReason?: string | null }).fallbackReason).toBe("local_extractor_no_requested_field");
+    expect(String(response.answer)).not.toMatch(/Answer generation|llmCalled|fallbackReason|Index source|PageIndex/i);
+  });
+
+  it("falls back and records LLM quota failures without retrying the injected answerer", async () => {
+    let callCount = 0;
+    const response = await answerFromCachedTrees("Breeding fish warranty handling details?", {
+      localSectionDocuments: ["Chapter03.pdf"],
+      geminiApiKeys: [],
+      enableLlmQa: true,
+      debug: true,
+      selectedSectionAnswerer: {
+        async synthesizeSectionAnswer() {
+          callCount += 1;
+          throw new Error("quota exceeded");
+        }
+      }
+    });
+
+    expect(response.intent).toBe("selected_section_qa");
+    expect(response.answerGeneration).toBe("safe-fallback");
+    expect(response.llmCalled).toBe(true);
+    expect(response.llmErrorType).toBe("quota");
+    expect((response.debug as { llmErrorType?: string | null; fallbackReason?: string | null }).llmErrorType).toBe("quota");
+    expect((response.debug as { fallbackReason?: string | null }).fallbackReason).toBe("llm_quota");
+    expect(callCount).toBe(1);
     expect(String(response.answer)).not.toContain("Sản phẩm là");
     expect(String(response.answer)).not.toContain("HS Code");
   });
@@ -122,18 +242,89 @@ describe("Q&A scope isolation", () => {
 
     expect(response.intent).toBe("product_classification");
     expect(response.answerGeneration).toBe("template-classification");
+    expect((response.debug as { answerGeneration?: string }).answerGeneration).toBe("template-classification");
     expect(String(response.answer)).toContain("Sản phẩm là Agarwood (Gaharu) chips, HS Code: 1211.90.95.");
     expect(String(response.answer)).not.toMatch(/Index source|PageIndex|cache freshness|candidate debug/i);
   });
 
-  it("treats a single broad Hevea token as ambiguous lookup", async () => {
+  it("classifies Cambodia premium fragrant rice as Malys rice without LLM QA", async () => {
+    const query = "Một loại gạo thơm của Cambodia, có hạt dài, mùi thơm tự nhiên và thường được gọi là premium fragrant rice. HS Code đúng là gì?";
+    const response = await answerFromCachedTrees(query, {
+      cachedTreeDocuments: ["Chapter10.pdf"],
+      geminiApiKeys: [],
+      enableLlmQa: false,
+      debug: true,
+      queryExpansionConfig: { enabled: false }
+    });
+
+    expect(response.intent).toBe("product_classification");
+    expect(response.selectedPrimary).toMatchObject({
+      document: "Chapter10.pdf",
+      hsCode: "1006.30.60",
+      title: "MALYS RICE"
+    });
+    expect(String(response.answer)).toContain("HS Code: 1006.30.60");
+    expect((response.debug as { domainAliasTerms?: string[] }).domainAliasTerms).toContain("malys rice");
+    expect((response.debug as { candidateAliasSignals?: string[] }).candidateAliasSignals).toContain("malys rice");
+    expect((response.debug as { llmRerankCalled?: boolean }).llmRerankCalled).toBe(false);
+  });
+
+  it("accepts an injected LLM rerank only when it selects a listed candidate with confidence", async () => {
+    const response = await answerFromCachedTrees("premium fragrant rice HS Code?", {
+      cachedTreeDocuments: ["Chapter10.pdf"],
+      geminiApiKeys: [],
+      enableLlmQa: true,
+      debug: true,
+      queryExpansionConfig: { enabled: false },
+      candidateReranker: {
+        async planQuery() {
+          return JSON.stringify({
+            selectedHsCode: "1006.30.60",
+            confidence: "high",
+            reason: "mock selected listed candidate"
+          });
+        }
+      }
+    });
+
+    expect(response.selectedPrimary).toMatchObject({ hsCode: "1006.30.60", title: "MALYS RICE" });
+    expect((response.debug as { llmRerankCalled?: boolean; llmRerankAccepted?: boolean; llmRerankSelectedHsCode?: string }).llmRerankCalled).toBe(true);
+    expect((response.debug as { llmRerankAccepted?: boolean }).llmRerankAccepted).toBe(true);
+    expect((response.debug as { llmRerankSelectedHsCode?: string }).llmRerankSelectedHsCode).toBe("1006.30.60");
+  });
+
+  it("ignores an injected LLM rerank that selects an HS code outside the candidate list", async () => {
+    const response = await answerFromCachedTrees("premium fragrant rice HS Code?", {
+      cachedTreeDocuments: ["Chapter10.pdf"],
+      geminiApiKeys: [],
+      enableLlmQa: true,
+      debug: true,
+      queryExpansionConfig: { enabled: false },
+      candidateReranker: {
+        async planQuery() {
+          return JSON.stringify({
+            selectedHsCode: "9999.99.99",
+            confidence: "high",
+            reason: "mock unsupported code"
+          });
+        }
+      }
+    });
+
+    expect(response.selectedPrimary).toMatchObject({ hsCode: "1006.30.70", title: "OTHER FRAGRANT RICE" });
+    expect((response.debug as { llmRerankCalled?: boolean; llmRerankAccepted?: boolean; llmRerankSelectedHsCode?: string }).llmRerankCalled).toBe(true);
+    expect((response.debug as { llmRerankAccepted?: boolean }).llmRerankAccepted).toBe(false);
+    expect((response.debug as { llmRerankSelectedHsCode?: string }).llmRerankSelectedHsCode).toBe("9999.99.99");
+  });
+
+  it("treats a single broad Hevea token as broad lookup", async () => {
     const response = await answerQuestionForEval("hevea", {
       localSectionDocuments: ["Chapter06.pdf"],
       debug: true
     });
 
-    expect(response.answerMode).toBe("ambiguous_lookup");
-    expect(response.answerGeneration).toBe("ambiguous-lookup");
+    expect(response.answerMode).toBe("broad_lookup");
+    expect(response.answerGeneration).toBe("broad-lookup");
     expect(response.selectedPrimary).toBeNull();
     expect(String(response.answer)).toContain("Tìm thấy nhiều mục liên quan đến 'hevea':");
     expect(String(response.answer)).toContain("Budded stumps of the genus Hevea");
@@ -142,7 +333,7 @@ describe("Q&A scope isolation", () => {
     expect(String(response.answer)).toContain("HS Code: 0602.90.40");
     expect(String(response.answer)).toContain("HS Code: 0602.90.50");
     expect(String(response.answer)).toContain("HS Code: 0602.90.60");
-    expect((response.debug as { ambiguityReason?: string; candidateCount?: number }).ambiguityReason).toBe("single broad token matched multiple sections");
+    expect((response.debug as { broadQueryDecision?: { reason?: string }; candidateCount?: number }).broadQueryDecision?.reason).toContain("single broad token");
     expect((response.debug as { candidateCount?: number }).candidateCount).toBeGreaterThanOrEqual(3);
   });
 
@@ -159,3 +350,12 @@ describe("Q&A scope isolation", () => {
     });
   });
 });
+
+function mockQueryExpansionProvider(expand: QueryExpansionProvider["expand"]): QueryExpansionProvider {
+  return {
+    name: "gemini",
+    source: "llm",
+    model: "mock-expander",
+    expand
+  };
+}

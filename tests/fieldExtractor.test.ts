@@ -32,6 +32,22 @@ describe("fieldExtractor", () => {
     expect(result.extractedText).not.toContain("required weight");
   });
 
+  it("extracts the following bullet under matched Activeness heading", () => {
+    const result = extractRequestedField([
+      "Activeness",
+      "- The fish must swim actively and respond to touch.",
+      "",
+      "Weight and size",
+      "- Uniform lot size."
+    ].join("\n"), "activeness");
+
+    expect(result.confidence).toBe("high");
+    expect(result.fallbackUsed).toBe(false);
+    expect(result.matchedHeading).toBe("Activeness");
+    expect(result.extractedText).toContain("swim actively");
+    expect(result.extractedText).not.toContain("Uniform lot size");
+  });
+
   it("extracts weight and size by heading", () => {
     const result = extractRequestedField(sectionText, "trọng lượng và kích thước");
 

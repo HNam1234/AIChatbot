@@ -17,6 +17,7 @@ import {
   loadEnvConfig,
   maskSecret,
   resolvePageIndexSettings,
+  saveBifrostSettingsToEnv,
   saveGeminiApiKeyToEnv,
   saveGeminiKeySlotEnabledToEnv,
   saveGeminiKeySlotToEnv,
@@ -35,7 +36,7 @@ import {
 import { JobStore } from "./jobStore";
 import { runPipelineProcess } from "./pipelineProcessRunner";
 import { QAValidator } from "../validators/qaValidator";
-import { GeminiRoundRobinClient, type SelectedSectionAnswerContext } from "../agent/geminiClient";
+import { createLlmClient, getLlmAvailability, type LlmClient } from "../agent/llmFactory";
 import {
   buildStructuredRetrievedContext,
   detectContrastTerms,
@@ -54,7 +55,9 @@ import {
   type EnrichedRetrievedSection,
   type QuerySignals,
   type RetrievedTreeHit,
-  type SectionMetadata
+  type ScoreBreakdown,
+  type SectionMetadata,
+  type ValidatedCandidate
 } from "../agent/qaAnswerFormatter";
 import {
   handleClarificationNeeded,
@@ -67,11 +70,23 @@ import {
   asksForHsCodeOrClassification,
   detectIntent,
   detectAmbiguousLookup,
+  detectBroadQuery,
+  extractLocalSelectedSectionAnswer,
+  sanitizeFinalAnswer,
   type RoutedQaAnswer,
+  type QaAnswerGenerationMode,
+  type LocalSelectedSectionAnswer,
   type QaDocumentMetadata
 } from "../agent/qaIntentRouter";
-import { resolveGeminiApiKeys } from "../config/gemini";
 import { TokenValidator } from "../validators/tokenValidator";
+import {
+  expandQueryForRetrievalWithDebug,
+  type QueryExpansionDebug,
+  type QueryExpansionResult,
+  type QueryExpansionProvider,
+  type QueryExpansionRuntimeConfig
+} from "../agent/queryExpansion";
+import { generateLocalAnswer, type LocalAnswerResult } from "../agent/localAnswerGenerator";
 
 const uploadsDir = path.resolve(process.cwd(), "data", "uploads");
 const convertedDir = path.resolve(process.cwd(), "data", "converted");
@@ -102,6 +117,14 @@ const SEARCH_STOPWORDS = new Set([
   "co",
   "ca",
   "phe",
+  "more",
+  "less",
+  "than",
+  "has",
+  "have",
+  "having",
+  "compared",
+  "compare",
   "cua",
   "cho",
   "thuoc",
@@ -289,6 +312,49 @@ export function createApiRouter(): express.Router {
 
       const result = await saveGeminiKeySlotEnabledToEnv(slot, booleanValue(req.body.enabled));
       res.json({ ok: true, slotName: result.slotName, enabled: result.enabled });
+    } catch (error) {
+      res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  router.post("/settings/bifrost", async (req, res) => {
+    try {
+      if (!canWriteSecretsFromUi()) {
+        res.status(403).json({ error: "Secret write is disabled. Set env variables outside the UI." });
+        return;
+      }
+
+      const rawProvider = stringValue(req.body.llmProvider);
+      const llmProvider = rawProvider === "gemini" || rawProvider === "bifrost" ? rawProvider : undefined;
+      if (rawProvider && !llmProvider) {
+        res.status(400).json({ error: "Invalid LLM provider." });
+        return;
+      }
+      const rawQueryExpansionProvider = stringValue(req.body.queryExpansionProvider);
+      const queryExpansionProvider =
+        rawQueryExpansionProvider === "none" ||
+        rawQueryExpansionProvider === "gemini" ||
+        rawQueryExpansionProvider === "openai" ||
+        rawQueryExpansionProvider === "translation"
+          ? rawQueryExpansionProvider
+          : undefined;
+      if (rawQueryExpansionProvider && !queryExpansionProvider) {
+        res.status(400).json({ error: "Invalid query expansion provider." });
+        return;
+      }
+
+      const result = await saveBifrostSettingsToEnv({
+        apiKey: stringValue(req.body.apiKey),
+        baseUrl: stringValue(req.body.baseUrl),
+        model: stringValue(req.body.model),
+        llmProvider,
+        enableLlmQa: hasOwn(req.body, "enableLlmQa") ? booleanValue(req.body.enableLlmQa) : undefined,
+        enableLlmQueryExpansion: hasOwn(req.body, "enableLlmQueryExpansion")
+          ? booleanValue(req.body.enableLlmQueryExpansion)
+          : undefined,
+        queryExpansionProvider
+      });
+      res.json({ ok: true, ...result });
     } catch (error) {
       res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
     }
@@ -1462,14 +1528,17 @@ export async function answerFromCachedTrees(
     debug?: boolean;
     cachedTreeDocuments?: string[];
     localSectionDocuments?: string[];
-    selectedSectionAnswerer?: {
-      synthesizeSectionAnswer(section: SelectedSectionAnswerContext, query: string, options?: { language?: string }): Promise<string>;
-    };
+    selectedSectionAnswerer?: Pick<LlmClient, "synthesizeSectionAnswer">;
+    candidateReranker?: Pick<LlmClient, "planQuery">;
     answerStyle?: AnswerStyleOption;
+    enableLlmQa?: boolean;
+    queryExpansionProvider?: QueryExpansionProvider;
+    queryExpansionConfig?: Partial<QueryExpansionRuntimeConfig>;
   } = {}
 ): Promise<Record<string, unknown>> {
   const startedAt = Date.now();
   const detection = detectIntent(question);
+  const enableLlmQa = options.enableLlmQa ?? loadEnvConfig().enableLlmQa;
   const answerStyle = options.answerStyle ?? "class-eval";
   const selectedCachedTreeDocuments = uniqueStrings(options.cachedTreeDocuments ?? []);
   const localSectionDocuments = uniqueStrings(options.localSectionDocuments ?? []);
@@ -1478,8 +1547,15 @@ export async function answerFromCachedTrees(
     intent: detection.intent,
     scope: scope.mode,
     overrideGeminiKeys: options.geminiApiKeys?.length ?? 0,
+    enableLlmQa,
     selectedCachedTreeDocuments: selectedCachedTreeDocuments.length,
     localSectionDocuments: localSectionDocuments.length
+  });
+  serverTrace("qna", "query plan", {
+    intent: detection.intent,
+    plannerSource: detection.plannerSource,
+    enableLlmQa,
+    scope: scope.mode
   });
   const forceLocalSections = localSectionDocuments.length > 0 && selectedCachedTreeDocuments.length === 0;
   const cachedDocuments = forceLocalSections ? [] : await listCachedTreeDocuments();
@@ -1512,6 +1588,18 @@ export async function answerFromCachedTrees(
     intentReason: detection.reason,
     queryPlan: detection.queryPlan,
     plannerSource: detection.plannerSource,
+    llmCalled: false,
+    llmSkippedReason: null,
+    llmErrorType: null,
+    sectionTextChars: 0,
+    contextChars: 0,
+    fallbackReason: null,
+    queryExpansion: defaultQueryExpansionDebug(question),
+    domainAliasTerms: extractQuerySignals(question).domainAliasTerms,
+    llmRerankCalled: false,
+    llmRerankSelectedHsCode: null,
+    llmRerankReason: null,
+    candidateAliasSignals: [],
     indexSource: {
       selectedCachedTreeDocuments,
       localSectionDocuments
@@ -1522,7 +1610,9 @@ export async function answerFromCachedTrees(
       sectionMetadataCount: sectionMetadata.length,
       documentMetadataCount: documentMetadata.length
     },
-    scope: scopeInfo
+    scope: scopeInfo,
+    scopeApplied: true,
+    finalAnswerSanitized: true
   };
   const responseCacheInfo = buildCacheResponseFields(documents, documents.length > 0 ? "cached-pageindex-tree" : "local-sections");
 
@@ -1579,12 +1669,26 @@ export async function answerFromCachedTrees(
   }
 
   const searchStartedAt = Date.now();
-  const retrievalQuestion = question;
+  const queryExpansion = await expandQueryForRetrievalWithDebug(question, {
+    provider: options.queryExpansionProvider,
+    config: options.queryExpansionConfig
+  });
+  const retrievalQuestion = queryExpansion.result.expandedQuery;
+  serverTrace("qna", "query expansion completed", {
+    expansionSource: queryExpansion.result.expansionSource,
+    confidence: queryExpansion.result.confidence,
+    expansionTermCount: queryExpansion.result.expansionTerms.length,
+    cacheHit: queryExpansion.debug.cacheHit,
+    error: queryExpansion.debug.error
+  });
   const retrieval = documents.length > 0
-    ? await searchCachedTreeDocuments(retrievalQuestion, documents, scope)
-    : await searchLocalSectionsOnly(retrievalQuestion, localFallbackDocuments, scope);
-  const hits = retrieval.hits;
-  const debugReport = createQaDebugReport(retrievalQuestion, retrieval);
+    ? await searchCachedTreeDocuments(retrievalQuestion, documents, scope, queryExpansion.result)
+    : await searchLocalSectionsOnly(retrievalQuestion, localFallbackDocuments, scope, queryExpansion.result);
+  let hits = retrieval.hits;
+  const debugReport = {
+    ...createQaDebugReport(question, retrieval),
+    queryExpansion: queryExpansion.debug
+  };
   serverTrace("answerFromCachedTrees", "cached tree search completed", {
     hitCount: hits.length,
     pageIndexResultCount: retrieval.pageIndexResultCount,
@@ -1592,13 +1696,31 @@ export async function answerFromCachedTrees(
     contrastTerms: retrieval.contrastTerms,
     elapsedMs: Date.now() - searchStartedAt
   });
+  serverTrace("qna", "retrieval completed", {
+    hitCount: hits.length,
+    source: retrieval.retrievalSource,
+    pageIndexResultCount: retrieval.pageIndexResultCount,
+    bm25FallbackUsed: retrieval.bm25FallbackUsed,
+    elapsedMs: Date.now() - searchStartedAt
+  });
   if (hits.length === 0) {
+    serverTrace("qna", "selected candidate", {
+      selected: false,
+      reason: "no_hits"
+    });
     const indexSource = buildIndexSource(retrieval, documents, []);
     const candidateRelevance = retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults;
     const routed = handleSelectedSectionQa(question, undefined, undefined, candidateRelevance, detection, {
       ...baseDebug,
       ...debugReport,
-      indexSource
+      indexSource,
+      answerGeneration: "safe-fallback",
+      llmCalled: false,
+      llmSkippedReason: "no_selected_section",
+      llmErrorType: null,
+      sectionTextChars: 0,
+      contextChars: 0,
+      fallbackReason: "no_selected_section"
     });
     const emptyResponse = {
       answer: scopedNotFoundMessage(scope) ?? routed.answer,
@@ -1619,28 +1741,51 @@ export async function answerFromCachedTrees(
       ...buildCacheResponseFields(documents, retrieval.retrievalSource),
       answerGeneration: "safe-fallback",
       llmCalled: false,
+      llmSkippedReason: "no_selected_section",
+      llmErrorType: null,
       sectionTextChars: 0,
+      contextChars: 0,
       fallbackReason: "no_selected_section"
     };
     return options.debug
       ? {
           ...emptyResponse,
           intent: routed.intent,
-          answer: emptyResponse.answer,
+          answer: sanitizeFinalAnswer(emptyResponse.answer),
           selectedPrimary: null,
           documentSummary: null,
           citations: [],
-          debug: { ...routed.debug, scope: emptyResponse.scope }
+          debug: { ...routed.debug, scope: emptyResponse.scope, scopeApplied: true, finalAnswerSanitized: true }
         }
       : {
           ...emptyResponse,
           intent: routed.intent,
-          answer: emptyResponse.answer,
+          answer: sanitizeFinalAnswer(emptyResponse.answer),
           selectedPrimary: null,
           documentSummary: null,
           citations: []
         };
   }
+
+  const candidateRelevance = retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults;
+  const explicitHsQuestion = asksForHsCodeOrClassification(question);
+  const llmRerankResult = await maybeRerankCandidateHitsWithLlm({
+    question,
+    hits,
+    candidates: candidateRelevance,
+    enableLlmQa,
+    geminiApiKeys: options.geminiApiKeys,
+    candidateReranker: options.candidateReranker
+  });
+  hits = llmRerankResult.hits;
+  const selectedAfterRerank = matchingCandidateForSection(hits[0], candidateRelevance);
+  Object.assign(debugReport, {
+    ...llmRerankResult.debug,
+    selectedCandidateValidation: selectedAfterRerank?.validation ?? null,
+    strongSignals: selectedAfterRerank?.validation?.strongSignals ?? [],
+    weakSignals: selectedAfterRerank?.validation?.weakSignals ?? [],
+    missingEvidence: selectedAfterRerank?.validation?.missingEvidence ?? []
+  });
 
   const hydratedPrimary = hydrateSelectedSectionText(hits[0], sectionMetadata, documentMetadata);
   const sectionTextChars = selectedSectionTextChars(hydratedPrimary);
@@ -1652,115 +1797,389 @@ export async function answerFromCachedTrees(
     truncatedChars: context.slice(0, 12000).length,
     sourceDocuments: uniqueStrings(hits.map((hit) => hit.document)).length
   });
+  serverTrace("qna", "selected candidate", {
+    selected: true,
+    document: hydratedPrimary.document,
+    section: hydratedPrimary.section,
+    hsCode: hydratedPrimary.hsCode,
+    score: hydratedPrimary.score,
+    sectionTextChars
+  });
   let llmAnswer: string | undefined;
   let llmError: string | undefined;
+  let llmErrorType: string | null = null;
   let llmCalled = false;
+  let llmSkippedReason: string | null = null;
   let fallbackReason: string | null = null;
-  const explicitHsQuestion = asksForHsCodeOrClassification(question);
-  const alternatives = selectAlternativeSections(topHits, retrievalQuestion);
-  const candidateRelevance = retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults;
+  let fieldExtraction: LocalSelectedSectionAnswer["fieldExtraction"];
+  const alternatives = selectAlternativeSections(topHits, question);
+  const broadQueryDecision = detectBroadQuery({
+    originalQuery: question,
+    querySignals: extractQuerySignals(question),
+    validatedCandidates: candidateRelevance.map((candidate) => validatedCandidateFromRelevanceCandidate(candidate))
+  });
   const broadAmbiguity = detectAmbiguousLookup(question, candidateRelevance);
+  const meaningfulQueryTokenCount = extractQuerySignals(question).queryTokens.length;
+  const broadCanPreemptAnswer =
+    explicitHsQuestion ||
+    isNumericOnlyQuestion(question) ||
+    meaningfulQueryTokenCount <= 1;
+  const shouldUseBroadLookup = broadCanPreemptAnswer && broadQueryDecision.isBroad && broadQueryDecision.suggestedMode === "broad_lookup";
+  const shouldClarifyBroadQuery = broadCanPreemptAnswer && broadQueryDecision.isBroad && broadQueryDecision.suggestedMode === "clarification";
   const selectedSectionContext = buildStructuredRetrievedContext([hydratedPrimary]).slice(0, 12000);
   const selectedSectionContextChars = selectedSectionContext.length;
+  const selectedSectionText = [hydratedPrimary.text, ...(hydratedPrimary.captions ?? [])].filter(Boolean).join("\n\n").trim();
+  const selectedValidatedCandidate = validatedCandidateForLocalAnswer(hydratedPrimary, candidateRelevance);
+  let answerGeneration: QaAnswerGenerationMode = shouldUseBroadLookup
+    ? "broad-lookup"
+    : explicitHsQuestion
+      ? "template-classification"
+      : detection.intent === "definition"
+        ? "extractive-definition"
+        : "safe-fallback";
+  const localGeneratedAnswer = broadCanPreemptAnswer && broadQueryDecision.isBroad
+    ? null
+    : generateLocalAnswer({
+        originalQuery: question,
+        selectedCandidate: selectedValidatedCandidate,
+        selectedSectionText,
+        querySignals: extractQuerySignals(question),
+        answerPolicy: {
+          classificationRequested: explicitHsQuestion,
+          definitionRequested: detection.intent === "definition",
+          requestedField: detection.queryPlan?.requestedField ?? null,
+          attachHsCode: true,
+          allowRelatedHsCode: true
+        }
+      });
+  let localExtractorUsed = false;
+  let localExtractorConfidence: LocalAnswerResult["confidence"] | null = localGeneratedAnswer?.confidence ?? null;
+  let localExtractorReason: string | null = localGeneratedAnswer?.reason ?? null;
+  let hsCodeAttached = Boolean(localGeneratedAnswer?.answer && HS_CODE_PATTERN.test(localGeneratedAnswer.answer));
   if (explicitHsQuestion) {
-    serverTrace("answerFromCachedTrees", "metadata template used", {
-      intent: "product_classification",
-      selectedSection: hits[0].section,
-      answerStyle
+    if (isSuccessfulLocalAnswer(localGeneratedAnswer) && localGeneratedAnswer.confidence !== "low") {
+      llmAnswer = localGeneratedAnswer.answer;
+      answerGeneration = localGeneratedAnswer.answerGeneration;
+      localExtractorUsed = true;
+      fallbackReason = null;
+      llmSkippedReason = "local_extractor_succeeded";
+      serverTrace("answerFromCachedTrees", "metadata template used", {
+        intent: "product_classification",
+        selectedSection: hits[0].section,
+        answerStyle,
+        localExtractorUsed,
+        localExtractorReason
+      });
+      serverTrace("qna", "llm skipped", {
+        reason: llmSkippedReason,
+        answerGeneration
+      });
+    } else if (!enableLlmQa || sectionTextChars === 0) {
+      llmSkippedReason = !enableLlmQa ? "ENABLE_LLM_QA=false" : "missing_section_text";
+      serverTrace("answerFromCachedTrees", "metadata template used", {
+        intent: "product_classification",
+        selectedSection: hits[0].section,
+        answerStyle,
+        localExtractorUsed,
+        localExtractorReason
+      });
+      serverTrace("qna", "llm skipped", {
+        reason: llmSkippedReason,
+        answerGeneration
+      });
+    } else {
+      const llmAvailability = getLlmAvailability({ apiKeys: options.geminiApiKeys });
+      const llmProvider = options.selectedSectionAnswerer ? "injected" : llmAvailability.provider;
+      const llmKeyCount: number | "injected" = options.selectedSectionAnswerer ? "injected" : llmAvailability.keyCount;
+      if (!options.selectedSectionAnswerer && !llmAvailability.configured) {
+        llmSkippedReason = "llm_unavailable";
+        serverTrace("qna", "llm skipped", {
+          reason: llmSkippedReason,
+          llmProvider,
+          llmKeyCount,
+          unavailableReason: llmAvailability.unavailableReason
+        });
+      } else {
+        const llmStartedAt = Date.now();
+        serverTrace("qna", "llm called for classification", { sectionTextChars, llmProvider, llmKeyCount });
+        try {
+          const llm = options.selectedSectionAnswerer ?? createLlmClient({ apiKeys: options.geminiApiKeys });
+          llmCalled = true;
+          llmAnswer = await llm.synthesizeSectionAnswer({
+            document: hydratedPrimary.document,
+            section: hydratedPrimary.section,
+            title: hydratedPrimary.title,
+            hsCode: hydratedPrimary.hsCode,
+            source: hydratedPrimary.source,
+            text: hydratedPrimary.text,
+            context: selectedSectionContext
+          }, question, { language: "Vietnamese" });
+          if (llmAnswer?.trim()) {
+            answerGeneration = "llm-selected-section";
+            fallbackReason = null;
+            serverTrace("qna", "llm completed", {
+              answerChars: llmAnswer.length,
+              elapsedMs: Date.now() - llmStartedAt,
+              llmProvider,
+              llmKeyCount
+            });
+          } else {
+            answerGeneration = "template-classification";
+            llmAnswer = undefined;
+            serverTrace("qna", "llm empty, using template", { elapsedMs: Date.now() - llmStartedAt, llmProvider, llmKeyCount });
+          }
+        } catch (error) {
+          llmError = error instanceof Error ? error.message : String(error);
+          llmErrorType = classifyLlmErrorType(error);
+          answerGeneration = "template-classification";
+          serverTrace("qna", "llm failed, using template", {
+            reason: llmError,
+            elapsedMs: Date.now() - llmStartedAt,
+            llmProvider,
+            llmKeyCount
+          });
+        }
+      }
+    }
+  } else if (broadCanPreemptAnswer && broadQueryDecision.isBroad) {
+    llmSkippedReason = shouldClarifyBroadQuery ? "broad_query_clarification" : "broad_lookup";
+    serverTrace("qna", "llm skipped", {
+      reason: llmSkippedReason,
+      answerGeneration
     });
-  } else if (detection.intent === "selected_section_qa" && !broadAmbiguity) {
-    const apiKeys = options.selectedSectionAnswerer ? [] : resolveOptionalGeminiApiKeys(options.geminiApiKeys);
-    const llmKeyCount: number | "injected" = options.selectedSectionAnswerer ? "injected" : apiKeys.length;
+  } else if (detection.intent === "definition") {
+    if (isSuccessfulLocalAnswer(localGeneratedAnswer) && localGeneratedAnswer.confidence !== "low") {
+      llmAnswer = localGeneratedAnswer.answer;
+      answerGeneration = localGeneratedAnswer.answerGeneration;
+      localExtractorUsed = true;
+      fallbackReason = null;
+      llmSkippedReason = "local_extractor_succeeded";
+    } else if (!enableLlmQa || sectionTextChars === 0) {
+      llmSkippedReason = !enableLlmQa ? "ENABLE_LLM_QA=false" : "missing_section_text";
+    } else {
+      const llmAvailability = getLlmAvailability({ apiKeys: options.geminiApiKeys });
+      const llmProvider = options.selectedSectionAnswerer ? "injected" : llmAvailability.provider;
+      const llmKeyCount: number | "injected" = options.selectedSectionAnswerer ? "injected" : llmAvailability.keyCount;
+      if (!options.selectedSectionAnswerer && !llmAvailability.configured) {
+        llmSkippedReason = "llm_unavailable";
+        serverTrace("qna", "llm skipped", {
+          reason: llmSkippedReason,
+          llmProvider,
+          llmKeyCount,
+          unavailableReason: llmAvailability.unavailableReason
+        });
+      } else {
+        const llmStartedAt = Date.now();
+        serverTrace("qna", "llm called for definition", { sectionTextChars, llmProvider, llmKeyCount });
+        try {
+          const llm = options.selectedSectionAnswerer ?? createLlmClient({ apiKeys: options.geminiApiKeys });
+          llmCalled = true;
+          llmAnswer = await llm.synthesizeSectionAnswer({
+            document: hydratedPrimary.document,
+            section: hydratedPrimary.section,
+            title: hydratedPrimary.title,
+            hsCode: hydratedPrimary.hsCode,
+            source: hydratedPrimary.source,
+            text: hydratedPrimary.text,
+            context: selectedSectionContext
+          }, question, { language: "Vietnamese" });
+          if (llmAnswer?.trim()) {
+            answerGeneration = "llm-selected-section";
+            fallbackReason = null;
+          } else {
+            answerGeneration = "extractive-definition";
+            llmAnswer = undefined;
+          }
+        } catch (error) {
+          llmError = error instanceof Error ? error.message : String(error);
+          llmErrorType = classifyLlmErrorType(error);
+          answerGeneration = "extractive-definition";
+        }
+      }
+    }
+    serverTrace("qna", "definition path", {
+      llmSkippedReason,
+      answerGeneration,
+      localExtractorUsed,
+      localExtractorReason
+    });
+  } else if (detection.intent === "selected_section_qa" || detection.intent === "section_attribute_question" || detection.intent === "comparison") {
+    serverTrace("qna", "local extractor start", {
+      sectionTextChars,
+      contextChars: selectedSectionContextChars,
+      selectedSection: hydratedPrimary.section
+    });
+    const localGeneratedSucceeded = isHighQualityLocalAnswer(localGeneratedAnswer, question);
+    const legacyLocalAnswer = localGeneratedSucceeded ? null : extractLocalSelectedSectionAnswer(question, hydratedPrimary, detection);
+    const legacyLocalSucceeded = isSuccessfulLegacyLocalAnswer(legacyLocalAnswer);
+    fieldExtraction = legacyLocalAnswer?.fieldExtraction;
+    serverTrace("qna", "local extractor end", {
+      answerGeneration: localGeneratedAnswer?.answerGeneration ?? legacyLocalAnswer?.answerGeneration,
+      answerChars: localGeneratedAnswer?.answer?.length ?? legacyLocalAnswer?.answer?.length ?? 0,
+      fallbackReason: localGeneratedSucceeded || legacyLocalSucceeded ? null : legacyLocalAnswer?.fallbackReason ?? localGeneratedAnswer?.reason,
+      requestedField: legacyLocalAnswer?.fieldExtraction?.requestedField ?? detection.queryPlan?.requestedField,
+      matchedHeading: legacyLocalAnswer?.fieldExtraction?.matchedHeading,
+      confidence: localGeneratedAnswer?.confidence ?? legacyLocalAnswer?.fieldExtraction?.confidence,
+      localExtractorReason
+    });
+
     const llmTraceDetails = {
-      llmKeyCount,
       sectionTextChars,
       contextChars: selectedSectionContextChars,
       selectedSection: hydratedPrimary.section
     };
-    const llmStartedAt = Date.now();
-    serverTrace("answerFromCachedTrees", "selected_section_qa llm start", llmTraceDetails);
-
-    if (sectionTextChars === 0) {
-      fallbackReason = "missing_section_text";
-      llmAnswer = MISSING_SECTION_TEXT_FALLBACK;
-      serverTrace("answerFromCachedTrees", "selected_section_qa llm failed with reason", {
+    if (localGeneratedSucceeded || legacyLocalSucceeded) {
+      llmAnswer = localGeneratedSucceeded ? localGeneratedAnswer!.answer ?? undefined : legacyLocalAnswer?.answer;
+      answerGeneration = localGeneratedSucceeded ? localGeneratedAnswer!.answerGeneration : legacyLocalAnswer?.answerGeneration ?? "extractive-field";
+      localExtractorUsed = true;
+      localExtractorConfidence = localGeneratedSucceeded ? localGeneratedAnswer!.confidence : legacyLocalAnswer?.fieldExtraction?.confidence ?? "medium";
+      localExtractorReason = localGeneratedSucceeded ? localGeneratedAnswer!.reason : "field extracted from selected section text";
+      hsCodeAttached = Boolean(llmAnswer && HS_CODE_PATTERN.test(llmAnswer));
+      fallbackReason = null;
+      llmSkippedReason = "local_extractor_succeeded";
+      serverTrace("qna", "llm skipped", {
         ...llmTraceDetails,
-        reason: fallbackReason
+        reason: llmSkippedReason,
+        answerGeneration
+      });
+    } else if (!enableLlmQa) {
+      fallbackReason = legacyLocalAnswer?.fallbackReason ?? localGeneratedAnswer?.reason ?? "local_extractor_no_answer";
+      llmSkippedReason = "ENABLE_LLM_QA=false";
+      serverTrace("qna", "llm skipped", {
+        ...llmTraceDetails,
+        reason: llmSkippedReason,
+        fallbackReason
+      });
+    } else if (sectionTextChars === 0) {
+      fallbackReason = "missing_section_text";
+      llmSkippedReason = "missing_section_text";
+      serverTrace("qna", "llm skipped", {
+        ...llmTraceDetails,
+        reason: llmSkippedReason
       });
     } else if (selectedSectionContextChars === 0) {
       fallbackReason = "missing_context";
-      llmAnswer = MISSING_SECTION_TEXT_FALLBACK;
-      serverTrace("answerFromCachedTrees", "selected_section_qa llm failed with reason", {
+      llmSkippedReason = "missing_context";
+      serverTrace("qna", "llm skipped", {
         ...llmTraceDetails,
-        reason: fallbackReason
-      });
-    } else if (!options.selectedSectionAnswerer && apiKeys.length === 0) {
-      fallbackReason = "llm_unavailable";
-      llmAnswer = SAFE_SELECTED_SECTION_FALLBACK;
-      serverTrace("answerFromCachedTrees", "selected_section_qa llm failed with reason", {
-        ...llmTraceDetails,
-        reason: fallbackReason
+        reason: llmSkippedReason
       });
     } else {
-      try {
-        const llm = options.selectedSectionAnswerer ?? new GeminiRoundRobinClient({ apiKeys });
-        llmCalled = true;
-        llmAnswer = await llm.synthesizeSectionAnswer({
-          document: hydratedPrimary.document,
-          section: hydratedPrimary.section,
-          title: hydratedPrimary.title,
-          hsCode: hydratedPrimary.hsCode,
-          source: hydratedPrimary.source,
-          text: hydratedPrimary.text,
-          context: selectedSectionContext
-        }, question, { language: "Vietnamese" });
+      const llmAvailability = getLlmAvailability({ apiKeys: options.geminiApiKeys });
+      const llmProvider = options.selectedSectionAnswerer ? "injected" : llmAvailability.provider;
+      const llmKeyCount: number | "injected" = options.selectedSectionAnswerer ? "injected" : llmAvailability.keyCount;
+      if (!options.selectedSectionAnswerer && !llmAvailability.configured) {
+        fallbackReason = "llm_unavailable";
+        llmSkippedReason = "llm_unavailable";
+        serverTrace("qna", "llm skipped", {
+          ...llmTraceDetails,
+          llmKeyCount,
+          llmProvider,
+          unavailableReason: llmAvailability.unavailableReason,
+          reason: llmSkippedReason
+        });
+      } else {
+        const llmStartedAt = Date.now();
+        serverTrace("qna", "llm called", {
+          ...llmTraceDetails,
+          llmKeyCount,
+          llmProvider
+        });
+        try {
+          const llm = options.selectedSectionAnswerer ?? createLlmClient({ apiKeys: options.geminiApiKeys });
+          llmCalled = true;
+          const contrastSignals = detectContrastTerms(question);
+          const hasContrastQuery = contrastSignals.terms.length > 0 || contrastSignals.baselineTokens.length > 0;
+          if (hasContrastQuery && alternatives.length > 0 && !options.selectedSectionAnswerer) {
+            const comparisonSections = [hydratedPrimary, ...alternatives.slice(0, 1)].map((section) => ({
+              document: section.document,
+              section: section.section,
+              title: section.title,
+              hsCode: section.hsCode,
+              source: section.source,
+              text: section.text
+            }));
+            const comparisonLlm = createLlmClient({ apiKeys: options.geminiApiKeys });
+            llmAnswer = await comparisonLlm.synthesizeComparisonAnswer(comparisonSections, question, { language: "Vietnamese" });
+          } else {
+            llmAnswer = await llm.synthesizeSectionAnswer({
+              document: hydratedPrimary.document,
+              section: hydratedPrimary.section,
+              title: hydratedPrimary.title,
+              hsCode: hydratedPrimary.hsCode,
+              source: hydratedPrimary.source,
+              text: hydratedPrimary.text,
+              context: selectedSectionContext
+            }, question, { language: "Vietnamese" });
+          }
 
-        if (!llmAnswer?.trim()) {
-          fallbackReason = "empty_llm_answer";
-          llmError = fallbackReason;
-          llmAnswer = SAFE_SELECTED_SECTION_FALLBACK;
-          serverTrace("answerFromCachedTrees", "selected_section_qa llm failed with reason", {
+          if (!llmAnswer?.trim()) {
+            fallbackReason = "empty_llm_answer";
+            llmErrorType = "empty";
+            llmError = fallbackReason;
+            llmAnswer = undefined;
+            answerGeneration = "safe-fallback";
+            serverTrace("qna", "llm failed", {
+              ...llmTraceDetails,
+              llmKeyCount,
+              llmProvider,
+              reason: fallbackReason,
+              llmErrorType,
+              elapsedMs: Date.now() - llmStartedAt
+            });
+          } else {
+            answerGeneration = "llm-selected-section";
+            fallbackReason = null;
+            serverTrace("answerFromCachedTrees", "selected_section_qa llm completed", {
+              ...llmTraceDetails,
+              llmKeyCount,
+              llmProvider,
+              answerChars: llmAnswer.length,
+              elapsedMs: Date.now() - llmStartedAt
+            });
+            serverTrace("qna", "llm completed", {
+              ...llmTraceDetails,
+              llmKeyCount,
+              llmProvider,
+              answerChars: llmAnswer.length,
+              elapsedMs: Date.now() - llmStartedAt
+            });
+          }
+        } catch (error) {
+          llmError = error instanceof Error ? error.message : String(error);
+          llmErrorType = classifyLlmErrorType(error);
+          fallbackReason = llmErrorType === "unknown" ? "llm_failed" : `llm_${llmErrorType}`;
+          llmAnswer = undefined;
+          answerGeneration = "safe-fallback";
+          serverTrace("qna", "llm failed", {
             ...llmTraceDetails,
-            reason: fallbackReason,
-            elapsedMs: Date.now() - llmStartedAt
-          });
-        } else {
-          serverTrace("answerFromCachedTrees", "selected_section_qa llm completed", {
-            ...llmTraceDetails,
-            answerChars: llmAnswer.length,
+            llmKeyCount,
+            llmProvider,
+            reason: llmError,
+            llmErrorType,
             elapsedMs: Date.now() - llmStartedAt
           });
         }
-      } catch (error) {
-        llmError = error instanceof Error ? error.message : String(error);
-        fallbackReason = llmError;
-        llmAnswer = SAFE_SELECTED_SECTION_FALLBACK;
-        serverTrace("answerFromCachedTrees", "selected_section_qa llm failed with reason", {
-          ...llmTraceDetails,
-          reason: llmError,
-          elapsedMs: Date.now() - llmStartedAt
-        });
       }
     }
   }
-  const answerGeneration = broadAmbiguity
-    ? "ambiguous-lookup"
-    : explicitHsQuestion
-    ? "template-classification"
-    : detection.intent === "definition"
-      ? "template-definition"
-    : llmAnswer && fallbackReason === null
-      ? "llm-selected-section"
-      : "safe-fallback";
   const routed = explicitHsQuestion
     ? handleProductClassification(question, hydratedPrimary, alternatives, llmAnswer, candidateRelevance, detection, {
         ...baseDebug,
         ...debugReport,
         answerGeneration,
         llmCalled,
+        llmSkippedReason,
+        llmErrorType,
         sectionTextChars,
+        selectedSectionTextChars: selectedSectionText.length,
         contextChars: selectedSectionContextChars,
-        fallbackReason
+        fallbackReason,
+        localExtractorUsed,
+        localExtractorConfidence,
+        localExtractorReason,
+        hsCodeAttached,
+        broadQueryDecision
       })
     : detection.intent === "definition"
       ? handleDefinition(question, hydratedPrimary, candidateRelevance, detection, {
@@ -1768,25 +2187,51 @@ export async function answerFromCachedTrees(
           ...debugReport,
           answerGeneration,
           llmCalled,
+          llmSkippedReason,
+          llmErrorType,
           sectionTextChars,
+          selectedSectionTextChars: selectedSectionText.length,
           contextChars: selectedSectionContextChars,
-          fallbackReason
-        })
+          fallbackReason,
+          localExtractorUsed,
+          localExtractorConfidence,
+          localExtractorReason,
+          hsCodeAttached,
+          broadQueryDecision
+        }, localGeneratedAnswer?.answer ?? undefined)
     : handleSelectedSectionQa(question, hydratedPrimary, llmAnswer, candidateRelevance, detection, {
         ...baseDebug,
         ...debugReport,
         answerGeneration,
         llmCalled,
+        llmSkippedReason,
+        llmErrorType,
         sectionTextChars,
+        selectedSectionTextChars: selectedSectionText.length,
         contextChars: selectedSectionContextChars,
-        fallbackReason
+        fallbackReason,
+        localExtractorUsed,
+        localExtractorConfidence,
+        localExtractorReason,
+        hsCodeAttached,
+        fieldExtraction,
+        broadQueryDecision
       });
-  const answer = routed.answer;
-  const finalAnswerGeneration = typeof routed.debug.answerGeneration === "string" ? routed.debug.answerGeneration : answerGeneration;
+  const answer = sanitizeFinalAnswer(routed.answer, { maxWords: answerStyle === "class-eval" ? 180 : undefined });
+  const finalAnswerGeneration = isQaAnswerGenerationMode(routed.debug.answerGeneration)
+    ? routed.debug.answerGeneration
+    : answerGeneration;
   const finalHsCodes = Array.isArray(routed.debug.finalHsCodes) ? routed.debug.finalHsCodes as string[] : hsCodesForSection(hits[0]);
   const answerRepairApplied = Boolean(routed.debug.answerRepairApplied);
   const marker13 = TokenValidator.validateOutputSize(answer, { maxWords: 180 });
   const validation = QAValidator.validateResponse(answer, { requireCitations: false });
+  serverTrace("qna", "final answer generation mode", {
+    answerGeneration: finalAnswerGeneration,
+    llmCalled,
+    llmSkippedReason,
+    llmErrorType,
+    fallbackReason
+  });
   serverTrace("answerFromCachedTrees", "completed", { elapsedMs: Date.now() - startedAt });
   const sourceDocuments = uniqueStrings(hits.map((hit) => hit.document));
   const indexSource = buildIndexSource(retrieval, documents, sourceDocuments);
@@ -1826,7 +2271,14 @@ export async function answerFromCachedTrees(
     metadataWarnings: hits[0].metadataWarnings,
     answerGeneration: finalAnswerGeneration,
     llmCalled,
+    llmSkippedReason,
+    llmErrorType,
     sectionTextChars,
+    selectedSectionTextChars: selectedSectionText.length,
+    localExtractorUsed,
+    localExtractorConfidence,
+    localExtractorReason,
+    hsCodeAttached,
     contextChars: selectedSectionContextChars,
     fallbackReason,
     llmError,
@@ -1835,27 +2287,38 @@ export async function answerFromCachedTrees(
       markers: [marker12, marker13, ...validation.markers]
     }
   };
-  return options.debug ? { ...response, debug: { ...routed.debug, scope: response.scope } } : response;
+  return options.debug ? { ...response, debug: { ...routed.debug, scope: response.scope, scopeApplied: true, finalAnswerSanitized: true } } : response;
 }
 
 async function searchCachedTreeDocuments(
   question: string,
   documents: CachedTreeDocument[],
-  scope: QaScopeTracker
+  scope: QaScopeTracker,
+  queryExpansion?: QueryExpansionResult
 ): Promise<CachedTreeRetrievalResult> {
   const contrast = detectContrastTerms(question);
   const signals = extractQuerySignals(question);
-  const queryTokens = tokenizeForSearch(question);
-  const scoringContext = { queryTokens, contrast };
+  const scoringContext = buildSearchScoringContext(question, signals, contrast);
   const scopedDocuments = documents.filter((document) => scopeAllowsDocument(scope, document.document));
-  const sectionMetadata = await loadSectionMetadata(scopedDocuments.map((document) => document.document), scope);
+  const scopedDocumentNames = scopedDocuments.map((document) => document.document);
+  const [sectionMetadata, documentMetadata] = await Promise.all([
+    loadSectionMetadata(scopedDocumentNames, scope),
+    loadDocumentMetadata(scopedDocumentNames)
+  ]);
   const pageIndexHits: EnrichedRetrievedSection[] = [];
 
   for (const document of scopedDocuments) {
     const treeJson = await readOptionalJson<Record<string, unknown>>(path.resolve(process.cwd(), document.treePath));
     const roots = normalizeTreeRoots(treeJson);
     for (const node of flattenCachedTreeNodes(roots)) {
-      const score = scoreRetrievedCandidate(scoringContext, node.title, node.text);
+      const scored = scoreSearchFields(scoringContext, {
+        title: node.title,
+        heading: node.title,
+        body: node.text,
+        captions: "",
+        source: document.document
+      });
+      const score = scored.total;
       if (score > 0) {
         const rawHit: RetrievedTreeHit = {
           document: document.document,
@@ -1863,13 +2326,28 @@ async function searchCachedTreeDocuments(
           text: node.text.slice(0, 2400),
           score
         };
-        pageIndexHits.push(enrichRetrievedHit(rawHit, sectionMetadata));
+        pageIndexHits.push({
+          ...enrichRetrievedHit(rawHit, sectionMetadata),
+          scoreBreakdown: scored.breakdown,
+          hydrationSource: "retrieval"
+        });
       }
     }
   }
 
-  const rankedPageIndexHits = rankRetrievedSectionsByUsability(pageIndexHits, question);
-  const pageIndexSelection = selectRelevantSections(rankedPageIndexHits, question, { requireHsMetadata: asksForHsCodeOrClassification(question) });
+  const localSearchHits = searchLocalSectionMetadataFallback(scoringContext, sectionMetadata, documentMetadata);
+  const hydratedPageIndexHits = hydrateSectionsForSearch(pageIndexHits, sectionMetadata, documentMetadata);
+  const rankedPageIndexHits = rankRetrievedSectionsByUsability(mergeSearchCandidates([
+    ...hydratedPageIndexHits,
+    ...localSearchHits
+  ]), question);
+  const pageIndexSelection = selectRelevantSections(rankedPageIndexHits, question, {
+    requireHsMetadata: asksForHsCodeOrClassification(queryExpansion?.originalQuery ?? question),
+    originalQuestion: queryExpansion?.originalQuery ?? question,
+    expansionTerms: queryExpansion?.expansionTerms ?? [],
+    expansionConfidence: queryExpansion?.confidence,
+    scope
+  });
   const usablePageIndexHits = pageIndexSelection.ranked;
   if (usablePageIndexHits.length > 0) {
     return {
@@ -1888,8 +2366,14 @@ async function searchCachedTreeDocuments(
     pageIndexResultCount: rankedPageIndexHits.length,
     contrastTerms: contrast.terms
   });
-  const bm25Candidates = rankRetrievedSectionsByUsability(searchLocalSectionMetadataFallback(scoringContext, sectionMetadata), question);
-  const bm25Selection = selectRelevantSections(bm25Candidates, question, { requireHsMetadata: asksForHsCodeOrClassification(question) });
+  const bm25Candidates = rankRetrievedSectionsByUsability(localSearchHits, question);
+  const bm25Selection = selectRelevantSections(bm25Candidates, question, {
+    requireHsMetadata: asksForHsCodeOrClassification(queryExpansion?.originalQuery ?? question),
+    originalQuestion: queryExpansion?.originalQuery ?? question,
+    expansionTerms: queryExpansion?.expansionTerms ?? [],
+    expansionConfidence: queryExpansion?.confidence,
+    scope
+  });
   return {
     hits: bm25Selection.ranked,
     retrievalSource: "bm25-fallback",
@@ -1907,33 +2391,244 @@ export async function answerQuestionForEval(
   options: {
     cachedTreeDocuments?: string[];
     localSectionDocuments?: string[];
-    selectedSectionAnswerer?: {
-      synthesizeSectionAnswer(section: SelectedSectionAnswerContext, query: string, options?: { language?: string }): Promise<string>;
-    };
+    selectedSectionAnswerer?: Pick<LlmClient, "synthesizeSectionAnswer">;
+    candidateReranker?: Pick<LlmClient, "planQuery">;
+    enableLlmQa?: boolean;
+    queryExpansionProvider?: QueryExpansionProvider;
+    queryExpansionConfig?: Partial<QueryExpansionRuntimeConfig>;
     debug?: boolean;
   } = {}
 ): Promise<Record<string, unknown>> {
   return await answerFromCachedTrees(question, {
     ...options,
     answerStyle: "class-eval",
-    geminiApiKeys: []
+    geminiApiKeys: [],
+    enableLlmQa: options.enableLlmQa ?? false
   });
+}
+
+interface LlmCandidateRerankDebug {
+  llmRerankCalled: boolean;
+  llmRerankSelectedHsCode: string | null;
+  llmRerankReason: string | null;
+  llmRerankAccepted: boolean;
+  llmRerankProvider: string | null;
+  llmRerankErrorType: string | null;
+  llmRerankCandidateCount: number;
+}
+
+async function maybeRerankCandidateHitsWithLlm(args: {
+  question: string;
+  hits: EnrichedRetrievedSection[];
+  candidates: CandidateRelevance[];
+  enableLlmQa: boolean;
+  geminiApiKeys?: string[];
+  candidateReranker?: Pick<LlmClient, "planQuery">;
+}): Promise<{ hits: EnrichedRetrievedSection[]; debug: LlmCandidateRerankDebug }> {
+  const debug = defaultLlmCandidateRerankDebug();
+  if (args.hits.length <= 1 || !asksForHsCodeOrClassification(args.question)) {
+    return { hits: args.hits, debug };
+  }
+  if (!args.enableLlmQa) {
+    return { hits: args.hits, debug: { ...debug, llmRerankReason: "ENABLE_LLM_QA=false" } };
+  }
+
+  const availability = getLlmAvailability({ apiKeys: args.geminiApiKeys });
+  const injected = Boolean(args.candidateReranker);
+  if (!injected && availability.provider !== "bifrost") {
+    return { hits: args.hits, debug: { ...debug, llmRerankProvider: availability.provider, llmRerankReason: "provider_not_bifrost" } };
+  }
+  if (!injected && !availability.configured) {
+    return {
+      hits: args.hits,
+      debug: {
+        ...debug,
+        llmRerankProvider: availability.provider,
+        llmRerankReason: availability.unavailableReason ?? "llm_unavailable"
+      }
+    };
+  }
+
+  const candidatePayload = args.hits.slice(0, 6).map((hit, index) => {
+    const candidate = matchingCandidateForSection(hit, args.candidates);
+    return {
+      rank: index + 1,
+      document: hit.document,
+      hsCode: hit.hsCode ?? null,
+      groupedHsCodes: hit.groupedHsCodes ?? [],
+      title: hit.title ?? null,
+      section: hit.section ?? null,
+      source: hit.source ?? null,
+      score: hit.score,
+      matchedTerms: candidate?.matchedTerms ?? [],
+      matchedPhrases: candidate?.candidateMatchedPhrases ?? [],
+      aliasSignals: candidate?.candidateAliasSignals ?? [],
+      validationStrongSignals: candidate?.validation?.strongSignals ?? [],
+      validationWeakSignals: candidate?.validation?.weakSignals ?? [],
+      excerpt: shortPromptExcerpt([hit.text, ...(hit.captions ?? [])].filter(Boolean).join("\n"))
+    };
+  });
+  const allowedHsCodes = new Set(candidatePayload.flatMap((candidate) => [
+    typeof candidate.hsCode === "string" ? candidate.hsCode : "",
+    ...candidate.groupedHsCodes
+  ]).filter(Boolean));
+  if (allowedHsCodes.size === 0) {
+    return { hits: args.hits, debug: { ...debug, llmRerankReason: "no_candidate_hscode" } };
+  }
+
+  const provider = injected ? "injected" : availability.provider;
+  const prompt = [
+    "You are reranking HS code candidates using only the candidate list below.",
+    "Select the candidate that best matches the user query. Do not invent HS codes.",
+    "Return strict JSON only: {\"selectedHsCode\":\"1000.00.00\",\"confidence\":\"high|medium|low\",\"reason\":\"short reason\"}.",
+    "",
+    `User query: ${args.question}`,
+    "",
+    `Candidates:\n${JSON.stringify(candidatePayload, null, 2)}`
+  ].join("\n");
+
+  serverTrace("qna", "llm rerank called", {
+    provider,
+    candidateCount: candidatePayload.length,
+    aliasSignals: uniqueStrings(candidatePayload.flatMap((candidate) => candidate.aliasSignals))
+  });
+  try {
+    const reranker = args.candidateReranker ?? createLlmClient({ apiKeys: args.geminiApiKeys });
+    const raw = await reranker.planQuery(prompt, { temperature: 0, maxOutputTokens: 300 });
+    const parsed = parseLlmRerankResponse(raw);
+    const selectedHsCode = parsed?.selectedHsCode ?? null;
+    const confidence = parsed?.confidence ?? "low";
+    const selectedIndex = selectedHsCode
+      ? args.hits.findIndex((hit) => hsCodesForSection(hit).includes(selectedHsCode))
+      : -1;
+    const accepted = Boolean(selectedHsCode && allowedHsCodes.has(selectedHsCode) && (confidence === "medium" || confidence === "high") && selectedIndex >= 0);
+    serverTrace("qna", "llm rerank completed", {
+      provider,
+      selectedHsCode,
+      confidence,
+      accepted,
+      reason: parsed?.reason ?? null
+    });
+    if (!accepted) {
+      return {
+        hits: args.hits,
+        debug: {
+          ...debug,
+          llmRerankCalled: true,
+          llmRerankProvider: provider,
+          llmRerankSelectedHsCode: selectedHsCode,
+          llmRerankReason: parsed?.reason ?? "rerank_response_not_accepted",
+          llmRerankCandidateCount: candidatePayload.length
+        }
+      };
+    }
+
+    const selected = args.hits[selectedIndex];
+    return {
+      hits: [selected, ...args.hits.filter((_, index) => index !== selectedIndex)],
+      debug: {
+        ...debug,
+        llmRerankCalled: true,
+        llmRerankAccepted: true,
+        llmRerankProvider: provider,
+        llmRerankSelectedHsCode: selectedHsCode,
+        llmRerankReason: parsed?.reason ?? null,
+        llmRerankCandidateCount: candidatePayload.length
+      }
+    };
+  } catch (error) {
+    const errorType = classifyLlmErrorType(error);
+    serverTrace("qna", "llm rerank failed", {
+      provider,
+      errorType,
+      reason: error instanceof Error ? error.message : String(error)
+    });
+    return {
+      hits: args.hits,
+      debug: {
+        ...debug,
+        llmRerankCalled: true,
+        llmRerankProvider: provider,
+        llmRerankErrorType: errorType,
+        llmRerankReason: errorType === "unknown" ? "llm_rerank_failed" : `llm_rerank_${errorType}`,
+        llmRerankCandidateCount: candidatePayload.length
+      }
+    };
+  }
+}
+
+function defaultLlmCandidateRerankDebug(): LlmCandidateRerankDebug {
+  return {
+    llmRerankCalled: false,
+    llmRerankSelectedHsCode: null,
+    llmRerankReason: null,
+    llmRerankAccepted: false,
+    llmRerankProvider: null,
+    llmRerankErrorType: null,
+    llmRerankCandidateCount: 0
+  };
+}
+
+function parseLlmRerankResponse(value: string): { selectedHsCode: string | null; confidence: "high" | "medium" | "low"; reason: string | null } | null {
+  const json = extractJsonObjectText(value);
+  if (!json) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(json) as Record<string, unknown>;
+    const selectedHsCode = typeof parsed.selectedHsCode === "string"
+      ? parsed.selectedHsCode.match(HS_CODE_PATTERN)?.[0] ?? null
+      : typeof parsed.hsCode === "string"
+        ? parsed.hsCode.match(HS_CODE_PATTERN)?.[0] ?? null
+        : null;
+    const confidence = parsed.confidence === "high" || parsed.confidence === "medium" || parsed.confidence === "low"
+      ? parsed.confidence
+      : "low";
+    const reason = typeof parsed.reason === "string" ? parsed.reason.slice(0, 240) : null;
+    return { selectedHsCode, confidence, reason };
+  } catch {
+    return null;
+  }
+}
+
+function extractJsonObjectText(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return trimmed;
+  }
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  return start >= 0 && end > start ? trimmed.slice(start, end + 1) : null;
+}
+
+function shortPromptExcerpt(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, 700);
 }
 
 async function searchLocalSectionsOnly(
   question: string,
   documentNames: string[] = [],
-  scope: QaScopeTracker = createQaScope(documentNames)
+  scope: QaScopeTracker = createQaScope(documentNames),
+  queryExpansion?: QueryExpansionResult
 ): Promise<CachedTreeRetrievalResult> {
   const contrast = detectContrastTerms(question);
   const signals = extractQuerySignals(question);
-  const queryTokens = tokenizeForSearch(question);
-  const scoringContext = { queryTokens, contrast };
+  const scoringContext = buildSearchScoringContext(question, signals, contrast);
   const allowedDocuments = new Set(documentNames);
-  const sectionMetadata = (await loadSectionMetadata(documentNames, scope))
+  const [loadedSectionMetadata, documentMetadata] = await Promise.all([
+    loadSectionMetadata(documentNames, scope),
+    loadDocumentMetadata(documentNames)
+  ]);
+  const sectionMetadata = loadedSectionMetadata
     .filter((section) => (allowedDocuments.size === 0 || allowedDocuments.has(section.document)) && scopeAllowsDocument(scope, section.document));
-  const bm25Candidates = rankRetrievedSectionsByUsability(searchLocalSectionMetadataFallback(scoringContext, sectionMetadata), question);
-  const bm25Selection = selectRelevantSections(bm25Candidates, question, { requireHsMetadata: asksForHsCodeOrClassification(question) });
+  const bm25Candidates = rankRetrievedSectionsByUsability(searchLocalSectionMetadataFallback(scoringContext, sectionMetadata, documentMetadata), question);
+  const bm25Selection = selectRelevantSections(bm25Candidates, question, {
+    requireHsMetadata: asksForHsCodeOrClassification(queryExpansion?.originalQuery ?? question),
+    originalQuestion: queryExpansion?.originalQuery ?? question,
+    expansionTerms: queryExpansion?.expansionTerms ?? [],
+    expansionConfidence: queryExpansion?.confidence,
+    scope
+  });
   return {
     hits: bm25Selection.ranked,
     retrievalSource: "local-sections",
@@ -2035,16 +2730,35 @@ function summarizePageIndexUploadStatus(cachedDocuments: CachedTreeDocument[]): 
 
 class TemplateFastPathSkip extends Error {}
 
-function resolveOptionalGeminiApiKeys(overrides: string[] | undefined): string[] {
-  if (overrides !== undefined) {
-    return uniqueStrings(overrides.map((key) => key.trim()).filter(Boolean));
+function classifyLlmErrorType(error: unknown): "quota" | "rate_limit" | "permission" | "timeout" | "empty" | "unknown" {
+  const status = errorStatus(error);
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  if (message.includes("timeout") || message.includes("timed out") || message.includes("deadline")) {
+    return "timeout";
   }
+  if (status === 401 || status === 403 ||
+    message.includes("api key not valid") ||
+    message.includes("invalid api key") ||
+    message.includes("unauthorized") ||
+    message.includes("permission denied") ||
+    message.includes("forbidden")) {
+    return "permission";
+  }
+  if (message.includes("quota") || message.includes("resource exhausted")) {
+    return "quota";
+  }
+  if (status === 429 || message.includes("rate limit") || message.includes("too many requests")) {
+    return "rate_limit";
+  }
+  return "unknown";
+}
 
-  try {
-    return resolveGeminiApiKeys();
-  } catch {
-    return [];
-  }
+function errorStatus(error: unknown): number | undefined {
+  const candidate = error as { status?: unknown; response?: { status?: unknown }; code?: unknown };
+  if (typeof candidate.status === "number") return candidate.status;
+  if (typeof candidate.response?.status === "number") return candidate.response.status;
+  if (typeof candidate.code === "number") return candidate.code;
+  return undefined;
 }
 
 function shouldUseTemplateFastPath(intent: string, section: EnrichedRetrievedSection, answerStyle: AnswerStyleOption): boolean {
@@ -2092,6 +2806,14 @@ function finalizeRoutedAnswer(
   const responseScope = options.scope
     ? scopeSnapshot(options.scope, options.documents.map((document) => document.document))
     : routed.debug.scope ?? null;
+  const answerGeneration = responseAnswerGeneration(routed);
+  const llmCalled = Boolean(routed.debug.llmCalled);
+  const llmSkippedReason = typeof routed.debug.llmSkippedReason === "string" ? routed.debug.llmSkippedReason : null;
+  const llmErrorType = typeof routed.debug.llmErrorType === "string" ? routed.debug.llmErrorType : null;
+  const fallbackReason = typeof routed.debug.fallbackReason === "string" ? routed.debug.fallbackReason : null;
+  const localExtractorConfidence = isAnswerConfidence(routed.debug.localExtractorConfidence)
+    ? routed.debug.localExtractorConfidence
+    : null;
   const response = {
     intent: routed.intent,
     answerMode: routed.answerMode,
@@ -2100,7 +2822,7 @@ function finalizeRoutedAnswer(
     finalScore: routed.debug.finalScore,
     strongSignals: routed.debug.strongSignals ?? [],
     contradictions: routed.debug.contradictions ?? [],
-    answer: routed.answer,
+    answer: sanitizeFinalAnswer(routed.answer),
     selectedPrimary: routed.selectedPrimary,
     documentSummary: routed.documentSummary,
     scope: responseScope,
@@ -2124,10 +2846,84 @@ function finalizeRoutedAnswer(
     citations: routed.citations,
     retrievedSections: [],
     metadataWarnings: [],
-    answerGeneration: "template",
+    answerGeneration,
+    llmCalled,
+    llmSkippedReason,
+    llmErrorType,
+    sectionTextChars: typeof routed.debug.sectionTextChars === "number" ? routed.debug.sectionTextChars : 0,
+    selectedSectionTextChars: typeof routed.debug.selectedSectionTextChars === "number" ? routed.debug.selectedSectionTextChars : 0,
+    localExtractorUsed: Boolean(routed.debug.localExtractorUsed),
+    localExtractorConfidence,
+    localExtractorReason: typeof routed.debug.localExtractorReason === "string" ? routed.debug.localExtractorReason : null,
+    hsCodeAttached: Boolean(routed.debug.hsCodeAttached),
+    contextChars: typeof routed.debug.contextChars === "number" ? routed.debug.contextChars : 0,
+    fallbackReason,
     validation: QAValidator.validateResponse(routed.answer, { requireCitations: false })
   };
-  return options.debug ? { ...response, debug: { ...routed.debug, scope: response.scope } } : response;
+  return options.debug ? { ...response, debug: { ...routed.debug, scope: response.scope, scopeApplied: true, finalAnswerSanitized: true } } : response;
+}
+
+function responseAnswerGeneration(routed: RoutedQaAnswer): QaAnswerGenerationMode {
+  if (isQaAnswerGenerationMode(routed.debug.answerGeneration)) {
+    return routed.debug.answerGeneration;
+  }
+  if (routed.intent === "exact_hscode_lookup" || routed.intent === "product_classification") {
+    return "template-classification";
+  }
+  if (routed.intent === "definition") {
+    return "extractive-definition";
+  }
+  return "safe-fallback";
+}
+
+function isQaAnswerGenerationMode(value: unknown): value is QaAnswerGenerationMode {
+  return value === "template-classification" ||
+    value === "extractive-definition" ||
+    value === "extractive-field" ||
+    value === "broad-lookup" ||
+    value === "llm-selected-section" ||
+    value === "safe-fallback";
+}
+
+function isSuccessfulLocalAnswer(result: LocalAnswerResult | null | undefined): result is LocalAnswerResult & { answer: string } {
+  if (!result?.answer) {
+    return false;
+  }
+  return (
+    result.answerGeneration !== "safe-fallback" &&
+    result.confidence !== "low" &&
+    (
+      result.answerGeneration === "template-classification" ||
+      result.answerGeneration === "extractive-definition" ||
+      result.answerGeneration === "extractive-field" ||
+      result.answerGeneration === "broad-lookup"
+    )
+  );
+}
+
+function isHighQualityLocalAnswer(result: LocalAnswerResult | null | undefined, query: string): boolean {
+  if (!isSuccessfulLocalAnswer(result)) return false;
+  if (result.answerGeneration === "template-classification") return true;
+  if (result.answerGeneration === "broad-lookup") return true;
+  const answer = normalizeSearchText(result.answer);
+  const queryTokens = tokenizeForSearch(query).filter((token) => token.length >= 4);
+  if (queryTokens.length === 0) return true;
+  const matchedInAnswer = queryTokens.filter((token) => answer.includes(token));
+  if (matchedInAnswer.length === 0) return false;
+  if (queryTokens.length >= 3 && matchedInAnswer.length <= 1) return false;
+  return true;
+}
+
+function isSuccessfulLegacyLocalAnswer(result: LocalSelectedSectionAnswer | null | undefined): result is LocalSelectedSectionAnswer & { answer: string } {
+  const confidence = result?.fieldExtraction?.confidence;
+  return Boolean(result?.answer) &&
+    result?.answerGeneration !== null &&
+    result?.answerGeneration !== "safe-fallback" &&
+    confidence !== "low";
+}
+
+function isAnswerConfidence(value: unknown): value is "high" | "medium" | "low" {
+  return value === "high" || value === "medium" || value === "low";
 }
 
 function publicCachedTreeDocument(document: CachedTreeDocument): Record<string, unknown> {
@@ -2152,52 +2948,243 @@ function rankRetrievedSectionsByUsability(hits: EnrichedRetrievedSection[], ques
 
 interface SearchScoringContext {
   queryTokens: string[];
+  signals: QuerySignals;
   contrast: ReturnType<typeof detectContrastTerms>;
+}
+
+interface SearchDocumentFields {
+  title: string;
+  heading: string;
+  body: string;
+  captions: string;
+  source: string;
+  hsCodes?: string[];
 }
 
 function searchLocalSectionMetadataFallback(
   scoringContext: SearchScoringContext,
-  sections: SectionMetadata[]
+  sections: SectionMetadata[],
+  documentMetadata: QaDocumentMetadata[] = []
 ): EnrichedRetrievedSection[] {
-  return sections.flatMap((section) => {
-    const score = scoreRetrievedCandidate(
-      scoringContext,
-      `${section.title ?? ""} ${section.section ?? ""}`,
-      `${section.text ?? ""} ${section.textPreview ?? ""} ${(section.captions ?? []).join(" ")}`
-    );
+  const baseSections = hydrateSectionsForSearch(sections.map((section) => sectionMetadataToRetrievedForSearch(section)), sections, documentMetadata);
+  return baseSections.flatMap((section) => {
+    const scored = scoreSearchFields(scoringContext, searchFieldsForSection(section));
+    const score = scored.total;
     if (score <= 0) {
       return [];
     }
 
     return [{
-      document: section.document,
-      chapter: section.chapter,
-      hsCode: section.hsCode,
-      groupedHsCodes: section.groupedHsCodes,
-      title: section.title,
-      section: section.section,
-      pageStart: section.pageStart,
-      pageEnd: section.pageEnd,
-      source: section.source,
-      text: section.text ?? section.textPreview ?? "",
-      captions: section.captions ?? [],
+      ...section,
       score,
-      metadataWarnings: []
+      scoreBreakdown: scored.breakdown
     }];
   });
 }
 
-function scoreRetrievedCandidate(scoringContext: SearchScoringContext, title: string, text: string): number {
+function buildSearchScoringContext(
+  question: string,
+  signals: QuerySignals = extractQuerySignals(question),
+  contrast: ReturnType<typeof detectContrastTerms> = detectContrastTerms(question)
+): SearchScoringContext {
+  const baselineTokens = new Set(contrast.baselineTokens);
+  const queryTokens = uniqueStrings([
+    ...tokenizeForSearch(question),
+    ...signals.queryTokens,
+    ...signals.physicalAttributes.flatMap(tokenizeForSearch),
+    ...signals.usageTerms.flatMap(tokenizeForSearch),
+    ...signals.tradeForms.flatMap(tokenizeForSearch),
+    ...signals.scientificNames.flatMap(tokenizeForSearch)
+  ]).filter((token) => !baselineTokens.has(token));
+  return { queryTokens, signals, contrast };
+}
+
+function scoreSearchFields(scoringContext: SearchScoringContext, fields: SearchDocumentFields): { total: number; breakdown: ScoreBreakdown } {
   const baselineTokens = new Set(scoringContext.contrast.baselineTokens);
-  const titleHaystack = normalizeSearchText(title);
-  const textHaystack = normalizeSearchText(text);
+  const titleHaystack = normalizeSearchText(`${fields.title} ${(fields.hsCodes ?? []).join(" ")}`);
+  const headingHaystack = normalizeSearchText(fields.heading);
+  const bodyHaystack = normalizeSearchText(fields.body);
+  const captionHaystack = normalizeSearchText(fields.captions);
+  const sourceHaystack = normalizeSearchText(fields.source);
   const positiveTokens = scoringContext.queryTokens.filter((token) => !baselineTokens.has(token));
-  const positiveScore = positiveTokens.reduce(
-    (sum, token) => sum + (countOccurrences(titleHaystack, token) * 5) + countOccurrences(textHaystack, token),
-    0
-  );
-  const baselinePenalty = scoringContext.contrast.baselineTokens.reduce((sum, token) => sum + countOccurrences(titleHaystack, token), 0) * 6;
-  return positiveScore - baselinePenalty;
+  const exactHsCodeTokens = positiveTokens.filter((token) => HS_CODE_PATTERN.test(token));
+  const phraseSignals = uniqueStrings([
+    ...scoringContext.signals.queryPhrases,
+    ...scoringContext.signals.physicalAttributes,
+    ...scoringContext.signals.usageTerms,
+    ...scoringContext.signals.tradeForms,
+    ...scoringContext.signals.scientificNames
+  ]).filter((phrase) => tokenizeForSearch(phrase).length >= 2);
+  const aliasSignals = scoringContext.signals.domainAliasTerms;
+
+  const breakdown: ScoreBreakdown = {
+    hsCode: exactHsCodeTokens.reduce((sum, token) => sum + countSearchToken(titleHaystack, token) * 40, 0),
+    alias:
+      phraseFieldScore(aliasSignals, titleHaystack, 42) +
+      phraseFieldScore(aliasSignals, headingHaystack, 34) +
+      phraseFieldScore(aliasSignals, bodyHaystack, 26) +
+      phraseFieldScore(aliasSignals, captionHaystack, 22),
+    title: tokenFieldScore(positiveTokens, titleHaystack, 7) + phraseFieldScore(phraseSignals, titleHaystack, 14),
+    heading: tokenFieldScore(positiveTokens, headingHaystack, 6) + phraseFieldScore(phraseSignals, headingHaystack, 11),
+    body: tokenFieldScore(positiveTokens, bodyHaystack, 3) + phraseFieldScore(phraseSignals, bodyHaystack, 8),
+    captions: tokenFieldScore(positiveTokens, captionHaystack, 4) + phraseFieldScore(phraseSignals, captionHaystack, 6),
+    source: tokenFieldScore(positiveTokens, sourceHaystack, 1),
+    numeric: scoringContext.signals.numericRanges.reduce((sum, range) =>
+      sum + (fieldIncludesSignal(`${titleHaystack} ${headingHaystack} ${bodyHaystack} ${captionHaystack}`, range) ? 11 : 0), 0),
+    scientific: scoringContext.signals.scientificNames.reduce((sum, name) =>
+      sum + (fieldIncludesSignal(titleHaystack, name) ? 12 : fieldIncludesSignal(bodyHaystack, name) ? 8 : 0), 0),
+    contrastPenalty: -scoringContext.contrast.baselineTokens.reduce((sum, token) =>
+      sum + countSearchToken(titleHaystack, token) * 6 + countSearchToken(headingHaystack, token) * 4 + countSearchToken(bodyHaystack, token) * 1, 0)
+  };
+  return {
+    total: Object.values(breakdown).reduce((sum, value) => sum + value, 0),
+    breakdown
+  };
+}
+
+function tokenFieldScore(tokens: string[], haystack: string, weight: number): number {
+  return tokens.reduce((sum, token) => sum + countSearchToken(haystack, token) * weight, 0);
+}
+
+function phraseFieldScore(phrases: string[], haystack: string, weight: number): number {
+  return phrases.reduce((sum, phrase) => sum + (fieldIncludesSignal(haystack, phrase) ? weight : 0), 0);
+}
+
+function fieldIncludesSignal(haystack: string, signal: string): boolean {
+  const normalized = normalizeSearchText(signal);
+  if (!normalized) {
+    return false;
+  }
+  if (/^[a-z0-9.]+$/i.test(normalized)) {
+    return countSearchToken(haystack, normalized) > 0;
+  }
+  return haystack.includes(normalized);
+}
+
+function countSearchToken(text: string, token: string): number {
+  let count = 0;
+  const pattern = new RegExp(`(?:^|[^a-z0-9.])${escapeRegExp(token)}(?=$|[^a-z0-9.])`, "g");
+  for (const _match of text.matchAll(pattern)) {
+    count += 1;
+  }
+  return count;
+}
+
+function searchFieldsForSection(section: EnrichedRetrievedSection): SearchDocumentFields {
+  return {
+    title: `${section.hsCode ?? ""} ${(section.groupedHsCodes ?? []).join(" ")} ${section.title ?? ""}`,
+    heading: `${section.section ?? ""} ${section.title ?? ""}`,
+    body: section.text ?? "",
+    captions: (section.captions ?? []).join(" "),
+    source: `${section.source ?? ""} ${section.chapter ?? ""} ${section.document}`,
+    hsCodes: hsCodesForSection(section)
+  };
+}
+
+function sectionMetadataToRetrievedForSearch(section: SectionMetadata): EnrichedRetrievedSection {
+  return {
+    document: section.document,
+    chapter: section.chapter,
+    hsCode: section.hsCode,
+    groupedHsCodes: section.groupedHsCodes ?? [],
+    title: section.title,
+    section: section.section,
+    pageStart: section.pageStart,
+    pageEnd: section.pageEnd,
+    source: section.source,
+    text: section.text ?? section.textPreview ?? "",
+    captions: section.captions ?? [],
+    score: 0,
+    metadataWarnings: [],
+    hydrationSource: section.text ? "section-metadata" : "retrieval"
+  };
+}
+
+export function hydrateSectionsForSearch(
+  sections: EnrichedRetrievedSection[],
+  sectionMetadata: SectionMetadata[],
+  documentMetadata: QaDocumentMetadata[]
+): EnrichedRetrievedSection[] {
+  return sections.map((section) => hydrateSectionForSearch(section, sectionMetadata, documentMetadata));
+}
+
+function hydrateSectionForSearch(
+  section: EnrichedRetrievedSection,
+  sectionMetadata: SectionMetadata[],
+  documentMetadata: QaDocumentMetadata[]
+): EnrichedRetrievedSection {
+  const metadata = findMatchingSectionMetadata(section, sectionMetadata);
+  const metadataText = [metadata?.text, metadata?.textPreview].filter(Boolean).join("\n\n").trim();
+  const metadataCaptions = metadata?.captions ?? [];
+  const markdownText = documentMetadata
+    .filter((document) => document.document === section.document)
+    .map((document) => [document.markdownText, document.rootText].filter(Boolean).join("\n\n"))
+    .find((text) => text.trim()) ?? "";
+  const markdownSection = markdownText ? extractMarkdownSectionBody(markdownText, {
+    ...section,
+    hsCode: section.hsCode ?? metadata?.hsCode,
+    title: section.title ?? metadata?.title,
+    section: section.section ?? metadata?.section
+  }) : "";
+  const currentText = section.text ?? "";
+  const candidates = [
+    { text: currentText, source: section.hydrationSource ?? "retrieval" as const },
+    { text: metadataText, source: "section-metadata" as const },
+    { text: markdownSection, source: "markdown" as const }
+  ].filter((item) => item.text.trim());
+  const best = candidates.sort((left, right) => hydrationTextQuality(right.text) - hydrationTextQuality(left.text))[0];
+  return {
+    ...section,
+    chapter: section.chapter ?? metadata?.chapter,
+    hsCode: section.hsCode ?? metadata?.hsCode,
+    groupedHsCodes: section.groupedHsCodes?.length ? section.groupedHsCodes : metadata?.groupedHsCodes ?? [],
+    title: section.title ?? metadata?.title,
+    section: section.section ?? metadata?.section,
+    pageStart: section.pageStart ?? metadata?.pageStart,
+    pageEnd: section.pageEnd ?? metadata?.pageEnd,
+    source: section.source ?? metadata?.source,
+    text: best?.text ?? currentText,
+    captions: uniqueStrings([...(section.captions ?? []), ...metadataCaptions]),
+    hydrationSource: best?.source ?? section.hydrationSource ?? "retrieval"
+  };
+}
+
+function hydrationTextQuality(text: string): number {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return 0;
+  }
+  const previewPenalty = isLikelyPreviewOnlyText(trimmed) ? 500 : 0;
+  return trimmed.length - previewPenalty;
+}
+
+function mergeSearchCandidates(sections: EnrichedRetrievedSection[]): EnrichedRetrievedSection[] {
+  const byKey = new Map<string, EnrichedRetrievedSection>();
+  for (const section of sections) {
+    const key = [
+      section.document,
+      hsCodesForSection(section).join("|"),
+      normalizeSearchText(section.title ?? ""),
+      normalizeSearchText(section.section ?? "")
+    ].join("|");
+    const existing = byKey.get(key);
+    if (!existing) {
+      byKey.set(key, section);
+      continue;
+    }
+    byKey.set(key, {
+      ...existing,
+      ...section,
+      text: hydrationTextQuality(section.text) > hydrationTextQuality(existing.text) ? section.text : existing.text,
+      captions: uniqueStrings([...(existing.captions ?? []), ...(section.captions ?? [])]),
+      score: Math.max(existing.score, section.score),
+      scoreBreakdown: (section.score >= existing.score ? section.scoreBreakdown : existing.scoreBreakdown) ?? section.scoreBreakdown ?? existing.scoreBreakdown,
+      hydrationSource: section.hydrationSource === "markdown" || existing.hydrationSource === "markdown"
+        ? "markdown"
+        : section.hydrationSource ?? existing.hydrationSource
+    });
+  }
+  return [...byKey.values()];
 }
 
 async function loadSectionMetadata(documentNames: string[], scope: QaScopeTracker = createQaScope(documentNames)): Promise<SectionMetadata[]> {
@@ -2334,18 +3321,51 @@ function publicSectionCitation(section: EnrichedRetrievedSection): Record<string
 }
 
 function createQaDebugReport(question: string, retrieval: CachedTreeRetrievalResult): Record<string, unknown> {
+  const candidates = retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults;
+  const acceptedCandidates = candidates.filter((candidate) => candidate.validation?.accepted ?? !candidate.rejected);
+  const selectedCandidateValidation = acceptedCandidates[0]?.validation ?? null;
   return {
     query: question,
     extractedSignals: retrieval.signals,
+    domainAliasTerms: retrieval.signals.domainAliasTerms,
     retrieval: {
       pageIndexResults: retrieval.pageIndexResults,
       bm25FallbackUsed: retrieval.bm25FallbackUsed,
       bm25Results: retrieval.bm25Results
     },
-    candidates: retrieval.bm25FallbackUsed ? retrieval.bm25Results : retrieval.pageIndexResults,
+    candidates,
+    candidateAliasSignals: uniqueStrings(candidates.flatMap((candidate) => candidate.candidateAliasSignals ?? [])),
+    candidatesBeforeValidation: candidates.length,
+    candidatesAfterValidation: acceptedCandidates.length,
+    rejectedCandidateReasons: candidates
+      .filter((candidate) => candidate.rejected || candidate.validation?.accepted === false)
+      .map((candidate) => ({
+        document: candidate.document,
+        hsCode: candidate.hsCode ?? null,
+        title: candidate.title ?? null,
+        section: candidate.section ?? null,
+        reason: candidate.validation?.reason ?? candidate.rejectedReason,
+        validation: candidate.validation ?? null
+      })),
+    selectedCandidateValidation,
+    strongSignals: selectedCandidateValidation?.strongSignals ?? [],
+    weakSignals: selectedCandidateValidation?.weakSignals ?? [],
+    missingEvidence: selectedCandidateValidation?.missingEvidence ?? [],
     selectedPrimary: {},
     finalAnswerHsCodes: [],
     answerRepairApplied: false
+  };
+}
+
+function defaultQueryExpansionDebug(question: string): QueryExpansionDebug {
+  return {
+    originalQuery: question,
+    expandedQuery: question,
+    expansionTerms: [],
+    expansionSource: "none",
+    confidence: "low",
+    error: null,
+    cacheHit: false
   };
 }
 
@@ -2354,16 +3374,17 @@ function hydrateSelectedSectionText(
   sectionMetadata: SectionMetadata[],
   documentMetadata: QaDocumentMetadata[]
 ): EnrichedRetrievedSection {
-  if (selectedSectionTextChars(section) > 0) {
+  if (selectedSectionTextChars(section) > 0 && !isLikelyPreviewOnlyText(section.text)) {
     return section;
   }
 
+  let metadataHydrated: EnrichedRetrievedSection | undefined;
   const metadata = findMatchingSectionMetadata(section, sectionMetadata);
   if (metadata) {
     const text = [metadata.text, metadata.textPreview].filter(Boolean).join("\n\n").trim();
     const captions = uniqueStrings([...(section.captions ?? []), ...(metadata.captions ?? [])]);
     if (text || captions.length > 0) {
-      return {
+      metadataHydrated = {
         ...section,
         chapter: section.chapter ?? metadata.chapter,
         pageStart: section.pageStart ?? metadata.pageStart,
@@ -2372,6 +3393,9 @@ function hydrateSelectedSectionText(
         text,
         captions
       };
+      if (!isLikelyPreviewOnlyText(text)) {
+        return metadataHydrated;
+      }
     }
   }
 
@@ -2380,11 +3404,89 @@ function hydrateSelectedSectionText(
     .map((document) => [document.markdownText, document.rootText].filter(Boolean).join("\n\n"))
     .find((text) => text.trim());
   const markdownSection = markdownText ? extractMarkdownSectionBody(markdownText, section) : "";
-  return markdownSection ? { ...section, text: markdownSection } : section;
+  return markdownSection ? { ...section, text: markdownSection } : metadataHydrated ?? section;
 }
 
 function selectedSectionTextChars(section: EnrichedRetrievedSection): number {
   return `${section.text ?? ""} ${(section.captions ?? []).join(" ")}`.trim().length;
+}
+
+function isLikelyPreviewOnlyText(text: string | undefined): boolean {
+  const trimmed = text?.trim() ?? "";
+  return Boolean(trimmed) && trimmed.length < 700 && /\.\.\./.test(trimmed);
+}
+
+function validatedCandidateForLocalAnswer(
+  section: EnrichedRetrievedSection,
+  candidates: CandidateRelevance[]
+): ValidatedCandidate {
+  const relevance = matchingCandidateForSection(section, candidates) ?? evaluateCandidateRelevance(section, section.title ?? section.section ?? section.text);
+  const validation: ValidatedCandidate["validation"] = relevance.validation ?? {
+    accepted: !relevance.rejected,
+    confidence: relevance.rejected ? "low" : "medium",
+    reason: relevance.rejectedReason ?? "selected candidate accepted by retrieval",
+    strongSignals: [],
+    weakSignals: relevance.rejected ? ["existing_relevance_rejection"] : [],
+    missingEvidence: relevance.rejected ? ["accepted_relevance_gate"] : []
+  };
+
+  return {
+    ...section,
+    relevance,
+    validation
+  };
+}
+
+function validatedCandidateFromRelevanceCandidate(candidate: CandidateRelevance): ValidatedCandidate {
+  return {
+    document: candidate.document,
+    hsCode: candidate.hsCode,
+    groupedHsCodes: candidate.groupedHsCodes,
+    title: candidate.title,
+    section: candidate.section,
+    pageStart: candidate.pageStart ?? undefined,
+    pageEnd: candidate.pageEnd ?? undefined,
+    source: candidate.source,
+    text: "",
+    captions: [],
+    score: candidate.finalScore,
+    metadataWarnings: [],
+    relevance: candidate,
+    validation: candidate.validation ?? {
+      accepted: !candidate.rejected,
+      confidence: candidate.rejected ? "low" : "medium",
+      reason: candidate.rejectedReason ?? "candidate accepted by retrieval",
+      strongSignals: [],
+      weakSignals: candidate.rejected ? ["existing_relevance_rejection"] : [],
+      missingEvidence: candidate.rejected ? ["accepted_relevance_gate"] : []
+    }
+  };
+}
+
+function matchingCandidateForSection(
+  section: EnrichedRetrievedSection,
+  candidates: CandidateRelevance[]
+): CandidateRelevance | undefined {
+  const codes = new Set(hsCodesForSection(section));
+  const sectionTitle = normalizeSearchText(section.title ?? "");
+  const sectionHeading = normalizeSearchText(section.section ?? "");
+  return candidates.find((candidate) => {
+    if (candidate.document !== section.document) {
+      return false;
+    }
+    if (candidate.hsCode && codes.has(candidate.hsCode)) {
+      return true;
+    }
+    if (candidate.groupedHsCodes.some((code) => codes.has(code))) {
+      return true;
+    }
+    const candidateTitle = normalizeSearchText(candidate.title ?? "");
+    const candidateHeading = normalizeSearchText(candidate.section ?? "");
+    return Boolean(
+      (sectionTitle && candidateTitle && sectionTitle === candidateTitle) ||
+      (sectionHeading && candidateHeading && sectionHeading === candidateHeading)
+    );
+  });
 }
 
 function findMatchingSectionMetadata(
@@ -2486,9 +3588,10 @@ function tokenizeForSearch(text: string): string[] {
   const tokens = uniqueStrings(
     normalizeSearchText(text)
       .split(/[^a-z0-9.]+/g)
+      .map(normalizeSearchToken)
       .filter((token) => token.length >= 3 && !SEARCH_STOPWORDS.has(token))
   );
-  return tokens.length > 0 ? tokens : uniqueStrings(normalizeSearchText(text).split(/[^a-z0-9.]+/g).filter((token) => token.length >= 3));
+  return tokens.length > 0 ? tokens : uniqueStrings(normalizeSearchText(text).split(/[^a-z0-9.]+/g).map(normalizeSearchToken).filter((token) => token.length >= 3));
 }
 
 function normalizeSearchText(text: string): string {
@@ -2497,7 +3600,20 @@ function normalizeSearchText(text: string): string {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
-    .replace(/\bca\s+phe\b/g, "coffee");
+    .replace(/\bca\s+phe\b/g, "coffee")
+    .replace(/\bwoodchips\b/g, "wood chips");
+}
+
+function normalizeSearchToken(token: string): string {
+  if (token === "higher" || token === "highest") return "high";
+  if (token === "lower" || token === "lowest") return "low";
+  if (token === "larger" || token === "largest") return "large";
+  if (token === "longer" || token === "longest") return "long";
+  if (token === "rounder") return "round";
+  if (token === "coarser") return "coarse";
+  if (token === "smoother") return "smooth";
+  if (token === "dried" || token === "drier") return "dry";
+  return token;
 }
 
 function countOccurrences(text: string, token: string): number {
@@ -2508,6 +3624,10 @@ function countOccurrences(text: string, token: string): number {
     index = text.indexOf(token, index + token.length);
   }
   return count;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function extractCachedDocId(payload: Record<string, unknown> | undefined): string | undefined {
@@ -2671,6 +3791,10 @@ function numberFromUnknown(value: unknown): number | undefined {
 
 function booleanValue(value: unknown): boolean {
   return value === "true" || value === "on" || value === "1" || value === true;
+}
+
+function hasOwn(value: unknown, key: string): boolean {
+  return typeof value === "object" && value !== null && Object.prototype.hasOwnProperty.call(value, key);
 }
 
 function parseAnswerStyle(value: unknown): AnswerStyleOption {

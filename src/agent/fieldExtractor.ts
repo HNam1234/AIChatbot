@@ -69,6 +69,30 @@ export const FIELD_SYNONYM_GROUPS: FieldSynonymGroup[] = [
   {
     canonical: "note",
     labels: ["note", "notes", "remark", "remarks", "chu thich", "ghi chu", "luu y"]
+  },
+  {
+    canonical: "origin",
+    labels: ["origin", "country of origin", "provenance", "xuat xu", "nguon goc", "nuoc xuat xu"]
+  },
+  {
+    canonical: "composition",
+    labels: ["composition", "ingredient", "ingredients", "material", "thanh phan", "chat lieu", "nguyen lieu"]
+  },
+  {
+    canonical: "packaging",
+    labels: ["packaging", "package", "container", "wrapping", "dong goi", "bao bi", "bao goi"]
+  },
+  {
+    canonical: "color",
+    labels: ["color", "colour", "hue", "shade", "mau sac", "mau"]
+  },
+  {
+    canonical: "processing",
+    labels: ["processing", "process", "method", "technique", "preparation", "che bien", "phuong phap", "ky thuat", "xu ly"]
+  },
+  {
+    canonical: "classification",
+    labels: ["classification", "category", "phan loai", "loai", "nhom"]
   }
 ];
 
@@ -199,7 +223,7 @@ function extractHeadingBlocks(sectionText: string): HeadingBlock[] {
     }
 
     if (current) {
-      current.body = [current.body, line].filter(Boolean).join(" ");
+      current.body = [current.body, normalizeBodyLine(line)].filter(Boolean).join(" ");
     }
   }
 
@@ -328,6 +352,10 @@ function normalizeSectionText(value: string): string {
 
 function normalizeDisplayText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function normalizeBodyLine(value: string): string {
+  return normalizeDisplayText(value.replace(/^[-*]\s+/, ""));
 }
 
 function isCompactLabel(value: string): boolean {
