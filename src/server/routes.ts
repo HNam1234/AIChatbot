@@ -2246,7 +2246,7 @@ export async function answerFromCachedTrees(
     strongSignals: routed.debug.strongSignals ?? [],
     contradictions: routed.debug.contradictions ?? [],
     answer,
-    selectedPrimary: routed.selectedPrimary,
+    selectedPrimary: withPdfCitationLinks(routed.selectedPrimary),
     documentSummary: routed.documentSummary,
     scope: scopeSnapshot(scope, documents.map((document) => document.document)),
     docIds: [],
@@ -2262,11 +2262,11 @@ export async function answerFromCachedTrees(
       bm25FallbackUsed: retrieval.bm25FallbackUsed,
       pageIndexResultCount: retrieval.pageIndexResultCount,
       contrastTerms: retrieval.contrastTerms,
-      selectedSection: routed.selectedPrimary,
+      selectedSection: withPdfCitationLinks(routed.selectedPrimary),
       finalHsCodes,
       answerRepairApplied
     },
-    citations: routed.citations,
+    citations: withPdfCitationLinksList(routed.citations),
     retrievedSections: topHits.slice(0, 5).map(publicSectionCitation),
     metadataWarnings: hits[0].metadataWarnings,
     answerGeneration: finalAnswerGeneration,
@@ -2823,7 +2823,7 @@ function finalizeRoutedAnswer(
     strongSignals: routed.debug.strongSignals ?? [],
     contradictions: routed.debug.contradictions ?? [],
     answer: sanitizeFinalAnswer(routed.answer),
-    selectedPrimary: routed.selectedPrimary,
+    selectedPrimary: withPdfCitationLinks(routed.selectedPrimary),
     documentSummary: routed.documentSummary,
     scope: responseScope,
     docIds: [],
@@ -2839,11 +2839,11 @@ function finalizeRoutedAnswer(
       bm25FallbackUsed: options.retrieval?.bm25FallbackUsed ?? false,
       pageIndexResultCount: options.retrieval?.pageIndexResultCount ?? 0,
       contrastTerms: options.retrieval?.contrastTerms ?? [],
-      selectedSection: routed.selectedPrimary,
+      selectedSection: withPdfCitationLinks(routed.selectedPrimary),
       finalHsCodes,
       answerRepairApplied: false
     },
-    citations: routed.citations,
+    citations: withPdfCitationLinksList(routed.citations),
     retrievedSections: [],
     metadataWarnings: [],
     answerGeneration,
@@ -2931,6 +2931,7 @@ function publicCachedTreeDocument(document: CachedTreeDocument): Record<string, 
     document: document.document,
     docId: document.docId ?? null,
     treePath: document.treePath,
+    pdfUrl: pdfUrlForDocument(document.document),
     status: document.pageIndexCacheStatus
   };
 }
@@ -3316,8 +3317,53 @@ function publicSectionCitation(section: EnrichedRetrievedSection): Record<string
     source: section.source ?? null,
     captions: section.captions,
     score: section.score,
-    metadataWarnings: section.metadataWarnings
+    metadataWarnings: section.metadataWarnings,
+    ...pdfLinksForCitation(section.document, section.pageStart, section.pageEnd)
   };
+}
+
+function withPdfCitationLinks<T extends Record<string, unknown> | null>(citation: T): T {
+  if (!citation) {
+    return citation;
+  }
+  return {
+    ...citation,
+    ...pdfLinksForCitation(citation.document, citation.pageStart, citation.pageEnd)
+  } as T;
+}
+
+function withPdfCitationLinksList(citations: Record<string, unknown>[]): Record<string, unknown>[] {
+  return citations.map((citation) => withPdfCitationLinks(citation));
+}
+
+function pdfLinksForCitation(documentValue: unknown, pageStartValue?: unknown, pageEndValue?: unknown): Record<string, unknown> {
+  const pdfUrl = pdfUrlForDocument(documentValue);
+  if (!pdfUrl) {
+    return {};
+  }
+  const page = citationPageNumber(pageStartValue, pageEndValue);
+  return {
+    pdfUrl,
+    ...(page ? { pdfPageUrl: `${pdfUrl}#page=${page}` } : {})
+  };
+}
+
+function pdfUrlForDocument(documentValue: unknown): string | undefined {
+  const document = stringValue(documentValue);
+  if (!document) {
+    return undefined;
+  }
+  const fileName = safeRequestedPdfName(path.basename(document));
+  return fileName ? `/api/uploads/${encodeURIComponent(fileName)}` : undefined;
+}
+
+function citationPageNumber(pageStartValue: unknown, pageEndValue?: unknown): number | undefined {
+  const pageStart = Number(pageStartValue);
+  if (Number.isFinite(pageStart) && pageStart > 0) {
+    return pageStart;
+  }
+  const pageEnd = Number(pageEndValue);
+  return Number.isFinite(pageEnd) && pageEnd > 0 ? pageEnd : undefined;
 }
 
 function createQaDebugReport(question: string, retrieval: CachedTreeRetrievalResult): Record<string, unknown> {

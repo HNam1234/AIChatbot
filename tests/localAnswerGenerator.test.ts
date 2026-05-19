@@ -96,6 +96,80 @@ describe("local answer generator", () => {
     expect(result.answer).not.toContain("Uniform size");
   });
 
+  it("answers mixed-language activeness questions from the exact requested field", () => {
+    const query = "Breeding fish co yeu cau activeness the nao?";
+    const candidate = validatedFixture({
+      document: "Chapter03.pdf",
+      hsCode: "0301.99.10",
+      title: "BREEDING FISH",
+      section: "0301.99.10 - BREEDING FISH"
+    });
+
+    const result = localAnswer(query, candidate, [
+      "Breeding fish are accompanied by certification from the competent authorities.",
+      "General requirements on appearance: Well-proportioned body, no deformity, normal fins. Activeness: Fish should be active, swift, swimming under the water in groups. Weight and size: Depends on each species and hatchery time.",
+      "This partial document outlines the classification and requirements for various breeding fish species."
+    ].join("\n"), {
+      requestedField: "activeness",
+      allowRelatedHsCode: true
+    });
+
+    expect(result.answerGeneration).toBe("extractive-field");
+    expect(result.answer).toContain("Fish should be active, swift");
+    expect(result.answer).not.toContain("Weight and size");
+    expect(result.answer).not.toContain("Mã liên quan");
+    expect(result.answer).not.toContain("HS Code");
+  });
+
+  it("answers flattened table comparisons with numeric evidence", () => {
+    const query = "Which coconut water has higher reducing sugars: mature or tender/young?";
+    const candidate = validatedFixture({
+      document: "Chapter08.pdf",
+      hsCode: "0801.19.10",
+      title: "YOUNG COCONUT",
+      section: "0801.19.10 - YOUNG COCONUT"
+    });
+    const text = [
+      "Mature Coconut Water Tender/young Coconut",
+      "Water Total solids% 5.4 6.5 Reducing sugars % 0.2 4.4 Minerals % 0.5 0.6",
+      "Table 1. Approximate Analysis of Mature and tender/young Coconut Water"
+    ].join("\n");
+
+    const result = localAnswer(query, candidate, text, {
+      allowRelatedHsCode: true
+    });
+
+    expect(result.answerGeneration).toBe("extractive-field");
+    expect(result.confidence).toBe("high");
+    expect(result.answer).toContain("Tender/young coconut water");
+    expect(result.answer).toContain("4.4%");
+    expect(result.answer).toContain("mature coconut water");
+    expect(result.answer).toContain("0.2%");
+    expect(result.answer).not.toContain("Mã liên quan");
+    expect(result.answer).not.toContain("HS Code");
+  });
+
+  it("can answer lower-value table comparisons from the same flattened row", () => {
+    const query = "Which coconut water has lower reducing sugars: mature or tender/young?";
+    const candidate = validatedFixture({
+      document: "Chapter08.pdf",
+      hsCode: "0801.19.10",
+      title: "YOUNG COCONUT",
+      section: "0801.19.10 - YOUNG COCONUT"
+    });
+
+    const result = localAnswer(query, candidate, [
+      "Mature Coconut Water Tender/young Coconut",
+      "Water Total solids% 5.4 6.5 Reducing sugars % 0.2 4.4"
+    ].join("\n"), {
+      allowRelatedHsCode: true
+    });
+
+    expect(result.answer).toContain("Mature coconut water");
+    expect(result.answer).toContain("0.2%");
+    expect(result.answer).toContain("4.4%");
+  });
+
   it("keeps safe-fallback local result low confidence", () => {
     const query = "Sample material warranty handling details?";
     const candidate = validatedFixture({

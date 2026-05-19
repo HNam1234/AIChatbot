@@ -269,6 +269,50 @@ describe("Q&A scope isolation", () => {
     expect((response.debug as { llmRerankCalled?: boolean }).llmRerankCalled).toBe(false);
   });
 
+  it("answers Chapter08 coconut water reducing sugars table comparisons without LLM QA", async () => {
+    const response = await answerFromCachedTrees("Dua tren bang so sanh nuoc dua, loai coconut water nao co reducing sugars cao hon: mature hay tender/young?", {
+      cachedTreeDocuments: ["Chapter08.pdf"],
+      geminiApiKeys: [],
+      enableLlmQa: false,
+      debug: true,
+      queryExpansionConfig: { enabled: false }
+    });
+
+    expect(response.selectedPrimary).toMatchObject({ document: "Chapter08.pdf", hsCode: "0801.19.10" });
+    expect(response.selectedPrimary).toMatchObject({
+      pdfUrl: "/api/uploads/Chapter08.pdf",
+      pdfPageUrl: expect.stringMatching(/^\/api\/uploads\/Chapter08\.pdf#page=\d+$/)
+    });
+    expect((response.citations as Array<Record<string, unknown>>)[0]).toMatchObject({
+      document: "Chapter08.pdf",
+      pdfUrl: "/api/uploads/Chapter08.pdf",
+      pdfPageUrl: expect.stringMatching(/^\/api\/uploads\/Chapter08\.pdf#page=\d+$/)
+    });
+    expect(response.answerGeneration).toBe("extractive-field");
+    expect(String(response.answer)).toContain("Tender/young coconut water");
+    expect(String(response.answer)).toContain("4.4%");
+    expect(String(response.answer)).toContain("mature coconut water");
+    expect(String(response.answer)).toContain("0.2%");
+    expect(String(response.answer)).not.toContain("HS Code");
+  });
+
+  it("answers mixed-language Chapter03 activeness field questions without leaking weight and size", async () => {
+    const response = await answerFromCachedTrees("Breeding fish co yeu cau activeness the nao?", {
+      cachedTreeDocuments: ["Chapter03.pdf"],
+      geminiApiKeys: [],
+      enableLlmQa: false,
+      debug: true,
+      queryExpansionConfig: { enabled: false }
+    });
+
+    expect(response.selectedPrimary).toMatchObject({ document: "Chapter03.pdf" });
+    expect(response.answerGeneration).toBe("extractive-field");
+    expect(String(response.answer)).toContain("Fish should be active, swift, swimming under the water in groups");
+    expect(String(response.answer)).not.toContain("Weight and size");
+    expect(String(response.answer)).not.toContain("Depends on each species");
+    expect(String(response.answer)).not.toContain("HS Code");
+  });
+
   it("accepts an injected LLM rerank only when it selects a listed candidate with confidence", async () => {
     const response = await answerFromCachedTrees("premium fragrant rice HS Code?", {
       cachedTreeDocuments: ["Chapter10.pdf"],

@@ -75,6 +75,16 @@ const debugOutputEl = document.querySelector("#debug-output");
 const chatTerminalEl = document.querySelector("#chat-terminal");
 const toggleDebugPanelButton = document.querySelector("#toggle-debug-panel");
 const collapseDebugPanelButton = document.querySelector("#collapse-debug-panel");
+const clearChatButton = document.querySelector("#clear-chat");
+const debugSidebarEl = document.querySelector("#debug-sidebar");
+const sidePanelKickerEl = document.querySelector("#side-panel-kicker");
+const sidePanelTitleEl = document.querySelector("#side-panel-title");
+const showTerminalPanelButton = document.querySelector("#show-terminal-panel");
+const showPdfPanelButton = document.querySelector("#show-pdf-panel");
+const terminalSectionEl = document.querySelector(".terminal-section");
+const debugSectionEl = document.querySelector(".debug-section");
+const pdfPanelEl = document.querySelector(".pdf-panel");
+const resultPanelEl = document.querySelector(".result-panel");
 const openMappingButton = document.querySelector("#open-mapping");
 const mappingScreen = document.querySelector("#mapping-screen");
 const mappingDocumentSelect = document.querySelector("#mapping-document");
@@ -127,6 +137,10 @@ let mappingViewportScale = 1;
 let mappingRenderToken = 0;
 let cacheStatusRequestId = 0;
 let uploadInProgress = false;
+const CHAT_HISTORY_STORAGE_KEY = "pageindex-hscode-chat-history:v1";
+const MAX_CHAT_HISTORY_MESSAGES = 80;
+let chatHistory = loadStoredChatHistory();
+let sidePanelMode = "terminal";
 let settings = {
   hasPageIndexApiKey: false,
   maskedPageIndexApiKey: null,
@@ -151,6 +165,8 @@ void loadSettings();
 void loadIndexedDocuments();
 void loadMappingDocuments();
 showSetupScreen();
+renderChatHistory();
+setSidePanelMode("terminal");
 
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => activateTab(tab.dataset.tab));
@@ -176,6 +192,21 @@ openMappingButton?.addEventListener("click", () => {
 });
 toggleDebugPanelButton?.addEventListener("click", () => setDebugPanelCollapsed(!debugPanelCollapsed));
 collapseDebugPanelButton?.addEventListener("click", () => setDebugPanelCollapsed(true));
+clearChatButton?.addEventListener("click", clearChatHistory);
+showTerminalPanelButton?.addEventListener("click", () => {
+  setDebugPanelCollapsed(false);
+  setSidePanelMode("terminal");
+});
+showPdfPanelButton?.addEventListener("click", () => {
+  setDebugPanelCollapsed(false);
+  setSidePanelMode("pdf");
+});
+answerEl?.addEventListener("click", (event) => {
+  const target = event.target instanceof Element ? event.target.closest("[data-citation-jump]") : null;
+  if (!target) return;
+  event.preventDefault();
+  openCitationInPdfPanel(target);
+});
 questionAllDocsInput.addEventListener("change", updateAgentScope);
 questionDocIdInput.addEventListener("input", updateAgentScope);
 mappingDocumentSelect?.addEventListener("change", () => {
@@ -446,21 +477,19 @@ askButton.addEventListener("click", async () => {
     ? uniqueStrings([...manualDocIds])
     : uniqueStrings([...manualDocIds, ...selectedDocIds]);
   if (!question) {
-    answerEl.className = "chat-thread warning";
-    answerEl.textContent = "Enter a question first.";
+    renderChatNotice("Enter a question first.", "warning");
+    questionInput.focus();
     return;
   }
   const canUseSelectedCachedTree = Boolean(selectedBundle?.document && selectedBundle.hasTree);
   const canUseSelectedLocalSections = Boolean(selectedBundle?.document && Array.isArray(selectedBundle.sections) && selectedBundle.sections.length > 0);
   const canUseCheckedLocalSections = questionAllDocsInput.checked && checkedLocalDocuments.length > 0;
   if (questionAllDocsInput.checked && checkedSources.length === 0 && manualDocIds.length === 0) {
-    answerEl.className = "chat-thread warning";
-    answerEl.textContent = "Select at least one processed source before asking.";
+    renderChatNotice("Select at least one processed source before asking.", "warning");
     return;
   }
   if (docIds.length === 0 && !canUseCheckedLocalSections && !questionAllDocsInput.checked && !canUseSelectedCachedTree && !canUseSelectedLocalSections) {
-    answerEl.className = "chat-thread warning";
-    answerEl.textContent = "No source is available. Add PDFs and run the pipeline before chatting.";
+    renderChatNotice("No source is available. Add PDFs and run the pipeline before chatting.", "warning");
     return;
   }
   const mixedCheckedSources = questionAllDocsInput.checked && checkedTreeDocuments.length > 0 && checkedLocalDocuments.length > 0;
@@ -481,15 +510,26 @@ askButton.addEventListener("click", async () => {
       : docIds.length > 0
         ? "selected"
         : "local-sections";
-  answerEl.className = "chat-thread muted";
-  renderDebugOutput(escapeHtml("Waiting for retrieval debug..."), true);
-  answerEl.textContent = selectedScope === "cached-tree-selected"
+  const pendingText = selectedScope === "cached-tree-selected"
     ? `Searching cached tree JSON for ${cachedTreeDocuments.length} selected source(s)...`
     : selectedScope === "local-sections"
       ? `Searching local sections for ${localSectionDocuments.length} selected source(s)...`
-    : docIds.length > 0
-      ? `Asking PageIndex Chat across ${docIds.length} document(s)...`
-      : `Searching local sections for ${selectedBundle.document}...`;
+      : docIds.length > 0
+        ? `Asking PageIndex Chat across ${docIds.length} document(s)...`
+        : `Searching local sections for ${selectedBundle.document}...`;
+  const scopeLabel = chatScopeLabel({
+    selectedScope,
+    cachedTreeDocuments,
+    localSectionDocuments,
+    docIds,
+    selectedBundle
+  });
+  appendChatMessage({ role: "user", text: question, scopeLabel });
+  const assistantMessageId = appendChatMessage({ role: "assistant", status: "pending", text: pendingText, scopeLabel });
+  questionInput.value = "";
+  askButton.disabled = true;
+  questionInput.disabled = true;
+  renderDebugOutput(escapeHtml("Waiting for retrieval debug..."), true);
   const body = {
     question,
     docIds,
@@ -505,40 +545,39 @@ askButton.addEventListener("click", async () => {
   if (geminiApiKeys.length > 0) {
     body.geminiApiKeys = geminiApiKeys;
   }
-  const response = await fetch("/api/ask", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  const payload = await response.json();
-  if (!response.ok) {
-    answerEl.className = "chat-thread warning";
-    answerEl.textContent = payload.error || "Could not get answer.";
-    renderDebugOutput(escapeHtml(payload.error || "Could not get retrieval debug."), true);
-    return;
+  try {
+    const response = await fetch("/api/ask", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      const message = payload.error || "Could not get answer.";
+      updateChatMessage(assistantMessageId, { status: "error", text: message });
+      renderDebugOutput(escapeHtml(message), true);
+      return;
+    }
+    const indexSource = payload.indexSourceDetails || (typeof payload.indexSource === "object" ? payload.indexSource : selectedIndexSource());
+    const indexSourceCode = typeof payload.indexSource === "string" ? payload.indexSource : indexSource?.source;
+    const answerScope = indexSource?.source === "pageindex-chat" || indexSourceCode === "pageindex_live"
+      ? `Scope: ${(payload.docIds || docIds).length} PageIndex document(s)`
+      : `Index source: ${formatIndexSource(indexSource, payload.retrieval)}`;
+    updateChatMessage(assistantMessageId, {
+      status: "complete",
+      text: payload.answer || "",
+      payload: compactChatPayload(payload, indexSource, answerScope)
+    });
+    renderDebugOutput(renderDebugPanel(payload.debug, indexSource, payload.retrieval, payload));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    updateChatMessage(assistantMessageId, { status: "error", text: message || "Could not get answer." });
+    renderDebugOutput(escapeHtml(message || "Could not get retrieval debug."), true);
+  } finally {
+    questionInput.disabled = false;
+    updateChatGate();
+    questionInput.focus();
   }
-  answerEl.className = "chat-thread";
-  const indexSource = payload.indexSourceDetails || (typeof payload.indexSource === "object" ? payload.indexSource : selectedIndexSource());
-  const indexSourceCode = typeof payload.indexSource === "string" ? payload.indexSource : indexSource?.source;
-  const answerScope = indexSource?.source === "pageindex-chat" || indexSourceCode === "pageindex_live"
-    ? `Scope: ${(payload.docIds || docIds).length} PageIndex document(s)`
-    : `Index source: ${formatIndexSource(indexSource, payload.retrieval)}`;
-  const retrievalStatus = renderRetrievalStatus(payload.retrieval, indexSource, payload);
-  const summaryIntent = payload.intent === "chapter_summary" || payload.intent === "document_summary";
-  const documentSummaryCard = summaryIntent ? renderDocumentSummaryCard(payload.documentSummary) : "";
-  const citationCards = summaryIntent ? "" : renderCitationCards(payload.citations || []);
-  renderDebugOutput(renderDebugPanel(payload.debug, indexSource, payload.retrieval, payload));
-  answerEl.innerHTML = `
-    <div class="answer-box">
-      <div class="answer-text">${escapeHtml(payload.answer || "")}</div>
-    </div>
-    <div class="answer-metadata">
-      ${retrievalStatus}
-      ${documentSummaryCard}
-      ${citationCards}
-      <p>${escapeHtml(answerScope)}</p>
-    </div>
-  `;
 });
 
 questionInput.addEventListener("keydown", (event) => {
@@ -857,20 +896,101 @@ function renderCitationCards(citations) {
     return "";
   }
 
-  return `<div class="citation-cards">${citations.map((citation, index) => `
+  const citationIndex = `
+    <div class="citation-index" aria-label="Citation links">
+      <span>PDF citations</span>
+      ${citations.map((citation, index) => renderCitationJumpLink(citation, index + 1)).join("")}
+    </div>
+  `;
+
+  return `<div class="citation-cards">${citationIndex}${citations.map((citation, index) => `
     <div class="citation-card">
-      <strong>${index === 0 ? "Product citation" : "Scoped related match"}</strong>
+      <strong>${renderCitationJumpLink(citation, index + 1)} <span>${index === 0 ? "Product citation" : "Scoped related match"}</span></strong>
       <dl>
         <dt>HS Code</dt><dd>${escapeHtml(citation.hsCode || "n/a")}</dd>
         <dt>Grouped</dt><dd>${escapeHtml(Array.isArray(citation.groupedHsCodes) && citation.groupedHsCodes.length > 0 ? citation.groupedHsCodes.join(", ") : "n/a")}</dd>
         <dt>Title</dt><dd>${escapeHtml(citation.title || "n/a")}</dd>
         <dt>Document</dt><dd>${escapeHtml(citation.document || "n/a")}</dd>
-        <dt>Page</dt><dd>${escapeHtml(formatCitationPage(citation.pageStart, citation.pageEnd))}</dd>
+        <dt>Page</dt><dd>${renderCitationPageJumpLink(citation, index + 1)}</dd>
         <dt>Section</dt><dd>${escapeHtml(citation.section || "n/a")}</dd>
         <dt>Source</dt><dd>${escapeHtml(citation.source || "n/a")}</dd>
       </dl>
     </div>
   `).join("")}</div>`;
+}
+
+function renderCitationJumpLink(citation, number) {
+  const pdfUrl = citationPdfUrl(citation);
+  const page = citationPageNumber(citation);
+  const pdfPageUrl = citationPdfPageUrl(citation);
+  if (!pdfUrl && !pdfPageUrl) {
+    return `<span class="citation-number disabled">[${number}]</span>`;
+  }
+  return `<a class="citation-number" href="${escapeHtml(pdfPageUrl || pdfUrl)}" data-citation-jump="true" data-pdf-url="${escapeHtml(pdfUrl)}" data-pdf-page-url="${escapeHtml(pdfPageUrl)}" data-pdf-page="${page ? escapeHtml(String(page)) : ""}" title="Open citation ${number} in the side PDF panel">[${number}]</a>`;
+}
+
+function renderCitationPageJumpLink(citation, number) {
+  const pageLabel = formatCitationPage(citation?.pageStart, citation?.pageEnd);
+  const jump = renderCitationJumpLink(citation, number);
+  return `${jump} <span>${escapeHtml(pageLabel)}</span>`;
+}
+
+function renderCitationDocumentLink(citation) {
+  const document = citation?.document || "n/a";
+  const pdfUrl = citationPdfUrl(citation);
+  if (!pdfUrl) {
+    return escapeHtml(document);
+  }
+  return `<a href="${escapeHtml(pdfUrl)}" target="_blank" rel="noreferrer">${escapeHtml(document)}</a>`;
+}
+
+function renderCitationPageLink(citation) {
+  const label = formatCitationPage(citation?.pageStart, citation?.pageEnd);
+  const pdfPageUrl = citationPdfPageUrl(citation);
+  if (!pdfPageUrl) {
+    return escapeHtml(label);
+  }
+  return `<a href="${escapeHtml(pdfPageUrl)}" target="_blank" rel="noreferrer">${escapeHtml(label)}</a>`;
+}
+
+function citationPdfUrl(citation) {
+  const explicitUrl = typeof citation?.pdfUrl === "string" ? citation.pdfUrl : "";
+  if (explicitUrl) {
+    return explicitUrl;
+  }
+  const document = typeof citation?.document === "string" ? citation.document : "";
+  if (!/^[^\\/]+\.pdf$/i.test(document)) {
+    return "";
+  }
+  return `/api/uploads/${encodeURIComponent(document)}`;
+}
+
+function citationPdfPageUrl(citation) {
+  const explicitUrl = typeof citation?.pdfPageUrl === "string" ? citation.pdfPageUrl : "";
+  if (explicitUrl) {
+    return explicitUrl;
+  }
+  const pdfUrl = citationPdfUrl(citation);
+  if (!pdfUrl) {
+    return "";
+  }
+  const pageStart = Number(citation?.pageStart);
+  const pageEnd = Number(citation?.pageEnd);
+  const page = Number.isFinite(pageStart) && pageStart > 0
+    ? pageStart
+    : Number.isFinite(pageEnd) && pageEnd > 0
+      ? pageEnd
+      : null;
+  return page ? `${pdfUrl}#page=${page}` : "";
+}
+
+function citationPageNumber(citation) {
+  const pageStart = Number(citation?.pageStart);
+  if (Number.isFinite(pageStart) && pageStart > 0) {
+    return pageStart;
+  }
+  const pageEnd = Number(citation?.pageEnd);
+  return Number.isFinite(pageEnd) && pageEnd > 0 ? pageEnd : null;
 }
 
 function renderDocumentSummaryCard(summary) {
@@ -926,6 +1046,173 @@ function renderRetrievalStatus(retrieval, indexSource, payload = {}) {
       ${documentDetails}
     </div>
   `;
+}
+
+function appendChatMessage(message) {
+  const nextMessage = {
+    id: message.id || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    createdAt: message.createdAt || new Date().toISOString(),
+    status: message.status || "complete",
+    ...message
+  };
+  chatHistory = [...chatHistory, nextMessage].slice(-MAX_CHAT_HISTORY_MESSAGES);
+  saveChatHistory();
+  renderChatHistory();
+  return nextMessage.id;
+}
+
+function updateChatMessage(id, patch) {
+  chatHistory = chatHistory.map((message) => message.id === id ? { ...message, ...patch, updatedAt: new Date().toISOString() } : message);
+  saveChatHistory();
+  renderChatHistory();
+}
+
+function clearChatHistory() {
+  chatHistory = [];
+  saveChatHistory();
+  renderChatHistory();
+  renderDebugOutput(escapeHtml("Ask a question, then inspect retrieval candidates here."), true);
+}
+
+function renderChatHistory(notice) {
+  if (!answerEl) return;
+  if (chatHistory.length === 0) {
+    answerEl.className = notice?.tone === "warning" ? "chat-thread warning" : "chat-thread muted";
+    answerEl.innerHTML = `<div class="chat-empty">${escapeHtml(notice?.text || "Ask a question about the selected document, all cached trees, or local sections.")}</div>`;
+    return;
+  }
+
+  answerEl.className = "chat-thread";
+  answerEl.innerHTML = `
+    ${chatHistory.map(renderChatMessage).join("")}
+    ${notice?.text ? `<div class="chat-notice ${notice.tone === "warning" ? "warning" : ""}">${escapeHtml(notice.text)}</div>` : ""}
+  `;
+  answerEl.scrollTop = answerEl.scrollHeight;
+}
+
+function renderChatNotice(text, tone = "muted") {
+  renderChatHistory({ text, tone });
+}
+
+function renderChatMessage(message) {
+  const role = message.role === "user" ? "user" : "assistant";
+  const statusClass = message.status === "pending" ? "pending" : message.status === "error" ? "error" : "";
+  const label = role === "user" ? "You" : "Assistant";
+  const time = formatChatTime(message.createdAt);
+  const meta = [time, message.scopeLabel].filter(Boolean).join(" · ");
+  const content = role === "user" ? renderUserMessage(message) : renderAssistantMessage(message);
+  return `
+    <article class="chat-message ${role} ${statusClass}">
+      <div class="chat-bubble">
+        <div class="chat-message-label">
+          <span>${escapeHtml(label)}</span>
+          ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
+        </div>
+        ${content}
+      </div>
+    </article>
+  `;
+}
+
+function renderUserMessage(message) {
+  return `<div class="chat-message-text">${escapeHtml(message.text || "")}</div>`;
+}
+
+function renderAssistantMessage(message) {
+  if (message.status === "pending") {
+    return `<div class="chat-message-text chat-pending">${escapeHtml(message.text || "Thinking...")}</div>`;
+  }
+  if (message.status === "error") {
+    return `<div class="chat-message-text">${escapeHtml(message.text || "Could not get answer.")}</div>`;
+  }
+
+  const payload = message.payload || {};
+  const indexSource = payload.indexSourceDetails || (typeof payload.indexSource === "object" ? payload.indexSource : null);
+  const summaryIntent = payload.intent === "chapter_summary" || payload.intent === "document_summary";
+  const documentSummaryCard = summaryIntent ? renderDocumentSummaryCard(payload.documentSummary) : "";
+  const citationCards = summaryIntent ? "" : renderCitationCards(payload.citations || []);
+  const retrievalStatus = renderRetrievalStatus(payload.retrieval, indexSource, payload);
+  const answerScope = payload.answerScope || message.scopeLabel || "";
+  return `
+    <div class="answer-text">${escapeHtml(message.text || payload.answer || "")}</div>
+    <div class="answer-metadata">
+      ${retrievalStatus}
+      ${documentSummaryCard}
+      ${citationCards}
+      ${answerScope ? `<p>${escapeHtml(answerScope)}</p>` : ""}
+    </div>
+  `;
+}
+
+function compactChatPayload(payload, indexSource, answerScope) {
+  return {
+    answer: payload.answer || "",
+    intent: payload.intent || null,
+    answerConfidence: payload.answerConfidence || null,
+    answerGeneration: payload.answerGeneration || null,
+    indexSource: payload.indexSource || null,
+    indexSourceDetails: indexSource || null,
+    retrieval: payload.retrieval || null,
+    citations: Array.isArray(payload.citations) ? payload.citations.slice(0, 8) : [],
+    documentSummary: payload.documentSummary || null,
+    docIds: Array.isArray(payload.docIds) ? payload.docIds : [],
+    cachedDocumentCount: payload.cachedDocumentCount ?? null,
+    cacheFreshness: payload.cacheFreshness || null,
+    pageIndexUploadStatus: payload.pageIndexUploadStatus || null,
+    answerScope
+  };
+}
+
+function loadStoredChatHistory() {
+  try {
+    const raw = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed
+      .filter((message) => message && (message.role === "user" || message.role === "assistant"))
+      .map((message) => message.status === "pending"
+        ? { ...message, status: "error", text: "Request interrupted before an answer was saved." }
+        : message)
+      .slice(-MAX_CHAT_HISTORY_MESSAGES);
+  } catch {
+    return [];
+  }
+}
+
+function saveChatHistory() {
+  try {
+    localStorage.setItem(CHAT_HISTORY_STORAGE_KEY, JSON.stringify(chatHistory.slice(-MAX_CHAT_HISTORY_MESSAGES)));
+  } catch {
+    // Keep the in-memory transcript even if the browser refuses storage.
+  }
+}
+
+function chatScopeLabel({ selectedScope, cachedTreeDocuments, localSectionDocuments, docIds, selectedBundle }) {
+  if (selectedScope === "cached-tree-selected") {
+    return `${cachedTreeDocuments.length} cached tree source(s)`;
+  }
+  if (selectedScope === "local-sections") {
+    return `${localSectionDocuments.length || 1} local section source(s)`;
+  }
+  if (docIds.length > 0) {
+    return `${docIds.length} PageIndex document(s)`;
+  }
+  return selectedBundle?.document || "selected source";
+}
+
+function formatChatTime(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) {
+    return "";
+  }
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
 }
 
 function renderDebugPanel(debug, indexSource, retrieval, payload = {}) {
@@ -995,8 +1282,8 @@ function renderDebugSelected(selected) {
       <dl>
         <dt>HS Code</dt><dd>${escapeHtml(selected.hsCode || groupedCodesText(selected.groupedHsCodes) || "n/a")}</dd>
         <dt>Title</dt><dd>${escapeHtml(selected.title || "n/a")}</dd>
-        <dt>Document</dt><dd>${escapeHtml(selected.document || "n/a")}</dd>
-        <dt>Page</dt><dd>${escapeHtml(formatCitationPage(selected.pageStart, selected.pageEnd))}</dd>
+        <dt>Document</dt><dd>${renderCitationDocumentLink(selected)}</dd>
+        <dt>Page</dt><dd>${renderCitationPageLink(selected)}</dd>
         <dt>Section</dt><dd>${escapeHtml(selected.section || "n/a")}</dd>
         <dt>Source</dt><dd>${escapeHtml(selected.source || "n/a")}</dd>
       </dl>
@@ -1049,8 +1336,7 @@ function resetResult() {
   logsEl.textContent = "";
   if (chatTerminalEl) chatTerminalEl.textContent = "No runtime logs yet.";
   clientLogs = [];
-  answerEl.className = "chat-thread muted";
-  answerEl.textContent = "Ask a question about the selected document, all cached trees, or local sections.";
+  renderChatHistory();
   renderDebugOutput(escapeHtml("Ask a question, then inspect retrieval candidates here."), true);
   markdownEl.textContent = "No Markdown yet.";
   markdownEl.className = "markdown muted";
@@ -1308,6 +1594,7 @@ function showChatScreen() {
   openMappingButton?.classList.remove("hidden");
   if (screenSubtitleEl) screenSubtitleEl.textContent = "Ask across selected parsed sources. Use the back arrow to edit the dataset.";
   renderQuerySourceList();
+  renderChatHistory();
   updateAgentScope();
 }
 
@@ -1331,11 +1618,60 @@ function setDebugPanelCollapsed(collapsed) {
   debugPanelCollapsed = collapsed;
   chatScreen?.classList.toggle("debug-collapsed", collapsed);
   if (toggleDebugPanelButton) {
-    toggleDebugPanelButton.textContent = collapsed ? "Show terminal" : "Hide terminal";
+    toggleDebugPanelButton.textContent = collapsed ? "Show side panel" : "Hide side panel";
   }
   if (collapseDebugPanelButton) {
     collapseDebugPanelButton.textContent = collapsed ? "Collapsed" : "Collapse";
   }
+}
+
+function setSidePanelMode(mode) {
+  sidePanelMode = mode === "pdf" ? "pdf" : "terminal";
+  const isPdf = sidePanelMode === "pdf";
+  debugSidebarEl?.classList.toggle("pdf-mode", isPdf);
+  debugSidebarEl?.classList.toggle("terminal-mode", !isPdf);
+  terminalSectionEl?.classList.toggle("hidden", isPdf);
+  debugSectionEl?.classList.toggle("hidden", isPdf);
+  resultPanelEl?.classList.toggle("hidden", isPdf);
+  pdfPanelEl?.classList.toggle("hidden", !isPdf);
+  showTerminalPanelButton?.classList.toggle("active", !isPdf);
+  showPdfPanelButton?.classList.toggle("active", isPdf);
+  if (sidePanelKickerEl) sidePanelKickerEl.textContent = isPdf ? "PDF" : "Terminal";
+  if (sidePanelTitleEl) sidePanelTitleEl.textContent = isPdf ? "Source Preview" : "Debug Retrieval";
+  if (isPdf && currentPdfUrl && !pdfFrame.src) {
+    setPdfPage(currentPage || 1);
+  }
+}
+
+function openCitationInPdfPanel(target) {
+  const pdfPageUrl = target.dataset.pdfPageUrl || "";
+  const pdfUrl = target.dataset.pdfUrl || pdfPageUrl.split("#")[0] || "";
+  if (!pdfUrl) {
+    return;
+  }
+  const pageFromDataset = Number(target.dataset.pdfPage);
+  const pageFromUrl = pageNumberFromPdfUrl(pdfPageUrl);
+  const page = Number.isFinite(pageFromDataset) && pageFromDataset > 0
+    ? pageFromDataset
+    : pageFromUrl;
+  currentPdfUrl = pdfUrl.split("#")[0];
+  currentPage = page || 1;
+  pageNumberInput.value = String(currentPage);
+  const targetUrl = page ? `${currentPdfUrl}#page=${page}` : (pdfPageUrl || currentPdfUrl);
+  pdfFrame.src = targetUrl;
+  openPageLink.href = targetUrl;
+  setDebugPanelCollapsed(false);
+  setSidePanelMode("pdf");
+  pdfPanelEl?.scrollIntoView({ block: "nearest" });
+}
+
+function pageNumberFromPdfUrl(url) {
+  const match = /[#&?]page=(\d+)/i.exec(url || "");
+  if (!match) {
+    return null;
+  }
+  const page = Number(match[1]);
+  return Number.isFinite(page) && page > 0 ? page : null;
 }
 
 function hasProcessedSources() {

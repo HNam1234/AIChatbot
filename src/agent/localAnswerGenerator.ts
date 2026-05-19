@@ -5,7 +5,7 @@ import {
   type QuerySignals,
   type ValidatedCandidate
 } from "./qaAnswerFormatter";
-import { FIELD_SYNONYM_GROUPS, canonicalRequestedFieldFromText, normalizeFieldText } from "./fieldExtractor";
+import { FIELD_SYNONYM_GROUPS, canonicalRequestedFieldFromText, extractRequestedField, normalizeFieldText } from "./fieldExtractor";
 
 export type LocalAnswerResult = {
   answer: string | null;
@@ -32,6 +32,17 @@ interface AnswerBlock {
   heading: string;
   text: string;
   type: "heading" | "bullet" | "paragraph" | "table" | "caption";
+}
+
+interface TableComparisonAnswer {
+  answer: string;
+  confidence: "high" | "medium";
+  reason: string;
+}
+
+interface ParsedTableRow {
+  label: string;
+  values: Array<{ column: string; value: number; rawValue: string }>;
 }
 
 const DEFAULT_MAX_ANSWER_CHARS = 420;
@@ -93,6 +104,38 @@ export function generateLocalAnswer(args: {
   if (!requestedField && !hasGeneralEvidenceSignal(originalQuery, querySignals)) {
     return nullAnswer("safe-fallback", "local_extractor_no_requested_field");
   }
+  const tableComparison = tryTableComparisonAnswer(originalQuery, selectedSectionText, querySignals);
+  if (tableComparison) {
+    return {
+      answer: tableComparison.answer,
+      answerGeneration: "extractive-field",
+      confidence: tableComparison.confidence,
+      reason: tableComparison.reason
+    };
+  }
+  if (requestedField) {
+    const extracted = extractRequestedField(selectedSectionText, requestedField);
+    const extractedAnswer = cleanAnswerText(extracted.extractedText, maxChars);
+    const normalizedExtracted = normalizeForLocal(extractedAnswer);
+    const normalizedField = normalizeForLocal(requestedField);
+    const normalizedHeading = normalizeForLocal(extracted.matchedHeading ?? "");
+    if (
+      extractedAnswer &&
+      extracted.confidence !== "low" &&
+      normalizedExtracted !== normalizedField &&
+      normalizedExtracted !== normalizedHeading
+    ) {
+      const fieldAnswer = extracted.matchedHeading && !normalizeForLocal(extractedAnswer).startsWith(normalizedHeading)
+        ? `${extracted.matchedHeading}: ${extractedAnswer}`
+        : extractedAnswer;
+      return {
+        answer: ensureSentence(fieldAnswer),
+        answerGeneration: "extractive-field",
+        confidence: extracted.confidence,
+        reason: `matched requested field '${requestedField}'${extracted.matchedHeading ? ` under '${extracted.matchedHeading}'` : ""}`
+      };
+    }
+  }
   const blocks = segmentAnswerBlocks(selectedSectionText);
   const best = bestScoredBlock(blocks, originalQuery, querySignals, requestedField);
   if (!best || best.score < 3.2) {
@@ -101,7 +144,9 @@ export function generateLocalAnswer(args: {
 
   const confidence = best.score >= 6 ? "high" : "medium";
   let answer = focusedAnswerText(best.block, originalQuery, querySignals, requestedField, maxChars);
-  answer = maybeAppendRelatedCode(answer, selectedCandidate, answerPolicy, confidence);
+  if (asksForHsCodeOrClassification(originalQuery)) {
+    answer = maybeAppendRelatedCode(answer, selectedCandidate, answerPolicy, confidence);
+  }
   return {
     answer,
     answerGeneration: "extractive-field",
@@ -244,6 +289,248 @@ function hasGeneralEvidenceSignal(query: string, querySignals: QuerySignals): bo
     /\b(so\s+sanh|khac|phan\s+biet|hon|it\s+hon|nhieu\s+hon)\b/.test(normalized);
 }
 
+function tryTableComparisonAnswer(
+  query: string,
+  sectionText: string,
+  querySignals: QuerySignals
+): TableComparisonAnswer | null {
+  const direction = tableComparisonDirection(query);
+  if (!direction) {
+    return null;
+  }
+
+  const rows = parseTableRows(sectionText, query);
+  if (rows.length === 0) {
+    return null;
+  }
+
+  const row = selectMetricRow(rows, query, querySignals);
+  if (!row || row.values.length < 2) {
+    return null;
+  }
+
+  const comparedValues = selectComparedValues(row.values, query);
+  if (comparedValues.length < 2) {
+    return null;
+  }
+
+  const sorted = [...comparedValues].sort((left, right) =>
+    direction === "higher" ? right.value - left.value : left.value - right.value
+  );
+  const selected = sorted[0];
+  const baseline = sorted.find((value) => value.column !== selected.column) ?? sorted[1];
+  if (!selected || !baseline) {
+    return null;
+  }
+  if (Math.abs(selected.value - baseline.value) < 0.000001) {
+    const metric = formatMetricLabel(row.label);
+    return {
+    answer: `${formatColumnLabel(selected.column, true)} và ${formatColumnLabel(baseline.column)} có ${metric} bằng nhau: ${formatTableValue(selected.rawValue, row.label)}.`,
+      confidence: "medium",
+      reason: `matched table row '${row.label}'`
+    };
+  }
+
+  const metric = formatMetricLabel(row.label);
+  const relation = direction === "higher" ? "cao hơn" : "thấp hơn";
+  return {
+    answer: `${formatColumnLabel(selected.column, true)} có ${metric} ${relation}: ${formatTableValue(selected.rawValue, row.label)} so với ${formatColumnLabel(baseline.column)} ${formatTableValue(baseline.rawValue, row.label)}.`,
+    confidence: "high",
+    reason: `matched table row '${row.label}'`
+  };
+}
+
+function tableComparisonDirection(query: string): "higher" | "lower" | null {
+  const normalized = normalizeForLocal(query);
+  if (/\b(higher|more|greater|larger|cao\s+hon|nhieu\s+hon)\b/.test(normalized)) {
+    return "higher";
+  }
+  if (/\b(lower|less|smaller|thap\s+hon|it\s+hon)\b/.test(normalized)) {
+    return "lower";
+  }
+  return null;
+}
+
+function parseTableRows(sectionText: string, query: string): ParsedTableRow[] {
+  return uniqueTableRows([
+    ...parseMarkdownTableRows(sectionText),
+    ...parseFlattenedNumericRows(sectionText, query)
+  ]);
+}
+
+function parseMarkdownTableRows(sectionText: string): ParsedTableRow[] {
+  const rows: ParsedTableRow[] = [];
+  const lines = sectionText.split(/\n+/g).map((line) => line.trim()).filter((line) => line.includes("|"));
+  for (let index = 0; index < lines.length; index += 1) {
+    const header = parseMarkdownTableLine(lines[index]);
+    const separator = parseMarkdownTableLine(lines[index + 1] ?? "");
+    if (header.length < 3 || !separator.some((cell) => /^:?-{2,}:?$/.test(cell))) {
+      continue;
+    }
+    const columns = header.slice(1).map(normalizeColumnLabel).filter(Boolean);
+    for (let rowIndex = index + 2; rowIndex < lines.length; rowIndex += 1) {
+      const cells = parseMarkdownTableLine(lines[rowIndex]);
+      if (cells.length < 3) {
+        break;
+      }
+      const label = normalizeTableLabel(cells[0]);
+      const values = cells.slice(1).map((cell, valueIndex) => {
+        const rawValue = numericText(cell);
+        return rawValue && columns[valueIndex]
+          ? { column: columns[valueIndex], value: Number(rawValue), rawValue }
+          : null;
+      }).filter((value): value is ParsedTableRow["values"][number] => Boolean(value));
+      if (label && values.length >= 2) {
+        rows.push({ label, values });
+      }
+    }
+  }
+  return rows;
+}
+
+function parseMarkdownTableLine(line: string): string[] {
+  return line
+    .replace(/^\s*\|/, "")
+    .replace(/\|\s*$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function parseFlattenedNumericRows(sectionText: string, query: string): ParsedTableRow[] {
+  const columns = inferComparisonColumns(sectionText, query);
+  if (columns.length < 2) {
+    return [];
+  }
+  const compact = normalizeSectionText(sectionText)
+    .replace(/[|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const rows: ParsedTableRow[] = [];
+  const rowPattern = /([A-Za-z][A-Za-z /()%.-]{0,90}?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)(?=\s+[A-Za-z]|$)/g;
+  for (const match of compact.matchAll(rowPattern)) {
+    const label = normalizeTableLabel(match[1] ?? "");
+    const first = match[2] ?? "";
+    const second = match[3] ?? "";
+    if (!label || !first || !second || labelLooksLikeHeaderOnly(label)) {
+      continue;
+    }
+    rows.push({
+      label,
+      values: [
+        { column: columns[0], value: Number(first), rawValue: first },
+        { column: columns[1], value: Number(second), rawValue: second }
+      ]
+    });
+  }
+  return rows;
+}
+
+function inferComparisonColumns(sectionText: string, query: string): string[] {
+  const normalized = normalizeForLocal(`${query} ${sectionText}`);
+  const hasMature = /\bmature\b/.test(normalized);
+  const hasTenderYoung = /\btender\s*\/\s*young\b|\btender\b|\byoung\b/.test(normalized);
+  if (hasMature && hasTenderYoung) {
+    const suffix = /\bcoconut\s+water\b/.test(normalized) ? " coconut water" : "";
+    return [`mature${suffix}`, `tender/young${suffix}`];
+  }
+  return [];
+}
+
+function selectMetricRow(rows: ParsedTableRow[], query: string, querySignals: QuerySignals): ParsedTableRow | null {
+  const normalizedQuery = normalizeForLocal(query);
+  const queryTokens = new Set(meaningfulLocalTokens(query));
+  const phraseSignals = uniqueStrings([
+    ...querySignals.queryPhrases,
+    ...querySignals.productTerms,
+    ...querySignals.physicalAttributes,
+    ...querySignals.domainTerms
+  ].map(normalizeForLocal).filter((value) => value.length >= 4));
+  const scored = rows.map((row, index) => {
+    const normalizedLabel = normalizeForLocal(row.label);
+    const labelTokens = meaningfulLocalTokens(row.label);
+    let score = 0;
+    if (normalizedQuery.includes(normalizedLabel)) {
+      score += 6;
+    }
+    for (const phrase of phraseSignals) {
+      if (phrase && (normalizedLabel.includes(phrase) || phrase.includes(normalizedLabel))) {
+        score += 4;
+      }
+    }
+    score += labelTokens.filter((token) => queryTokens.has(token)).length * 2;
+    return { row, score, index };
+  }).filter((item) => item.score >= 2);
+
+  return scored.sort((left, right) => right.score - left.score || left.index - right.index)[0]?.row ?? null;
+}
+
+function selectComparedValues(
+  values: ParsedTableRow["values"],
+  query: string
+): ParsedTableRow["values"] {
+  const normalizedQuery = normalizeForLocal(query);
+  const mentioned = values.filter((value) => {
+    const column = normalizeForLocal(value.column);
+    return column.split(/\s+|\//g).filter((token) => token.length >= 3).some((token) => normalizedQuery.includes(token));
+  });
+  return mentioned.length >= 2 ? mentioned : values;
+}
+
+function uniqueTableRows(rows: ParsedTableRow[]): ParsedTableRow[] {
+  const byKey = new Map<string, ParsedTableRow>();
+  for (const row of rows) {
+    const key = normalizeForLocal(row.label);
+    if (!byKey.has(key)) {
+      byKey.set(key, row);
+    }
+  }
+  return [...byKey.values()];
+}
+
+function labelLooksLikeHeaderOnly(label: string): boolean {
+  const normalized = normalizeForLocal(label);
+  return normalized === "water" || normalized.endsWith(" coconut water") || normalized.includes("table ");
+}
+
+function normalizeTableLabel(value: string): string {
+  return value
+    .replace(/\b(?:mature\s+coconut\s+water|tender\/young\s+coconut(?:\s+water)?|water)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeColumnLabel(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function numericText(value: string): string | null {
+  return value.match(/-?\d+(?:\.\d+)?/)?.[0] ?? null;
+}
+
+function formatMetricLabel(label: string): string {
+  return label
+    .replace(/\s*(?:mg\s*)?%/gi, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function formatColumnLabel(label: string, sentenceStart = false): string {
+  const normalized = label.replace(/\s+/g, " ").trim().toLowerCase();
+  return sentenceStart && normalized ? `${normalized.charAt(0).toUpperCase()}${normalized.slice(1)}` : normalized;
+}
+
+function formatTableValue(value: string, label: string): string {
+  const raw = value.trim();
+  if (/mg\s*%/i.test(label)) {
+    return `${raw} mg%`;
+  }
+  if (/%/.test(label)) {
+    return `${raw}%`;
+  }
+  return raw;
+}
+
 function scoreBlock(block: AnswerBlock, query: string, querySignals: QuerySignals, requestedField: string | null): number {
   const blockText = normalizeForLocal(`${block.heading} ${block.text}`);
   const blockTokens = new Set(meaningfulLocalTokens(blockText));
@@ -279,6 +566,8 @@ function scoreBlock(block: AnswerBlock, query: string, querySignals: QuerySignal
     score += fieldScore * 5;
     if (block.heading && fieldOverlapScore(field, block.heading) > 0) {
       score += 1.5;
+    } else if (block.heading) {
+      score -= 1.5;
     }
   }
   const missingDistinctiveTokens = queryTokens.filter((token) => isDistinctiveToken(token) && !tokenMatchesLocal(blockTokens, token));
@@ -404,6 +693,7 @@ function cleanAnswerText(value: string, maxChars = DEFAULT_MAX_ANSWER_CHARS): st
     .replace(/^#{1,6}\s+/gm, "")
     .replace(/\bGrouped HS code set:\s*[\s\S]*?(?=\bShared description:|\n|$)/gi, " ")
     .replace(/\bShared description:\s*/gi, " ")
+    .replace(/[•▪◦\uf0b7]/g, " ")
     .replace(/^\s*(?:Source|Citation|Page|Image|Picture|Caption):.*$/gim, " ")
     .replace(/^\s*\(?Source:[^)]+\)?\s*$/gim, " ")
     .replace(/^\s*\d{4}\.\d{2}\.\d{2}\s*[-—–].*$/gm, " ")

@@ -48,6 +48,19 @@ describe("fieldExtractor", () => {
     expect(result.extractedText).not.toContain("Uniform lot size");
   });
 
+  it("splits inline field labels even when the section text already has newlines", () => {
+    const result = extractRequestedField([
+      "## CHAPTER 3",
+      "Breeding fish are accompanied by certification from the competent authorities.",
+      "General requirements on appearance: Well-proportioned body and normal fins. Activeness: Fish should be active, swift, swimming under the water in groups. Weight and size: Depends on each species and hatchery time."
+    ].join("\n"), "activeness");
+
+    expect(result.confidence).toBe("high");
+    expect(result.matchedHeading).toBe("Activeness");
+    expect(result.extractedText).toContain("active, swift");
+    expect(result.extractedText).not.toContain("Weight and size");
+  });
+
   it("extracts weight and size by heading", () => {
     const result = extractRequestedField(sectionText, "trọng lượng và kích thước");
 

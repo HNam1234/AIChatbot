@@ -218,6 +218,26 @@ p {
   padding: 14px 16px 10px;
 }
 
+.chat-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.panel-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.panel-toggle button.active {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+
 .compact-heading {
   padding-bottom: 8px;
 }
@@ -759,6 +779,9 @@ button.compact {
 }
 
 .chat-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
   min-width: 0;
   min-height: 0;
   overflow: auto;
@@ -766,6 +789,102 @@ button.compact {
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0), rgba(247, 249, 252, 0.78)),
     #fff;
+}
+
+.chat-empty,
+.chat-notice {
+  align-self: center;
+  width: min(100%, 720px);
+  border: 1px dashed var(--line-strong);
+  border-radius: 14px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  padding: 14px;
+  font-size: 13px;
+  text-align: center;
+}
+
+.chat-notice.warning {
+  border-style: solid;
+  border-color: #ecc970;
+  background: #fff8df;
+  color: #664500;
+}
+
+.chat-message {
+  display: flex;
+  width: 100%;
+}
+
+.chat-message.user {
+  justify-content: flex-end;
+}
+
+.chat-message.assistant {
+  justify-content: flex-start;
+}
+
+.chat-bubble {
+  max-width: min(820px, 88%);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #fff;
+  padding: 12px 14px;
+  box-shadow: 0 6px 18px rgba(39, 52, 68, 0.05);
+}
+
+.chat-message.user .chat-bubble {
+  max-width: min(640px, 82%);
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+
+.chat-message.error .chat-bubble {
+  border-color: #ecc970;
+  background: #fff8df;
+  color: #664500;
+}
+
+.chat-message-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.chat-message-label small {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  overflow-wrap: anywhere;
+}
+
+.chat-message.user .chat-message-label small {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.chat-message-text,
+.answer-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-message.pending .chat-message-text::after {
+  content: "";
+  display: inline-block;
+  width: 0.9em;
+  height: 0.9em;
+  margin-left: 8px;
+  border: 2px solid var(--line-strong);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  vertical-align: -0.12em;
+  animation: spin 0.9s linear infinite;
 }
 
 .chat-thread.warning {
@@ -826,14 +945,29 @@ button.compact {
   white-space: pre-wrap;
 }
 
+.answer-metadata {
+  margin-top: 10px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .debug-sidebar {
   display: grid;
   grid-template-rows: auto minmax(140px, 0.42fr) minmax(260px, 1fr) auto;
   gap: 12px;
 }
 
+.debug-sidebar.pdf-mode {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
 .terminal-section,
-.debug-section {
+.debug-section,
+.pdf-panel {
   min-height: 0;
 }
 
@@ -1215,6 +1349,15 @@ button.compact {
   background: #e7edf2;
 }
 
+.pdf-panel {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.debug-sidebar.pdf-mode #pdf-frame {
+  height: 100%;
+  min-height: 560px;
+}
+
 #open-page {
   display: inline-flex;
   width: fit-content;
@@ -1508,6 +1651,61 @@ figcaption {
 .citation-card dd {
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+.citation-index {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 10px;
+  background: var(--surface-soft);
+  padding: 8px;
+  font-size: 12px;
+}
+
+.citation-index span {
+  color: var(--muted);
+  font-weight: 850;
+}
+
+.citation-card strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.citation-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  min-height: 24px;
+  border: 1px solid var(--primary);
+  border-radius: 999px;
+  background: #eef7f4;
+  color: var(--primary-strong);
+  font-size: 12px;
+  font-weight: 900;
+  line-height: 1;
+  text-decoration: none;
+}
+
+.citation-number:hover {
+  background: var(--primary);
+  color: #fff;
+}
+
+.citation-number.disabled {
+  border-color: var(--line-strong);
+  background: var(--surface-soft);
+  color: var(--muted);
+}
+
+.citation-card a {
+  color: var(--primary-strong);
+  font-weight: 800;
 }
 
 .debug-panel {

@@ -129,7 +129,7 @@ describe("qaIntentRouter", () => {
     expect(result.answer).not.toContain("Sản phẩm là");
   });
 
-  it("answers non-HS field questions first and only appends a related code", () => {
+  it("answers non-HS field questions without appending a related code", () => {
     const selected = retrievedFixture({
       document: "Chapter03.pdf",
       hsCode: "0301.99.10",
@@ -148,12 +148,13 @@ describe("qaIntentRouter", () => {
 
     expect(result.answerMode).toBe("selected_section_qa");
     expect(result.answer).toContain("balanced body");
-    expect(result.answer).toContain("Mã liên quan: 0301.99.10.");
+    expect(result.answer).not.toContain("liên quan");
+    expect(result.answer).not.toContain("0301.99.10");
     expect(result.answer).not.toContain("HS Code");
     expect(result.answer).not.toContain("Sản phẩm là");
   });
 
-  it("does not duplicate HS Code when selected-section text already mentioned it", () => {
+  it("strips HS Code from non-HS selected-section answers when text already mentioned it", () => {
     const selected = retrievedFixture({
       document: "Chapter03.pdf",
       hsCode: "0301.99.10",
@@ -172,9 +173,9 @@ describe("qaIntentRouter", () => {
 
     const codeMentions = result.answer.match(/0301\.99\.10/g) ?? [];
     expect(result.answer).toContain("balanced body");
-    expect(result.answer).toContain("Mã liên quan: 0301.99.10.");
+    expect(result.answer).not.toContain("liên quan");
     expect(result.answer).not.toContain("HS Code:");
-    expect(codeMentions).toHaveLength(1);
+    expect(codeMentions).toHaveLength(0);
   });
 
   it("keeps selected-section answers free of debug metadata", () => {

@@ -215,7 +215,10 @@
                 <span class="kicker">Chat</span>
                 <h2>Ask Your Parsed Documents</h2>
               </div>
-              <button id="toggle-debug-panel" type="button" class="secondary compact">Hide terminal</button>
+              <div class="chat-heading-actions">
+                <button id="clear-chat" type="button" class="secondary compact">Clear chat</button>
+                <button id="toggle-debug-panel" type="button" class="secondary compact">Hide side panel</button>
+              </div>
             </div>
 
             <div id="answer" class="chat-thread muted">
@@ -231,10 +234,14 @@
           <aside id="debug-sidebar" class="notebook-pane studio-pane debug-sidebar" aria-label="Terminal and retrieval debug">
             <div class="pane-heading compact-heading">
               <div>
-                <span class="kicker">Terminal</span>
-                <h2>Debug Retrieval</h2>
+                <span id="side-panel-kicker" class="kicker">Terminal</span>
+                <h2 id="side-panel-title">Debug Retrieval</h2>
               </div>
-              <button id="collapse-debug-panel" type="button" class="secondary compact">Collapse</button>
+              <div class="panel-toggle">
+                <button id="show-terminal-panel" type="button" class="secondary compact active">Terminal</button>
+                <button id="show-pdf-panel" type="button" class="secondary compact">PDF</button>
+                <button id="collapse-debug-panel" type="button" class="secondary compact">Collapse</button>
+              </div>
             </div>
 
             <section class="artifact-section terminal-section">

@@ -1388,6 +1388,7 @@ function maybeAppendRelatedHsCode(
   if (
     !usedGeneratedAnswer ||
     codes.length === 0 ||
+    !asksForHsCodeOrClassification(query) ||
     gate.answerConfidence !== "high" ||
     answerMentionsHsCode(answer) ||
     !isSelectedSectionCodeUsefulQuestion(query) ||

@@ -195,7 +195,7 @@ export function normalizeFieldText(value: string): string {
 function extractHeadingBlocks(sectionText: string): HeadingBlock[] {
   const blocks: HeadingBlock[] = [];
   let current: HeadingBlock | null = null;
-  const headingReadyText = sectionText.includes("\n") ? sectionText : expandInlineFieldLabels(sectionText);
+  const headingReadyText = expandInlineFieldLabels(sectionText);
   const lines = headingReadyText
     .split(/\n+/g)
     .map((line) => line.trim())
@@ -311,7 +311,7 @@ function parseHeadingLine(line: string): { heading: string; inlineText: string }
     return { heading: normalizeDisplayText(colon[1]), inlineText: normalizeDisplayText(colon[2] ?? "") };
   }
 
-  if (isCompactLabel(line) && line.split(/\s+/g).length <= 6 && detectFieldGroups(line).length > 0) {
+  if (isCompactLabel(line) && line.split(/\s+/g).length <= 6 && !/[.!?]$/.test(line.trim()) && detectFieldGroups(line).length > 0) {
     return { heading: normalizeDisplayText(line), inlineText: "" };
   }
 
@@ -321,6 +321,7 @@ function parseHeadingLine(line: string): { heading: string; inlineText: string }
 function expandInlineFieldLabels(sectionText: string): string {
   const labels = FIELD_SYNONYM_GROUPS
     .flatMap((group) => group.labels)
+    .concat(["general requirements on appearance", "appearance requirements"])
     .filter((label) => label.length >= 5)
     .sort((left, right) => right.length - left.length)
     .map(escapeRegExp)
@@ -355,7 +356,7 @@ function normalizeDisplayText(value: string): string {
 }
 
 function normalizeBodyLine(value: string): string {
-  return normalizeDisplayText(value.replace(/^[-*]\s+/, ""));
+  return normalizeDisplayText(value.replace(/^[-*•▪◦\uf0b7]\s+/, ""));
 }
 
 function isCompactLabel(value: string): boolean {
@@ -365,6 +366,7 @@ function isCompactLabel(value: string): boolean {
 
 function isBoundaryLine(value: string): boolean {
   return /^(source|citation|page|section|chapter|hs\s*code)\b/i.test(value) ||
+    /^#{1,6}\s*chapter\b/i.test(value) ||
     /^#{1,6}\s*\d{4}\.\d{2}\.\d{2}\b/.test(value);
 }
 
