@@ -55,6 +55,20 @@ describe("qaIntentRouter", () => {
     }
   ];
 
+  it("detects simple small-talk without using document QA intent", () => {
+    expect(detectIntent("hi").intent).toBe("small_talk");
+    expect(detectIntent("hello").intent).toBe("small_talk");
+    expect(detectIntent("cam on").intent).toBe("small_talk");
+    expect(detectIntent("bye").intent).toBe("small_talk");
+  });
+
+  it("does not classify HS code questions as small-talk", () => {
+    const detection = detectIntent("hi, tra HS Code 0102.29.11");
+
+    expect(detection.intent).toBe("exact_hscode_lookup");
+    expect(detection.exactHsCode).toBe("0102.29.11");
+  });
+
   it("detects exact HS code lookup and returns the matching section", () => {
     const detection = detectIntent("Tra HS Code 0102.29.11");
     const result = handleExactHsCodeLookup("Tra HS Code 0102.29.11", sections, detection);

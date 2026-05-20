@@ -41,6 +41,7 @@ export {
 } from "./qaBroadLookup";
 
 export type QaIntent =
+  | "small_talk"
   | "exact_hscode_lookup"
   | "product_classification"
   | "definition"
@@ -52,6 +53,7 @@ export type QaIntent =
   | "clarification_needed";
 
 export type AnswerMode =
+  | "small_talk"
   | "classification"
   | "lookup"
   | "numeric_lookup"
@@ -69,6 +71,7 @@ export type AnswerMode =
 
 export type AnswerConfidence = "high" | "medium" | "low";
 export type QaAnswerGenerationMode =
+  | "small-talk"
   | "template-classification"
   | "extractive-definition"
   | "extractive-field"
@@ -174,6 +177,10 @@ export interface RoutedQaAnswer {
 }
 
 export function detectIntent(query: string): IntentDetection {
+  const simpleChat = detectSimpleChatIntent(query);
+  if (simpleChat) {
+    return simpleChat;
+  }
   const rulePlan = planQueryWithRules(query);
   if (rulePlan) {
     return intentDetectionFromQueryPlan(rulePlan, "rule");
@@ -245,6 +252,47 @@ export function intentDetectionFromQueryPlan(plan: QueryPlan, plannerSource?: Pl
     definitionTerm: plan.intent === "definition" ? plan.target ?? undefined : undefined,
     queryPlan: plan,
     plannerSource
+  };
+}
+
+export function handleSimpleChat(
+  query: string,
+  detection: IntentDetection = detectSimpleChatIntent(query) ?? detectIntent(query),
+  baseDebug: Partial<QaDebugInfo> = {}
+): RoutedQaAnswer {
+  const simpleChat = detectSimpleChat(query);
+  const answer = simpleChatAnswer(simpleChat?.kind ?? "greeting", query);
+  const gate = deterministicGate(
+    "small_talk",
+    "high",
+    100,
+    ["simple_chat_phrase"],
+    "query is a simple conversational phrase"
+  );
+  return {
+    intent: "small_talk",
+    answerMode: gate.answerMode,
+    answerConfidence: gate.answerConfidence,
+    answer: sanitizeFinalAnswer(answer),
+    selectedPrimary: null,
+    documentSummary: null,
+    citations: [],
+    debug: buildDebug(baseDebug, detection, {
+      selectedHandler: "small_talk",
+      selectedPrimary: null,
+      candidateRejectionReasons: [],
+      answerGeneration: "small-talk",
+      llmCalled: false,
+      llmSkippedReason: "small_talk_fast_path",
+      llmErrorType: null,
+      sectionTextChars: 0,
+      contextChars: 0,
+      fallbackReason: null,
+      broadQueryDecision: { isBroad: false, reason: "small talk bypasses document retrieval", suggestedMode: "normal" },
+      finalAnswerSanitized: true,
+      scopeApplied: true,
+      ...debugGateFields(gate)
+    })
   };
 }
 
@@ -1361,6 +1409,96 @@ function broadLookupAnswer(query: string, candidates: CandidateRelevance[]): str
 }
 
 
+type SimpleChatKind = "greeting" | "thanks" | "farewell";
+
+function detectSimpleChat(query: string): { kind: SimpleChatKind } | null {
+  if (HS_CODE_PATTERN.test(query)) {
+    return null;
+  }
+  const normalized = normalizeSimpleChat(query);
+  if (!normalized || hasDocumentQuestionSignal(normalized)) {
+    return null;
+  }
+  const tokens = normalized.split(" ").filter(Boolean);
+  if (tokens.length > 4) {
+    return null;
+  }
+  if (SIMPLE_GREETING_PHRASES.has(normalized)) {
+    return { kind: "greeting" };
+  }
+  if (SIMPLE_THANKS_PHRASES.has(normalized)) {
+    return { kind: "thanks" };
+  }
+  if (SIMPLE_FAREWELL_PHRASES.has(normalized)) {
+    return { kind: "farewell" };
+  }
+  return null;
+}
+
+const SIMPLE_GREETING_PHRASES = new Set([
+  "hi",
+  "hello",
+  "hey",
+  "hello there",
+  "hi there",
+  "chao",
+  "xin chao",
+  "chao ban",
+  "chao anh",
+  "chao chi",
+  "chao em",
+  "good morning",
+  "good afternoon",
+  "good evening"
+]);
+
+const SIMPLE_THANKS_PHRASES = new Set([
+  "thanks",
+  "thank",
+  "thank you",
+  "tks",
+  "cam on",
+  "cam on ban",
+  "cam on anh",
+  "cam on chi"
+]);
+
+const SIMPLE_FAREWELL_PHRASES = new Set([
+  "bye",
+  "goodbye",
+  "tam biet",
+  "hen gap lai"
+]);
+
+function normalizeSimpleChat(query: string): string {
+  return normalizeForIntent(query)
+    .replace(/[^a-z0-9\s]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function hasDocumentQuestionSignal(normalizedQuery: string): boolean {
+  return /\b(hs|hscode|code|ma hs|ma so|tra cuu|phan loai|chapter|chuong|tariff|thue|document|pdf|section)\b/.test(normalizedQuery);
+}
+
+function simpleChatAnswer(kind: SimpleChatKind, query: string): string {
+  const normalized = normalizeSimpleChat(query);
+  const vietnamese = prefersVietnameseAnswer(query) || /\b(chao|xin chao|cam on|tam biet|hen gap lai)\b/.test(normalized);
+  if (kind === "thanks") {
+    return vietnamese
+      ? "Khong co gi. Ban muon tra cuu HS code hoac hoi noi dung tai lieu nao tiep?"
+      : "You're welcome. What HS code or document question would you like to check next?";
+  }
+  if (kind === "farewell") {
+    return vietnamese
+      ? "Tam biet. Khi can tra cuu HS code hoac noi dung tai lieu, ban cu hoi tiep."
+      : "Goodbye. Ask anytime when you need to check an HS code or document detail.";
+  }
+  return vietnamese
+    ? "Chao ban, ban muon tra cuu HS code hoac hoi noi dung tai lieu nao?"
+    : "Hello. What HS code or document question would you like to check?";
+}
+
 function clarificationAnswer(query?: string): string {
   if (!prefersVietnameseAnswer(query)) {
     return "There is not enough information to determine a confident HS Code. Please provide more product description, composition, use, product state, or technical specifications.";
@@ -1569,6 +1707,19 @@ function publicSection(section: SectionMetadata | EnrichedRetrievedSection): Rec
     score: "score" in section ? section.score : undefined,
     metadataWarnings: "metadataWarnings" in section ? section.metadataWarnings : [],
     sourceText
+  };
+}
+
+export function detectSimpleChatIntent(query: string): IntentDetection | null {
+  const detected = detectSimpleChat(query);
+  if (!detected) {
+    return null;
+  }
+  return {
+    intent: "small_talk",
+    confidence: 0.95,
+    reason: `simple ${detected.kind} fast-path`,
+    plannerSource: "fallback"
   };
 }
 

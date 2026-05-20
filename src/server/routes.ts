@@ -80,8 +80,10 @@ import {
   handleExactHsCodeLookup,
   handleProductClassification,
   handleSelectedSectionQa,
+  handleSimpleChat,
   asksForHsCodeOrClassification,
   detectIntent,
+  detectSimpleChatIntent,
   detectAmbiguousLookup,
   detectBroadQuery,
   extractLocalSelectedSectionAnswer,
@@ -638,6 +640,15 @@ export function createApiRouter(): express.Router {
       const docIds = uniqueStrings([...requestedDocIds, ...cachedDocIds]);
       if (!question) {
         res.status(400).json({ error: "Question is required." });
+        return;
+      }
+      const simpleChatResponse = answerSimpleChatIfNeeded(question, {
+        debug: booleanValue(req.body.debug),
+        mode: "small-talk"
+      });
+      if (simpleChatResponse) {
+        serverTrace("routes.ask", "small-talk answer sent", { elapsedMs: Date.now() - startedAt });
+        res.json(simpleChatResponse);
         return;
       }
       serverTrace("routes.ask", "request accepted", {
@@ -1256,6 +1267,51 @@ function applyScopedNotFoundAnswer(routed: RoutedQaAnswer, scope: QaScopeTracker
   };
 }
 
+function answerSimpleChatIfNeeded(
+  question: string,
+  options: { debug?: boolean; mode?: string; qaMode?: QaMode } = {}
+): Record<string, unknown> | null {
+  const detection = detectSimpleChatIntent(question);
+  if (!detection) {
+    return null;
+  }
+  const scope = createQaScope([]);
+  const routed = handleSimpleChat(question, detection, {
+    qaMode: options.qaMode ?? "fast",
+    answerLanguage: answerLanguageForQuestion(question),
+    llmCalled: false,
+    llmSkippedReason: "small_talk_fast_path",
+    llmErrorType: null,
+    sectionTextChars: 0,
+    selectedSectionTextChars: 0,
+    contextChars: 0,
+    fallbackReason: null,
+    queryExpansion: defaultQueryExpansionDebug(question),
+    domainAliasTerms: [],
+    indexSource: {
+      selectedCachedTreeDocuments: [],
+      localSectionDocuments: []
+    },
+    cacheStatus: {
+      cachedTreeDocumentCount: 0,
+      scopedDocumentNames: [],
+      sectionMetadataCount: 0,
+      documentMetadataCount: 0
+    },
+    scope: scopeSnapshot(scope),
+    scopeApplied: true,
+    finalAnswerSanitized: true
+  });
+  return finalizeRoutedAnswer(routed, {
+    mode: options.mode ?? "small-talk",
+    documents: [],
+    sourceDocuments: [],
+    debug: options.debug,
+    cacheInfo: buildCacheResponseFields([], "local-sections"),
+    scope
+  });
+}
+
 export async function answerFromCachedTrees(
   question: string,
   options: {
@@ -1274,6 +1330,15 @@ export async function answerFromCachedTrees(
   } = {}
 ): Promise<Record<string, unknown>> {
   const startedAt = Date.now();
+  const simpleChatResponse = answerSimpleChatIfNeeded(question, {
+    debug: options.debug,
+    mode: "cached-tree",
+    qaMode: options.qaMode ?? "fast"
+  });
+  if (simpleChatResponse) {
+    serverTrace("answerFromCachedTrees", "small-talk answer sent", { elapsedMs: Date.now() - startedAt });
+    return simpleChatResponse;
+  }
   const detection = detectIntent(question);
   const qaMode = options.qaMode ?? "fast";
   const answerLanguage = answerLanguageForQuestion(question);
@@ -3021,7 +3086,8 @@ function responseAnswerGeneration(routed: RoutedQaAnswer): QaAnswerGenerationMod
 }
 
 function isQaAnswerGenerationMode(value: unknown): value is QaAnswerGenerationMode {
-  return value === "template-classification" ||
+  return value === "small-talk" ||
+    value === "template-classification" ||
     value === "extractive-definition" ||
     value === "extractive-field" ||
     value === "broad-lookup" ||

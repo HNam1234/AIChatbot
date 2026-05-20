@@ -3,6 +3,24 @@ import { answerFromCachedTrees, answerQuestionForEval } from "../src/server/rout
 import type { QueryExpansionProvider } from "../src/agent/queryExpansion";
 
 describe("Q&A scope isolation", () => {
+  it("answers simple small-talk without retrieval or LLM", async () => {
+    const response = await answerQuestionForEval("hello", { debug: true });
+
+    expect(response.intent).toBe("small_talk");
+    expect(response.answerMode).toBe("small_talk");
+    expect(response.answerConfidence).toBe("high");
+    expect(response.llmCalled).toBe(false);
+    expect(response.llmSkippedReason).toBe("small_talk_fast_path");
+    expect(response.citations).toEqual([]);
+    expect(response.selectedPrimary).toBeNull();
+    expect(response.retrieval).toMatchObject({
+      source: "local-metadata",
+      pageIndexResultCount: 0,
+      selectedSection: null
+    });
+    expect((response.debug as { queryExpansion?: { expandedQuery?: string } }).queryExpansion?.expandedQuery).toBe("hello");
+  });
+
   it("does not return Chapter10 results when local scope is Chapter01", async () => {
     const response = await answerQuestionForEval("Tra cứu HS Code 1001.99.99", {
       localSectionDocuments: ["Chapter01.pdf"],
