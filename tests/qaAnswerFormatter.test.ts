@@ -184,7 +184,7 @@ describe("qaAnswerFormatter", () => {
     expect(result.answer).toContain("HS Code:");
     expect(result.answer).toContain("0207.14.10");
     expect(result.answer).toContain("0207.27.10");
-    expect(result.answer).toMatch(/tr.{0,8}ng th.{0,8}i/i);
+    expect(result.answer).toContain("depending on the product state");
     expect(result.answer).toContain("Chapter02.pdf");
     expect(result.answer).toContain("0207.14.10 - MECHANICALLY DEBONED MEAT");
   });
@@ -548,6 +548,70 @@ describe("qaAnswerFormatter", () => {
     expect(thaiSelection.ranked[0].title).toBe("HOM MALI RICE");
   });
 
+  it("uses Vietnamese potato description aliases to select chipping potatoes", () => {
+    const query = "Mot cong ty san xuat snack nhap khau lo khoai tay co hinh dang tron tria, ham luong duong rat thap khi chien co mau vang nhat. Lo hang nay ap ma HS nao?";
+    const chippingPotatoes = sectionFixture({
+      document: "Chapter07.pdf",
+      hsCode: "0701.90.10",
+      title: "CHIPPING POTATOES",
+      section: "0701.90.10 - CHIPPING POTATOES",
+      text: "Chipping potatoes are tubers grown for potato chip makers. Tubers are round, have low sugar content and fry to a light color.",
+      score: 2
+    });
+    const roundCabbage = sectionFixture({
+      document: "Chapter07.pdf",
+      hsCode: "0704.90.10",
+      title: "ROUND (DRUMHEAD) CABBAGES",
+      section: "0704.90.10 - ROUND (DRUMHEAD) CABBAGES",
+      text: "Round cabbage has a compact round head.",
+      score: 20
+    });
+
+    const selection = selectRelevantSections([roundCabbage, chippingPotatoes], query, { requireHsMetadata: true });
+
+    expect(extractQuerySignals(query).domainAliasTerms).toContain("chipping potatoes");
+    expect(selection.ranked[0]).toMatchObject({ hsCode: "0701.90.10", title: "CHIPPING POTATOES" });
+    expect(selection.candidates.find((candidate) => candidate.hsCode === "0701.90.10")?.validation?.accepted).toBe(true);
+  });
+
+  it("uses Vietnamese swim-bladder description aliases to keep fish maws despite numeric evidence", () => {
+    const query = "Duoc lieu kho 1 den 3 nam mau nau sam it trong suot la co quan noi tang chua khi cua loai ca giup duy tri suc noi. Co quan nay la gi va ma HS cua no?";
+    const fishMaws = sectionFixture({
+      document: "Chapter03.pdf",
+      hsCode: "0305.72.19",
+      groupedHsCodes: ["0305.72.11", "0305.72.19"],
+      title: "FISH MAWS",
+      section: "0305.72.19 - FISH MAWS",
+      text: "Fish maws are swim bladders, an internal gas-filled organ that helps fish maintain buoyancy. Dried fish maws may be stored 1 to 3 years and become dark brown with many wrinkles.",
+      score: 2
+    });
+    const unrelatedNumeric = sectionFixture({
+      document: "Chapter06.pdf",
+      hsCode: "0602.90.50",
+      title: "SEEDLINGS",
+      section: "0602.90.50 - SEEDLINGS",
+      text: "Seedlings have roots 1 to 3 cm long.",
+      score: 40
+    });
+
+    const selection = selectRelevantSections([unrelatedNumeric, fishMaws], query, { requireHsMetadata: true });
+    const fishMawCandidate = selection.candidates.find((candidate) => candidate.hsCode === "0305.72.19");
+
+    expect(extractQuerySignals(query).domainAliasTerms).toContain("swim bladder");
+    expect(selection.ranked[0]).toMatchObject({ hsCode: "0305.72.19", title: "FISH MAWS" });
+    expect(fishMawCandidate?.validation?.accepted).toBe(true);
+    expect(fishMawCandidate?.validation?.reason).not.toContain("numeric evidence is not supported");
+  });
+
+  it("normalizes Vietnamese d-stroke before alias extraction", () => {
+    const query = "M\u00e3 HS c\u1ee7a khoai t\u00e2y chi\u00ean c\u00f3 h\u00e0m l\u01b0\u1ee3ng \u0111\u01b0\u1eddng r\u1ea5t th\u1ea5p?";
+
+    expect(extractQuerySignals(query).domainAliasTerms).toEqual(expect.arrayContaining([
+      "chipping potatoes",
+      "low sugar"
+    ]));
+  });
+
   it("penalizes contrast-only candidates and promotes positive attribute evidence", () => {
     const baselineOnly = sectionFixture({
       document: "Chapter09.pdf",
@@ -601,7 +665,7 @@ describe("qaAnswerFormatter", () => {
     expect(result.finalHsCodes).toEqual(["1211.90.11", "1211.90.19"]);
     expect(result.answer).toContain("1211.90.11");
     expect(result.answer).toContain("1211.90.19");
-    expect(result.answer).toMatch(/tr.{0,8}ng th.{0,8}i/i);
+    expect(result.answer).toContain("depending on the product state in the tariff");
   });
 
   it("direct product and definition queries still favor matching title metadata", () => {

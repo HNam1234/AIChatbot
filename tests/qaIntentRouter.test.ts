@@ -509,7 +509,7 @@ describe("qaIntentRouter", () => {
     })], detectIntent("What is it?"));
 
     expect(result.answerMode).toBe("clarification");
-    expect(result.answer).toContain("Chưa đủ thông tin");
+    expect(result.answer).toContain("There is not enough information");
   });
 
   it("answers Vietnamese section attribute questions from LLM text without forcing HS Code", () => {

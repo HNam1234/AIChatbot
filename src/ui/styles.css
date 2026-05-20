@@ -456,6 +456,19 @@ button.compact {
   gap: 8px;
 }
 
+.selected-files-text {
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-soft);
+  padding: 10px;
+  color: #263445;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .source-list {
   display: grid;
   gap: 8px;

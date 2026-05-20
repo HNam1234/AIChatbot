@@ -668,33 +668,20 @@ function renderSelectedFiles(status = "waiting") {
     selectedFilesEl.textContent = "No files selected.";
     return;
   }
-  selectedFilesEl.className = "selected-files";
-  const hasCacheRows = selectedCacheRows.length > 0 && selectedCacheRows.some((row) => row.parseCacheStatus);
-  if (!hasCacheRows) {
-    selectedFilesEl.innerHTML = files.map((file) => `
-      <div class="file-row">
-        <span>${escapeHtml(file.name)}</span>
-        <span>${formatBytes(file.size)}</span>
-        ${statusChip(status)}
-      </div>
-    `).join("");
-    return;
-  }
+  selectedFilesEl.className = "selected-files selected-files-text";
+  selectedFilesEl.textContent = files.map((file, index) => selectedInputTextLine(file, index, status)).join("\n");
+}
 
-  selectedFilesEl.innerHTML = batchTableMarkup(files.map((file) => {
-    const row = cacheRowForFile(file, selectedCacheRows) || {};
-    return {
-      document: row.document || file.name,
-      progressPercent: status === "uploaded" ? 100 : status === "uploading" ? 30 : 0,
-      parseCache: row.parseCacheStatus || "checking",
-      pageIndexCache: row.pageIndexCacheStatus || "checking",
-      assets: Number.isFinite(row.assets) ? row.assets : "",
-      sections: Number.isFinite(row.sections) ? row.sections : "",
-      tree: row.treeStatus || "checking",
-      action: plannedAction(row, status),
-      error: row.error || ""
-    };
-  }), true);
+function selectedInputTextLine(file, index, status) {
+  const row = cacheRowForFile(file, selectedCacheRows) || {};
+  const details = [
+    formatBytes(file.size),
+    row.parseCacheStatus ? `parse: ${row.parseCacheStatus}` : "",
+    row.pageIndexCacheStatus ? `pageindex: ${row.pageIndexCacheStatus}` : "",
+    row.treeStatus ? `tree: ${row.treeStatus}` : "",
+    plannedAction(row, status)
+  ].filter(Boolean);
+  return `${index + 1}. ${file.name}${details.length ? ` - ${details.join("; ")}` : ""}`;
 }
 
 function renderBatchStatus(files) {

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "real-003",
+    "question": "Một công ty chuyên sản xuất snack nhập khẩu một lô khoai tây. Kết quả kiểm tra cho thấy củ khoai có hình dáng tròn trịa hơn bình thường, màu nhạt, lớp vỏ rất dễ chà xát bong tróc, và đặc biệt hàm lượng đường rất thấp giúp khoai khi chiên lên có màu vàng nhạt đến trắng đẹp mắt. Lô hàng khoai tây này được áp mã HS nào?",
+    "expectedIntent": "product_classification",
+    "mustContainAll": ["0701.90.10"],
+    "mustContainAny": ["Chipping potatoes", "khoai"],
+    "mustNotContain": ["Retrieval:", "PageIndex:", "Primary citation"],
+    "fallbackForbidden": true,
+    "expectedHsCodes": ["0701.90.10"],
+    "expectedDocument": "Chapter07.pdf",
+    "expectedTitleContains": "CHIPPING POTATOES"
+  },
+  {
+    "id": "real-007",
+    "question": "Một dược liệu đông y quý hiếm được bảo quản khô từ 1 đến 3 năm khiến cho nó có màu nâu sậm, nếp nhăn nhiều và ít độ trong suốt. Thực chất, đây là một cơ quan nội tạng chứa khí của loài cá, giúp cá duy trì sức nổi và cân bằng khối lượng dưới nước. Cơ quan này là gì và mã HS của nó?",
+    "expectedIntent": "product_classification",
+    "mustContainAll": ["0305.72.11", "0305.72.19"],
+    "mustContainAny": ["Fish maws", "swim bladder", "bong ca"],
+    "mustNotContain": ["Retrieval:", "PageIndex:", "Primary citation"],
+    "fallbackForbidden": true,
+    "expectedHsCodes": ["0305.72.11", "0305.72.19"],
+    "expectedDocument": "Chapter03.pdf",
+    "expectedTitleContains": "FISH MAWS"
+  }
+]

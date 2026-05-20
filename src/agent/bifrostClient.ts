@@ -5,6 +5,7 @@ import {
   buildSelectedSectionAnswerPrompt,
   type SelectedSectionAnswerContext
 } from "./geminiClient";
+import { answerLanguageForQuestion } from "./qaAnswerFormatter";
 
 export interface BifrostClientOptions {
   apiKey: string;
@@ -78,7 +79,7 @@ export class BifrostClient implements LlmClient {
     query: string,
     options: BifrostSynthesisOptions = {}
   ): Promise<string> {
-    const prompt = buildHsCodePrompt(context, query, options.language ?? "Vietnamese");
+    const prompt = buildHsCodePrompt(context, query, options.language ?? answerLanguageForQuestion(query));
     return await this.chat(prompt, {
       temperature: options.temperature ?? this.temperature,
       maxTokens: options.maxOutputTokens ?? this.maxOutputTokens
@@ -90,7 +91,7 @@ export class BifrostClient implements LlmClient {
     query: string,
     options: BifrostSynthesisOptions = {}
   ): Promise<string> {
-    const prompt = buildSelectedSectionAnswerPrompt(section, query);
+    const prompt = buildSelectedSectionAnswerPrompt(section, query, options.language ?? answerLanguageForQuestion(query));
     return await this.chat(prompt, {
       temperature: options.temperature ?? this.temperature,
       maxTokens: options.maxOutputTokens ?? this.maxOutputTokens
@@ -102,7 +103,7 @@ export class BifrostClient implements LlmClient {
     query: string,
     options: BifrostSynthesisOptions = {}
   ): Promise<string> {
-    const prompt = buildComparisonAnswerPrompt(sections, query);
+    const prompt = buildComparisonAnswerPrompt(sections, query, options.language ?? answerLanguageForQuestion(query));
     return await this.chat(prompt, {
       temperature: options.temperature ?? this.temperature,
       maxTokens: options.maxOutputTokens ?? this.maxOutputTokens

@@ -1,5 +1,6 @@
 import { GoogleGenAI, type GenerateContentConfig } from "@google/genai";
 import { resolveGeminiApiKeys } from "../config/gemini";
+import { answerLanguageForQuestion } from "./qaAnswerFormatter";
 
 export interface GeminiRoundRobinOptions {
   apiKeys?: string[];
@@ -83,7 +84,7 @@ export class GeminiRoundRobinClient {
   }
 
   public async synthesizeAnswer(context: string, query: string, options: GeminiSynthesisOptions = {}): Promise<string> {
-    const prompt = buildHsCodePrompt(context, query, options.language ?? "Vietnamese");
+    const prompt = buildHsCodePrompt(context, query, options.language ?? answerLanguageForQuestion(query));
     const config: GenerateContentConfig = {
       temperature: options.temperature ?? this.temperature,
       maxOutputTokens: options.maxOutputTokens ?? this.maxOutputTokens
@@ -96,7 +97,7 @@ export class GeminiRoundRobinClient {
     query: string,
     options: GeminiSynthesisOptions = {}
   ): Promise<string> {
-    const prompt = buildSelectedSectionAnswerPrompt(section, query);
+    const prompt = buildSelectedSectionAnswerPrompt(section, query, options.language ?? answerLanguageForQuestion(query));
     const config: GenerateContentConfig = {
       temperature: options.temperature ?? this.temperature,
       maxOutputTokens: options.maxOutputTokens ?? this.maxOutputTokens
@@ -109,7 +110,7 @@ export class GeminiRoundRobinClient {
     query: string,
     options: GeminiSynthesisOptions = {}
   ): Promise<string> {
-    const prompt = buildComparisonAnswerPrompt(sections, query);
+    const prompt = buildComparisonAnswerPrompt(sections, query, options.language ?? answerLanguageForQuestion(query));
     const config: GenerateContentConfig = {
       temperature: options.temperature ?? this.temperature,
       maxOutputTokens: options.maxOutputTokens ?? this.maxOutputTokens
@@ -185,14 +186,14 @@ export function buildHsCodePrompt(context: string, query: string, language: stri
   ].join("\n");
 }
 
-export function buildSelectedSectionAnswerPrompt(section: SelectedSectionAnswerContext, query: string): string {
+export function buildSelectedSectionAnswerPrompt(section: SelectedSectionAnswerContext, query: string, language = "Vietnamese"): string {
   return [
     "You are answering a question using only the selected HSCode document section.",
     "Use the selected section text and retrieved context as evidence.",
     "Do not use outside knowledge.",
     "Do not invent information.",
     "If the selected section does not contain the requested information, say so.",
-    "Prefer Vietnamese for Vietnamese or mixed-language questions.",
+    `Answer in ${language} unless the user explicitly asks for another language.`,
     "Answer the user's actual question directly.",
     "If the user asks about requirements, characteristics, appearance, usage, definition, meaning, or notes, extract that information from the selected section.",
     "Do not output HS Code unless the user explicitly asks for HS Code or classification.",
@@ -225,7 +226,7 @@ export function buildSelectedSectionAnswerPrompt(section: SelectedSectionAnswerC
   ].join("\n");
 }
 
-export function buildComparisonAnswerPrompt(sections: SelectedSectionAnswerContext[], query: string): string {
+export function buildComparisonAnswerPrompt(sections: SelectedSectionAnswerContext[], query: string, language = "Vietnamese"): string {
   const sectionBlocks = sections.map((section, index) => [
     `Section ${index + 1} metadata:`,
     `- document: ${section.document ?? ""}`,
@@ -244,7 +245,7 @@ export function buildComparisonAnswerPrompt(sections: SelectedSectionAnswerConte
     "You are answering a comparison or contrast question using multiple HSCode document sections.",
     "Use ONLY the provided sections as evidence. Do not use outside knowledge.",
     "Do not invent information.",
-    "Prefer Vietnamese for Vietnamese or mixed-language questions.",
+    `Answer in ${language} unless the user explicitly asks for another language.`,
     "Compare and contrast the sections based on what the user asks.",
     "Highlight key differences and similarities.",
     "Do not output HS Code unless the user explicitly asks for HS Code or classification.",

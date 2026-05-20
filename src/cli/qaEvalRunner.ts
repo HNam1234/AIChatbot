@@ -18,6 +18,13 @@ interface QaEvalItem {
   expectedTitleContains?: string | null;
 }
 
+type QaMode = "fast" | "accuracy";
+
+interface CliOptions {
+  fixturePath: string;
+  qaMode: QaMode;
+}
+
 interface EvalResult {
   item: QaEvalItem;
   passed: boolean;
@@ -27,12 +34,18 @@ interface EvalResult {
 
 async function main(): Promise<void> {
   process.env.QA_EVAL_QUIET = "1";
-  const fixturePath = resolveFixturePath(process.argv.slice(2));
+  const cliOptions = parseCliOptions(process.argv.slice(2));
+  const fixturePath = cliOptions.fixturePath;
   const items = JSON.parse(await readFile(fixturePath, "utf8")) as QaEvalItem[];
   const results: EvalResult[] = [];
 
   for (const item of items) {
     const response = await answerQuestionForEval(item.question, {
+      qaMode: cliOptions.qaMode,
+      enableLlmQa: cliOptions.qaMode === "accuracy" ? true : undefined,
+      queryExpansionConfig: cliOptions.qaMode === "accuracy"
+        ? { enabled: true, timeoutMs: 12000, retryCount: 1, cacheEnabled: true }
+        : undefined,
       debug: true,
       localSectionDocuments: item.scopeDocuments
     });
@@ -45,7 +58,11 @@ async function main(): Promise<void> {
 
   const passed = results.filter((result) => result.passed).length;
   const failed = results.length - passed;
-  console.log(`\nQA eval summary: ${passed}/${results.length} passed, ${failed} failed.`);
+  const passRate = results.length > 0 ? Math.round((passed / results.length) * 1000) / 10 : 0;
+  const stats = summarizeEvalStats(results);
+  console.log(`\nQA eval summary: ${passed}/${results.length} passed (${passRate}%), ${failed} failed.`);
+  console.log(`mode: ${cliOptions.qaMode}`);
+  console.log(`LLM coverage: ${stats.llmCoverage}/${results.length}; rerank: ${stats.rerankCount}; verifier: ${stats.verifierCount}; timeouts: ${stats.timeoutCount}.`);
   if (failed > 0) {
     process.exitCode = 1;
   }
@@ -101,12 +118,64 @@ function evaluateItem(item: QaEvalItem, response: Record<string, unknown>): Eval
   return { item, passed: reasons.length === 0, reasons, response };
 }
 
+function parseCliOptions(args: string[]): CliOptions {
+  return {
+    fixturePath: resolveFixturePath(args),
+    qaMode: parseQaMode(args)
+  };
+}
+
 function resolveFixturePath(args: string[]): string {
   const fixtureFlagIndex = args.findIndex((arg) => arg === "--fixture" || arg === "-f");
   const fixtureValue = fixtureFlagIndex >= 0 ? args[fixtureFlagIndex + 1] : undefined;
   const inlineFixture = args.find((arg) => arg.startsWith("--fixture="))?.slice("--fixture=".length);
   const requested = fixtureValue || inlineFixture || path.join("tests", "fixtures", "qa-eval.json");
   return path.resolve(process.cwd(), requested);
+}
+
+function parseQaMode(args: string[]): QaMode {
+  const modeFlagIndex = args.findIndex((arg) => arg === "--qa-mode");
+  const modeValue = modeFlagIndex >= 0 ? args[modeFlagIndex + 1] : undefined;
+  const inlineMode = args.find((arg) => arg.startsWith("--qa-mode="))?.slice("--qa-mode=".length);
+  const value = inlineMode || modeValue || "fast";
+  if (value === "fast" || value === "accuracy") {
+    return value;
+  }
+  throw new Error(`Invalid --qa-mode '${value}'. Expected fast or accuracy.`);
+}
+
+function summarizeEvalStats(results: EvalResult[]): {
+  llmCoverage: number;
+  rerankCount: number;
+  verifierCount: number;
+  timeoutCount: number;
+} {
+  let llmCoverage = 0;
+  let rerankCount = 0;
+  let verifierCount = 0;
+  let timeoutCount = 0;
+  for (const result of results) {
+    const debug = debugRecord(result.response);
+    const queryExpansion = typeof debug.queryExpansion === "object" && debug.queryExpansion !== null
+      ? debug.queryExpansion as Record<string, unknown>
+      : {};
+    const usedLlm = result.response.llmCalled === true ||
+      debug.llmRerankCalled === true ||
+      debug.llmVerifierCalled === true ||
+      queryExpansion.expansionSource === "llm";
+    if (usedLlm) llmCoverage += 1;
+    if (debug.llmRerankCalled === true) rerankCount += 1;
+    if (debug.llmVerifierCalled === true) verifierCount += 1;
+    if (
+      result.response.llmErrorType === "timeout" ||
+      debug.llmRerankErrorType === "timeout" ||
+      debug.llmVerifierErrorType === "timeout" ||
+      queryExpansion.timedOut === true
+    ) {
+      timeoutCount += 1;
+    }
+  }
+  return { llmCoverage, rerankCount, verifierCount, timeoutCount };
 }
 
 function printResult(result: EvalResult): void {
@@ -134,6 +203,12 @@ function selectedRecord(response: Record<string, unknown>): Record<string, unkno
     return documentSummary as Record<string, unknown>;
   }
   return null;
+}
+
+function debugRecord(response: Record<string, unknown>): Record<string, unknown> {
+  return typeof response.debug === "object" && response.debug !== null
+    ? response.debug as Record<string, unknown>
+    : {};
 }
 
 function selectedDocument(response: Record<string, unknown>, selected: Record<string, unknown> | null): string | null {

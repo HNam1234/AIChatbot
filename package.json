@@ -13,6 +13,7 @@
     "chat": "tsx src/mainFlow.ts --mode chat",
     "agent": "tsx src/mainFlow.ts --mode agent",
     "eval:qa": "tsx src/cli/qaEvalRunner.ts",
+    "eval:qa:accuracy": "tsx src/cli/qaEvalRunner.ts --fixture tests/fixtures/qa-hard-40.json --qa-mode accuracy",
     "clean:tmp": "tsx src/cli/cleanTmp.ts",
     "dev": "tsx src/server/server.ts",
     "dev:watch": "tsx watch src/server/server.ts"

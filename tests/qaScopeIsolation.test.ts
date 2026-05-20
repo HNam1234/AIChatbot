@@ -190,7 +190,7 @@ describe("Q&A scope isolation", () => {
     expect((response.debug as { llmCalled?: boolean }).llmCalled).toBe(false);
     expect((response.debug as { llmSkippedReason?: string | null }).llmSkippedReason).toBe("ENABLE_LLM_QA=false");
     expect((response.debug as { fallbackReason?: string | null }).fallbackReason).toBe("local_extractor_no_requested_field");
-    expect(String(response.answer)).toBe("Tôi đã tìm thấy section liên quan, nhưng chưa thể trích xuất câu trả lời từ nội dung section. Vui lòng thử lại hoặc bật API key.");
+    expect(String(response.answer)).toBe("I found a relevant section, but I could not extract the answer from its text. Please try again or enable an API key.");
     expect(String(response.answer)).not.toContain("Sản phẩm là");
     expect(String(response.answer)).not.toContain("HS Code");
   });
@@ -243,7 +243,7 @@ describe("Q&A scope isolation", () => {
     expect(response.intent).toBe("product_classification");
     expect(response.answerGeneration).toBe("template-classification");
     expect((response.debug as { answerGeneration?: string }).answerGeneration).toBe("template-classification");
-    expect(String(response.answer)).toContain("Sản phẩm là Agarwood (Gaharu) chips, HS Code: 1211.90.95.");
+    expect(String(response.answer)).toContain("The product is Agarwood (Gaharu) chips, HS Code: 1211.90.95.");
     expect(String(response.answer)).not.toMatch(/Index source|PageIndex|cache freshness|candidate debug/i);
   });
 
@@ -370,7 +370,7 @@ describe("Q&A scope isolation", () => {
     expect(response.answerMode).toBe("broad_lookup");
     expect(response.answerGeneration).toBe("broad-lookup");
     expect(response.selectedPrimary).toBeNull();
-    expect(String(response.answer)).toContain("Tìm thấy nhiều mục liên quan đến 'hevea':");
+    expect(String(response.answer)).toContain("Found multiple items related to 'hevea':");
     expect(String(response.answer)).toContain("Budded stumps of the genus Hevea");
     expect(String(response.answer)).toContain("Seedlings of the genus Hevea");
     expect(String(response.answer)).toContain("Budwood of the genus Hevea");
@@ -392,6 +392,120 @@ describe("Q&A scope isolation", () => {
       hsCode: "0602.90.50",
       title: "SEEDLINGS OF THE GENUS HEVEA"
     });
+  });
+
+  it("accuracy mode reranks HS classification candidates with the configured LLM client", async () => {
+    let rerankCallCount = 0;
+    const response = await answerFromCachedTrees("premium fragrant rice HS Code?", {
+      cachedTreeDocuments: ["Chapter10.pdf"],
+      geminiApiKeys: [],
+      qaMode: "accuracy",
+      debug: true,
+      queryExpansionProvider: mockQueryExpansionProvider(async () => ({
+        englishQuery: "premium fragrant rice",
+        confidence: "high"
+      })),
+      candidateReranker: {
+        async planQuery() {
+          rerankCallCount += 1;
+          return JSON.stringify({
+            selectedHsCode: "1006.30.60",
+            confidence: "high",
+            reason: "mock selected listed candidate"
+          });
+        }
+      },
+      candidateVerifier: {
+        async planQuery() {
+          return JSON.stringify({
+            decision: "accept",
+            selectedHsCode: "1006.30.60",
+            confidence: "high",
+            reason: "mock verifier accepted selected candidate"
+          });
+        }
+      }
+    });
+
+    expect(rerankCallCount).toBe(1);
+    expect(response.selectedPrimary).toMatchObject({ hsCode: "1006.30.60", title: "MALYS RICE" });
+    expect((response.debug as { llmRerankCalled?: boolean; llmRerankAccepted?: boolean }).llmRerankCalled).toBe(true);
+    expect((response.debug as { llmRerankAccepted?: boolean }).llmRerankAccepted).toBe(true);
+    expect((response.debug as { qaMode?: string }).qaMode).toBe("accuracy");
+  });
+
+  it("accuracy verifier switches only to an HS code from the candidate list", async () => {
+    const response = await answerFromCachedTrees("premium fragrant rice HS Code?", {
+      cachedTreeDocuments: ["Chapter10.pdf"],
+      geminiApiKeys: [],
+      qaMode: "accuracy",
+      debug: true,
+      queryExpansionProvider: mockQueryExpansionProvider(async () => ({
+        englishQuery: "premium fragrant rice",
+        confidence: "high"
+      })),
+      candidateReranker: {
+        async planQuery() {
+          return JSON.stringify({
+            selectedHsCode: "1006.30.70",
+            confidence: "high",
+            reason: "mock keeps deterministic top"
+          });
+        }
+      },
+      candidateVerifier: {
+        async planQuery() {
+          return JSON.stringify({
+            decision: "switch",
+            selectedHsCode: "1006.30.60",
+            confidence: "high",
+            reason: "mock verifier selected the better listed code"
+          });
+        }
+      }
+    });
+
+    expect(response.selectedPrimary).toMatchObject({ hsCode: "1006.30.60", title: "MALYS RICE" });
+    expect((response.debug as { llmVerifierCalled?: boolean; llmVerifierAccepted?: boolean; llmVerifierSelectedHsCode?: string }).llmVerifierCalled).toBe(true);
+    expect((response.debug as { llmVerifierAccepted?: boolean }).llmVerifierAccepted).toBe(true);
+    expect((response.debug as { llmVerifierSelectedHsCode?: string }).llmVerifierSelectedHsCode).toBe("1006.30.60");
+  });
+
+  it("accuracy verifier ignores switch decisions outside the candidate list", async () => {
+    const response = await answerFromCachedTrees("premium fragrant rice HS Code?", {
+      cachedTreeDocuments: ["Chapter10.pdf"],
+      geminiApiKeys: [],
+      qaMode: "accuracy",
+      debug: true,
+      queryExpansionProvider: mockQueryExpansionProvider(async () => ({
+        englishQuery: "premium fragrant rice",
+        confidence: "high"
+      })),
+      candidateReranker: {
+        async planQuery() {
+          return JSON.stringify({
+            selectedHsCode: "1006.30.70",
+            confidence: "high",
+            reason: "mock keeps deterministic top"
+          });
+        }
+      },
+      candidateVerifier: {
+        async planQuery() {
+          return JSON.stringify({
+            decision: "switch",
+            selectedHsCode: "9999.99.99",
+            confidence: "high",
+            reason: "mock unsupported switch"
+          });
+        }
+      }
+    });
+
+    expect(response.selectedPrimary).toMatchObject({ hsCode: "1006.30.70", title: "OTHER FRAGRANT RICE" });
+    expect((response.debug as { llmVerifierCalled?: boolean; llmVerifierAccepted?: boolean; llmVerifierSelectedHsCode?: string }).llmVerifierCalled).toBe(true);
+    expect((response.debug as { llmVerifierAccepted?: boolean }).llmVerifierAccepted).toBe(false);
+    expect((response.debug as { llmVerifierSelectedHsCode?: string }).llmVerifierSelectedHsCode).toBe("9999.99.99");
   });
 });
 

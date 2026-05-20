@@ -54,6 +54,7 @@ export interface RenderedHsCodeAnswer {
 }
 
 export type AnswerStyle = "class-eval" | "verbose";
+export type AnswerLanguage = "Vietnamese" | "English";
 
 export interface StructuredAnswer {
   productTitle: string | null;
@@ -1100,10 +1101,17 @@ export function prefersVietnameseAnswer(question: string | undefined): boolean {
     /\b(la|gi|can|phai|yeu|cau|ngoai|quan|nhin|trong|nhu|nao|chuong|tom|tat|noi|dung|cong|dung|dac|diem|ma|thuoc)\b/.test(normalized)) {
     return true;
   }
+  if (/[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]/i.test(question)) {
+    return true;
+  }
   if (!/[a-z]/i.test(question)) {
     return true;
   }
   return false;
+}
+
+export function answerLanguageForQuestion(question: string | undefined): AnswerLanguage {
+  return prefersVietnameseAnswer(question) ? "Vietnamese" : "English";
 }
 
 export function hasSectionHsMetadata(section: Pick<EnrichedRetrievedSection, "hsCode" | "groupedHsCodes">): boolean {
@@ -1142,49 +1150,61 @@ export function propagateGroupedSectionPageRanges<T extends SectionMetadata>(sec
 }
 
 function formatHsCodeLine(codes: string[], question: string | undefined): string {
+  const vietnamese = prefersVietnameseAnswer(question);
   if (codes.length <= 1) {
     return `HS Code: ${codes[0]}.`;
   }
 
   const joined = codes.length === 2
-    ? `${codes[0]} hoặc ${codes[1]}`
-    : `${codes.slice(0, -1).join(", ")} hoặc ${codes[codes.length - 1]}`;
-  const qualifier = question && questionSpecifiesState(question) ? "" : ", tùy trạng thái hàng hóa";
+    ? `${codes[0]} ${vietnamese ? "hoặc" : "or"} ${codes[1]}`
+    : `${codes.slice(0, -1).join(", ")} ${vietnamese ? "hoặc" : "or"} ${codes[codes.length - 1]}`;
+  const qualifier = question && questionSpecifiesState(question)
+    ? ""
+    : vietnamese
+      ? ", tùy trạng thái hàng hóa"
+      : ", depending on the product state";
   return `HS Code: ${joined}${qualifier}.`;
 }
 
 function renderClassEvalAnswer(structured: StructuredAnswer, question: string | undefined): string {
-  const product = structured.normalizedProductName || structured.productTitle || "sản phẩm phù hợp";
+  const vietnamese = prefersVietnameseAnswer(question);
+  const product = structured.normalizedProductName || structured.productTitle || (vietnamese ? "sản phẩm phù hợp" : "the matching product");
   const definition = isDefinitionStyleQuestion(question ?? "") && !asksForHsCodeOrClassificationQuestion(question ?? "")
     ? formatDefinitionExplanation(structured.conciseExplanation ?? firstSectionSentence(structured.selectedPrimary.text), question)
     : null;
   if (definition) {
     const definitionText = ensureSentenceEnd(stripHsCodes(definition));
-    const answer = `${definitionText} ${formatClassEvalHsCodeLine(structured.hsCodes)}`;
-    return validateClassEvalAnswer(answer, structured) ? answer : fallbackClassEvalAnswer(structured);
+    const answer = `${definitionText} ${formatClassEvalHsCodeLine(structured.hsCodes, question)}`;
+    return validateClassEvalAnswer(answer, structured) ? answer : fallbackClassEvalAnswer(structured, question);
   }
-  const prefix = `Sản phẩm là ${product},`;
-  const codeLine = formatClassEvalHsCodeLine(structured.hsCodes);
-  const note = structured.note ? ` Lưu ý: ${ensureSentenceEnd(stripHsCodes(structured.note))}` : "";
+  const prefix = vietnamese ? `Sản phẩm là ${product},` : `The product is ${product},`;
+  const codeLine = formatClassEvalHsCodeLine(structured.hsCodes, question);
+  const note = structured.note
+    ? ` ${vietnamese ? "Lưu ý" : "Note"}: ${ensureSentenceEnd(stripHsCodes(structured.note))}`
+    : "";
   const answer = `${prefix} ${codeLine}${note}`;
-  return validateClassEvalAnswer(answer, structured) ? answer : fallbackClassEvalAnswer(structured);
+  return validateClassEvalAnswer(answer, structured) ? answer : fallbackClassEvalAnswer(structured, question);
 }
 
-function formatClassEvalHsCodeLine(codes: string[]): string {
+function formatClassEvalHsCodeLine(codes: string[], question?: string): string {
+  const vietnamese = prefersVietnameseAnswer(question);
   if (codes.length === 0) {
-    return "HS Code: chưa có trong metadata.";
+    return vietnamese ? "HS Code: chưa có trong metadata." : "HS Code: not available in metadata.";
   }
   if (codes.length === 1) {
     return `HS Code: ${codes[0]}.`;
   }
-  return `HS Code: ${joinHsCodes(codes)}, tùy trạng thái hàng hóa trong biểu mã.`;
+  return vietnamese
+    ? `HS Code: ${joinHsCodes(codes, true)}, tùy trạng thái hàng hóa trong biểu mã.`
+    : `HS Code: ${joinHsCodes(codes, false)}, depending on the product state in the tariff.`;
 }
 
-function joinHsCodes(codes: string[]): string {
+function joinHsCodes(codes: string[], vietnamese = true): string {
+  const joiner = vietnamese ? "hoặc" : "or";
   if (codes.length <= 2) {
-    return codes.join(" hoặc ");
+    return codes.join(` ${joiner} `);
   }
-  return `${codes.slice(0, -1).join(", ")} hoặc ${codes[codes.length - 1]}`;
+  return `${codes.slice(0, -1).join(", ")} ${joiner} ${codes[codes.length - 1]}`;
 }
 
 function formatDefinitionExplanation(value: string | null, question: string | undefined): string | null {
@@ -1229,9 +1249,12 @@ function maxDefined(left: number | undefined, right: number | undefined): number
   return Math.max(left, right);
 }
 
-function fallbackClassEvalAnswer(structured: StructuredAnswer): string {
-  const product = structured.normalizedProductName || structured.productTitle || "sản phẩm phù hợp";
-  return `Sản phẩm là ${product}, ${formatClassEvalHsCodeLine(structured.hsCodes)}`;
+function fallbackClassEvalAnswer(structured: StructuredAnswer, question?: string): string {
+  const vietnamese = prefersVietnameseAnswer(question);
+  const product = structured.normalizedProductName || structured.productTitle || (vietnamese ? "sản phẩm phù hợp" : "the matching product");
+  return vietnamese
+    ? `Sản phẩm là ${product}, ${formatClassEvalHsCodeLine(structured.hsCodes, question)}`
+    : `The product is ${product}, ${formatClassEvalHsCodeLine(structured.hsCodes, question)}`;
 }
 
 function validateClassEvalAnswer(answer: string, structured: StructuredAnswer): boolean {
@@ -1459,6 +1482,7 @@ function normalizeComparable(value: string | undefined): string {
 
 function normalizeForSearch(value: string): string {
   return normalizeDisplayText(value)
+    .replace(/[\u0111\u0110]/g, "d")
     .replace(/[đĐ]/g, "d")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
@@ -1558,6 +1582,46 @@ const COUNTRY_PRODUCT_ALIAS_RULES = [
       "somaly",
       "premium aromatic",
       "extra-long"
+    ]
+  }
+];
+
+const DESCRIPTIVE_PRODUCT_ALIAS_RULES = [
+  {
+    triggers: [
+      "khoai tay",
+      "ham luong duong rat thap",
+      "duong rat thap",
+      "hinh dang tron",
+      "tron tria",
+      "chien",
+      "snack"
+    ],
+    aliases: [
+      "potato",
+      "potatoes",
+      "chipping potatoes",
+      "potato chip",
+      "chips",
+      "low sugar",
+      "round"
+    ]
+  },
+  {
+    triggers: [
+      "co quan noi tang chua khi",
+      "chua khi cua loai ca",
+      "suc noi",
+      "duy tri suc noi",
+      "can bang khoi luong duoi nuoc",
+      "bong ca",
+      "bong bong ca"
+    ],
+    aliases: [
+      "fish maws",
+      "swim bladder",
+      "gas-filled organ",
+      "dried fish maws"
     ]
   }
 ];
@@ -1831,7 +1895,7 @@ function extractKnownTerms(question: string, terms: string[]): string[] {
 
 function extractDomainAliasTerms(question: string, originTerms: string[]): string[] {
   const normalizedQuestion = normalizeForSearch(question);
-  return uniqueStrings(COUNTRY_PRODUCT_ALIAS_RULES.flatMap((rule) => {
+  const countryProductAliases = COUNTRY_PRODUCT_ALIAS_RULES.flatMap((rule) => {
     const hasOrigin = rule.originTriggers.some((trigger) =>
       originTerms.includes(normalizeForSearch(trigger)) || includesSignal(normalizedQuestion, trigger)
     );
@@ -1840,7 +1904,13 @@ function extractDomainAliasTerms(question: string, originTerms: string[]): strin
     }
     const hasProductGuard = rule.productGuards.some((guard) => includesSignal(normalizedQuestion, guard));
     return hasProductGuard ? rule.aliases.map((alias) => normalizeForSearch(alias)) : [];
-  }).filter(Boolean));
+  });
+  const descriptiveProductAliases = DESCRIPTIVE_PRODUCT_ALIAS_RULES.flatMap((rule) =>
+    rule.triggers.some((trigger) => includesSignal(normalizedQuestion, trigger))
+      ? rule.aliases.map((alias) => normalizeForSearch(alias))
+      : []
+  );
+  return uniqueStrings([...countryProductAliases, ...descriptiveProductAliases].filter(Boolean));
 }
 
 function buildUsefulPhrases(tokens: string[], sourceText: string): string[] {

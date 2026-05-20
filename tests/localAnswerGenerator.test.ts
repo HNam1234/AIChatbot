@@ -202,8 +202,8 @@ describe("local answer generator", () => {
       classificationRequested: true
     });
 
-    expect(result.answer).toContain("0207.14.10, 0207.27.10 hoặc 0207.45.10");
-    expect(result.answer).toContain("tùy trạng thái hàng hóa trong biểu mã");
+    expect(result.answer).toContain("0207.14.10, 0207.27.10 or 0207.45.10");
+    expect(result.answer).toContain("depending on the product state in the tariff");
     expect(result.answer?.match(/HS Code:/g)).toHaveLength(1);
   });
 

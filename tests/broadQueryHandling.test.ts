@@ -27,7 +27,7 @@ describe("broad query handling", () => {
 
     expect(result.answerMode).toBe("broad_lookup");
     expect(result.selectedPrimary).toBeNull();
-    expect(result.answer).toContain("Tìm thấy nhiều mục liên quan đến 'material':");
+    expect(result.answer).toContain("Found multiple items related to 'material':");
     expect(result.answer).toContain("Alpha material");
     expect(result.answer).toContain("Beta material");
     expect(result.answer).not.toContain("Sản phẩm là");

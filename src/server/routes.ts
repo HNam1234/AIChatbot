@@ -52,6 +52,7 @@ import { createLlmClient, getLlmAvailability, type LlmClient } from "../agent/ll
 import {
   buildStructuredRetrievedContext,
   detectContrastTerms,
+  answerLanguageForQuestion,
   evaluateCandidateRelevance,
   extractQuerySignals,
   enrichRetrievedHit,
@@ -158,6 +159,10 @@ interface CachedTreeRetrievalResult {
 
 type PublicIndexSource = "fresh_cached_tree" | "stale_cached_tree" | "local_sections" | "bm25_fallback" | "pageindex_live" | "unknown";
 type AnswerStyleOption = "class-eval" | "verbose";
+export type QaMode = "fast" | "accuracy";
+
+const ACCURACY_QUERY_EXPANSION_TIMEOUT_MS = 12_000;
+const ACCURACY_LLM_DECISION_TIMEOUT_MS = 12_000;
 
 interface CacheFreshnessSummary {
   fresh: string[];
@@ -1260,15 +1265,20 @@ export async function answerFromCachedTrees(
     localSectionDocuments?: string[];
     selectedSectionAnswerer?: Pick<LlmClient, "synthesizeSectionAnswer">;
     candidateReranker?: Pick<LlmClient, "planQuery">;
+    candidateVerifier?: Pick<LlmClient, "planQuery">;
     answerStyle?: AnswerStyleOption;
     enableLlmQa?: boolean;
+    qaMode?: QaMode;
     queryExpansionProvider?: QueryExpansionProvider;
     queryExpansionConfig?: Partial<QueryExpansionRuntimeConfig>;
   } = {}
 ): Promise<Record<string, unknown>> {
   const startedAt = Date.now();
   const detection = detectIntent(question);
-  const enableLlmQa = options.enableLlmQa ?? loadEnvConfig().enableLlmQa;
+  const qaMode = options.qaMode ?? "fast";
+  const answerLanguage = answerLanguageForQuestion(question);
+  const envConfig = loadEnvConfig();
+  const enableLlmQa = qaMode === "accuracy" ? options.enableLlmQa ?? true : options.enableLlmQa ?? envConfig.enableLlmQa;
   const answerStyle = options.answerStyle ?? "class-eval";
   const selectedCachedTreeDocuments = uniqueStrings(options.cachedTreeDocuments ?? []);
   const localSectionDocuments = uniqueStrings(options.localSectionDocuments ?? []);
@@ -1278,6 +1288,7 @@ export async function answerFromCachedTrees(
     scope: scope.mode,
     overrideGeminiKeys: options.geminiApiKeys?.length ?? 0,
     enableLlmQa,
+    qaMode,
     selectedCachedTreeDocuments: selectedCachedTreeDocuments.length,
     localSectionDocuments: localSectionDocuments.length
   });
@@ -1285,6 +1296,7 @@ export async function answerFromCachedTrees(
     intent: detection.intent,
     plannerSource: detection.plannerSource,
     enableLlmQa,
+    qaMode,
     scope: scope.mode
   });
   const forceLocalSections = localSectionDocuments.length > 0 && selectedCachedTreeDocuments.length === 0;
@@ -1318,6 +1330,8 @@ export async function answerFromCachedTrees(
     intentReason: detection.reason,
     queryPlan: detection.queryPlan,
     plannerSource: detection.plannerSource,
+    qaMode,
+    answerLanguage,
     llmCalled: false,
     llmSkippedReason: null,
     llmErrorType: null,
@@ -1329,6 +1343,11 @@ export async function answerFromCachedTrees(
     llmRerankCalled: false,
     llmRerankSelectedHsCode: null,
     llmRerankReason: null,
+    llmVerifierCalled: false,
+    llmVerifierDecision: null,
+    llmVerifierSelectedHsCode: null,
+    llmVerifierReason: null,
+    llmVerifierRiskReasons: [],
     candidateAliasSignals: [],
     indexSource: {
       selectedCachedTreeDocuments,
@@ -1399,9 +1418,10 @@ export async function answerFromCachedTrees(
   }
 
   const searchStartedAt = Date.now();
+  const queryExpansionConfig = resolveQaQueryExpansionConfig(qaMode, envConfig, options.queryExpansionConfig);
   const queryExpansion = await expandQueryForRetrievalWithDebug(question, {
     provider: options.queryExpansionProvider,
-    config: options.queryExpansionConfig
+    config: queryExpansionConfig
   });
   const retrievalQuestion = queryExpansion.result.expandedQuery;
   serverTrace("qna", "query expansion completed", {
@@ -1409,6 +1429,7 @@ export async function answerFromCachedTrees(
     confidence: queryExpansion.result.confidence,
     expansionTermCount: queryExpansion.result.expansionTerms.length,
     cacheHit: queryExpansion.debug.cacheHit,
+    retryCount: queryExpansion.debug.retryCount,
     error: queryExpansion.debug.error
   });
   const retrieval = documents.length > 0
@@ -1417,7 +1438,9 @@ export async function answerFromCachedTrees(
   let hits = retrieval.hits;
   const debugReport = {
     ...createQaDebugReport(question, retrieval),
-    queryExpansion: queryExpansion.debug
+    queryExpansion: queryExpansion.debug,
+    queryExpansionRetryCount: queryExpansion.debug.retryCount,
+    queryExpansionError: queryExpansion.debug.error
   };
   serverTrace("answerFromCachedTrees", "cached tree search completed", {
     hitCount: hits.length,
@@ -1458,6 +1481,7 @@ export async function answerFromCachedTrees(
       docIds: [],
       documents: documents.map((document) => document.document),
       mode: "cached-tree",
+      qaMode,
       indexSourceDetails: indexSource,
       retrieval: {
         source: retrieval.retrievalSource,
@@ -1504,18 +1528,54 @@ export async function answerFromCachedTrees(
     hits,
     candidates: candidateRelevance,
     enableLlmQa,
+    qaMode,
     geminiApiKeys: options.geminiApiKeys,
     candidateReranker: options.candidateReranker
   });
   hits = llmRerankResult.hits;
+  const llmVerifierResult = await maybeVerifyCandidateHitsWithLlm({
+    question,
+    hits,
+    candidates: candidateRelevance,
+    enableLlmQa,
+    qaMode,
+    geminiApiKeys: options.geminiApiKeys,
+    candidateVerifier: options.candidateVerifier,
+    rerankDebug: llmRerankResult.debug
+  });
+  hits = llmVerifierResult.hits;
   const selectedAfterRerank = matchingCandidateForSection(hits[0], candidateRelevance);
   Object.assign(debugReport, {
     ...llmRerankResult.debug,
+    ...llmVerifierResult.debug,
     selectedCandidateValidation: selectedAfterRerank?.validation ?? null,
     strongSignals: selectedAfterRerank?.validation?.strongSignals ?? [],
     weakSignals: selectedAfterRerank?.validation?.weakSignals ?? [],
     missingEvidence: selectedAfterRerank?.validation?.missingEvidence ?? []
   });
+
+  if (llmVerifierResult.shouldClarify) {
+    const indexSource = buildIndexSource(retrieval, documents, uniqueStrings(hits.map((hit) => hit.document)));
+    const routed = handleClarificationNeeded(question, detection, {
+      ...baseDebug,
+      ...debugReport,
+      indexSource,
+      answerGeneration: "safe-fallback",
+      llmCalled: false,
+      llmSkippedReason: "llm_verifier_clarify",
+      llmErrorType: llmVerifierResult.debug.llmVerifierErrorType,
+      fallbackReason: "llm_verifier_clarify"
+    });
+    return finalizeRoutedAnswer(routed, {
+      mode: "cached-tree",
+      documents,
+      sourceDocuments: [],
+      retrieval,
+      debug: options.debug,
+      cacheInfo: responseCacheInfo,
+      scope
+    });
+  }
 
   const hydratedPrimary = hydrateSelectedSectionText(hits[0], sectionMetadata, documentMetadata);
   const sectionTextChars = selectedSectionTextChars(hydratedPrimary);
@@ -1604,6 +1664,20 @@ export async function answerFromCachedTrees(
         reason: llmSkippedReason,
         answerGeneration
       });
+    } else if (qaMode === "accuracy") {
+      llmSkippedReason = "accuracy_mode_template_answer";
+      answerGeneration = "template-classification";
+      serverTrace("answerFromCachedTrees", "accuracy template used", {
+        intent: "product_classification",
+        selectedSection: hits[0].section,
+        answerStyle,
+        localExtractorUsed,
+        localExtractorReason
+      });
+      serverTrace("qna", "llm skipped", {
+        reason: llmSkippedReason,
+        answerGeneration
+      });
     } else if (!enableLlmQa || sectionTextChars === 0) {
       llmSkippedReason = !enableLlmQa ? "ENABLE_LLM_QA=false" : "missing_section_text";
       serverTrace("answerFromCachedTrees", "metadata template used", {
@@ -1643,7 +1717,7 @@ export async function answerFromCachedTrees(
             source: hydratedPrimary.source,
             text: hydratedPrimary.text,
             context: selectedSectionContext
-          }, question, { language: "Vietnamese" });
+          }, question, { language: answerLanguage });
           if (llmAnswer?.trim()) {
             answerGeneration = "llm-selected-section";
             fallbackReason = null;
@@ -1712,7 +1786,7 @@ export async function answerFromCachedTrees(
             source: hydratedPrimary.source,
             text: hydratedPrimary.text,
             context: selectedSectionContext
-          }, question, { language: "Vietnamese" });
+          }, question, { language: answerLanguage });
           if (llmAnswer?.trim()) {
             answerGeneration = "llm-selected-section";
             fallbackReason = null;
@@ -1830,7 +1904,7 @@ export async function answerFromCachedTrees(
               text: section.text
             }));
             const comparisonLlm = createLlmClient({ apiKeys: options.geminiApiKeys });
-            llmAnswer = await comparisonLlm.synthesizeComparisonAnswer(comparisonSections, question, { language: "Vietnamese" });
+            llmAnswer = await comparisonLlm.synthesizeComparisonAnswer(comparisonSections, question, { language: answerLanguage });
           } else {
             llmAnswer = await llm.synthesizeSectionAnswer({
               document: hydratedPrimary.document,
@@ -1840,7 +1914,7 @@ export async function answerFromCachedTrees(
               source: hydratedPrimary.source,
               text: hydratedPrimary.text,
               context: selectedSectionContext
-            }, question, { language: "Vietnamese" });
+            }, question, { language: answerLanguage });
           }
 
           if (!llmAnswer?.trim()) {
@@ -1982,6 +2056,7 @@ export async function answerFromCachedTrees(
     docIds: [],
     documents: sourceDocuments,
     mode: "cached-tree",
+    qaMode,
     indexSource: cacheInfo.indexSource,
     indexSourceDetails: indexSource,
     cachedDocumentCount: cacheInfo.cachedDocumentCount,
@@ -2123,7 +2198,9 @@ export async function answerQuestionForEval(
     localSectionDocuments?: string[];
     selectedSectionAnswerer?: Pick<LlmClient, "synthesizeSectionAnswer">;
     candidateReranker?: Pick<LlmClient, "planQuery">;
+    candidateVerifier?: Pick<LlmClient, "planQuery">;
     enableLlmQa?: boolean;
+    qaMode?: QaMode;
     queryExpansionProvider?: QueryExpansionProvider;
     queryExpansionConfig?: Partial<QueryExpansionRuntimeConfig>;
     debug?: boolean;
@@ -2133,7 +2210,7 @@ export async function answerQuestionForEval(
     ...options,
     answerStyle: "class-eval",
     geminiApiKeys: [],
-    enableLlmQa: options.enableLlmQa ?? false
+    enableLlmQa: options.qaMode === "accuracy" ? options.enableLlmQa ?? true : options.enableLlmQa ?? false
   });
 }
 
@@ -2142,9 +2219,23 @@ interface LlmCandidateRerankDebug {
   llmRerankSelectedHsCode: string | null;
   llmRerankReason: string | null;
   llmRerankAccepted: boolean;
+  llmRerankChangedTop: boolean;
   llmRerankProvider: string | null;
   llmRerankErrorType: string | null;
   llmRerankCandidateCount: number;
+}
+
+interface LlmCandidateVerifierDebug {
+  llmVerifierCalled: boolean;
+  llmVerifierDecision: "accept" | "switch" | "clarify" | null;
+  llmVerifierSelectedHsCode: string | null;
+  llmVerifierReason: string | null;
+  llmVerifierAccepted: boolean;
+  llmVerifierProvider: string | null;
+  llmVerifierErrorType: "quota" | "rate_limit" | "permission" | "timeout" | "empty" | "unknown" | null;
+  llmVerifierCandidateCount: number;
+  llmVerifierRetryCount: number;
+  llmVerifierRiskReasons: string[];
 }
 
 async function maybeRerankCandidateHitsWithLlm(args: {
@@ -2152,6 +2243,7 @@ async function maybeRerankCandidateHitsWithLlm(args: {
   hits: EnrichedRetrievedSection[];
   candidates: CandidateRelevance[];
   enableLlmQa: boolean;
+  qaMode: QaMode;
   geminiApiKeys?: string[];
   candidateReranker?: Pick<LlmClient, "planQuery">;
 }): Promise<{ hits: EnrichedRetrievedSection[]; debug: LlmCandidateRerankDebug }> {
@@ -2165,9 +2257,6 @@ async function maybeRerankCandidateHitsWithLlm(args: {
 
   const availability = getLlmAvailability({ apiKeys: args.geminiApiKeys });
   const injected = Boolean(args.candidateReranker);
-  if (!injected && availability.provider !== "bifrost") {
-    return { hits: args.hits, debug: { ...debug, llmRerankProvider: availability.provider, llmRerankReason: "provider_not_bifrost" } };
-  }
   if (!injected && !availability.configured) {
     return {
       hits: args.hits,
@@ -2219,6 +2308,7 @@ async function maybeRerankCandidateHitsWithLlm(args: {
 
   serverTrace("qna", "llm rerank called", {
     provider,
+    qaMode: args.qaMode,
     candidateCount: candidatePayload.length,
     aliasSignals: uniqueStrings(candidatePayload.flatMap((candidate) => candidate.aliasSignals))
   });
@@ -2260,6 +2350,7 @@ async function maybeRerankCandidateHitsWithLlm(args: {
         ...debug,
         llmRerankCalled: true,
         llmRerankAccepted: true,
+        llmRerankChangedTop: selectedIndex !== 0,
         llmRerankProvider: provider,
         llmRerankSelectedHsCode: selectedHsCode,
         llmRerankReason: parsed?.reason ?? null,
@@ -2293,10 +2384,287 @@ function defaultLlmCandidateRerankDebug(): LlmCandidateRerankDebug {
     llmRerankSelectedHsCode: null,
     llmRerankReason: null,
     llmRerankAccepted: false,
+    llmRerankChangedTop: false,
     llmRerankProvider: null,
     llmRerankErrorType: null,
     llmRerankCandidateCount: 0
   };
+}
+
+async function maybeVerifyCandidateHitsWithLlm(args: {
+  question: string;
+  hits: EnrichedRetrievedSection[];
+  candidates: CandidateRelevance[];
+  enableLlmQa: boolean;
+  qaMode: QaMode;
+  geminiApiKeys?: string[];
+  candidateVerifier?: Pick<LlmClient, "planQuery">;
+  rerankDebug: LlmCandidateRerankDebug;
+}): Promise<{ hits: EnrichedRetrievedSection[]; debug: LlmCandidateVerifierDebug; shouldClarify: boolean }> {
+  const riskReasons = detectCandidateVerificationRisks(args);
+  const debug = defaultLlmCandidateVerifierDebug(riskReasons);
+  if (args.qaMode !== "accuracy" || args.hits.length <= 1 || !asksForHsCodeOrClassification(args.question)) {
+    return { hits: args.hits, debug, shouldClarify: false };
+  }
+  if (riskReasons.length === 0) {
+    return { hits: args.hits, debug: { ...debug, llmVerifierReason: "not_risky" }, shouldClarify: false };
+  }
+  if (!args.enableLlmQa) {
+    return {
+      hits: args.hits,
+      debug: { ...debug, llmVerifierReason: "ENABLE_LLM_QA=false" },
+      shouldClarify: !hasStrongTopValidation(args.hits, args.candidates)
+    };
+  }
+
+  const availability = getLlmAvailability({ apiKeys: args.geminiApiKeys });
+  const injected = Boolean(args.candidateVerifier);
+  if (!injected && !availability.configured) {
+    return {
+      hits: args.hits,
+      debug: {
+        ...debug,
+        llmVerifierProvider: availability.provider,
+        llmVerifierReason: availability.unavailableReason ?? "llm_unavailable"
+      },
+      shouldClarify: !hasStrongTopValidation(args.hits, args.candidates)
+    };
+  }
+
+  const candidatePayload = args.hits.slice(0, 6).map((hit, index) => {
+    const candidate = matchingCandidateForSection(hit, args.candidates);
+    return {
+      rank: index + 1,
+      document: hit.document,
+      hsCode: hit.hsCode ?? null,
+      groupedHsCodes: hit.groupedHsCodes ?? [],
+      title: hit.title ?? null,
+      section: hit.section ?? null,
+      source: hit.source ?? null,
+      score: hit.score,
+      matchedTerms: candidate?.matchedTerms ?? [],
+      matchedPhrases: candidate?.candidateMatchedPhrases ?? [],
+      aliasSignals: candidate?.candidateAliasSignals ?? [],
+      numericMatches: candidate?.numericMatches ?? [],
+      validation: candidate?.validation ?? null,
+      excerpt: shortPromptExcerpt([hit.text, ...(hit.captions ?? [])].filter(Boolean).join("\n"))
+    };
+  });
+  const allowedHsCodes = new Set(candidatePayload.flatMap((candidate) => [
+    typeof candidate.hsCode === "string" ? candidate.hsCode : "",
+    ...candidate.groupedHsCodes
+  ]).filter(Boolean));
+  if (allowedHsCodes.size === 0) {
+    return { hits: args.hits, debug: { ...debug, llmVerifierReason: "no_candidate_hscode" }, shouldClarify: false };
+  }
+
+  const provider = injected ? "injected" : availability.provider;
+  const prompt = [
+    "You are a strict verifier for HS code classification.",
+    "Use only the candidate list below. Do not invent HS codes.",
+    "Decision rules:",
+    "- accept: current rank 1 is supported by the query and evidence.",
+    "- switch: another listed candidate is clearly better.",
+    "- clarify: evidence is insufficient or the query is ambiguous.",
+    "For switch, selectedHsCode must be one HS code from the candidate list.",
+    "Return strict JSON only: {\"decision\":\"accept|switch|clarify\",\"selectedHsCode\":\"1000.00.00|null\",\"confidence\":\"high|medium|low\",\"reason\":\"short reason\"}.",
+    "",
+    `User query: ${args.question}`,
+    `Risk reasons: ${riskReasons.join(", ")}`,
+    "",
+    `Candidates:\n${JSON.stringify(candidatePayload, null, 2)}`
+  ].join("\n");
+
+  const verifier = args.candidateVerifier ?? createLlmClient({ apiKeys: args.geminiApiKeys });
+  let retryCount = 0;
+  let lastErrorType: LlmCandidateVerifierDebug["llmVerifierErrorType"] = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      serverTrace("qna", "llm verifier called", {
+        provider,
+        qaMode: args.qaMode,
+        attempt: attempt + 1,
+        riskReasons
+      });
+      const raw = await withOperationTimeout(
+        verifier.planQuery(prompt, { temperature: 0, maxOutputTokens: 300 }),
+        ACCURACY_LLM_DECISION_TIMEOUT_MS,
+        "LLM verifier"
+      );
+      const parsed = parseLlmVerifierResponse(raw);
+      const selectedHsCode = parsed?.selectedHsCode ?? null;
+      const decision = parsed?.decision ?? null;
+      const confidence = parsed?.confidence ?? "low";
+      const selectedIndex = selectedHsCode
+        ? args.hits.findIndex((hit) => hsCodesForSection(hit).includes(selectedHsCode))
+        : -1;
+      const highEnough = confidence === "medium" || confidence === "high";
+      const acceptsTop = decision === "accept" && highEnough;
+      const switchesToAllowed = decision === "switch" &&
+        highEnough &&
+        Boolean(selectedHsCode && allowedHsCodes.has(selectedHsCode)) &&
+        selectedIndex >= 0;
+      serverTrace("qna", "llm verifier completed", {
+        provider,
+        decision,
+        selectedHsCode,
+        confidence,
+        accepted: acceptsTop || switchesToAllowed,
+        reason: parsed?.reason ?? null
+      });
+
+      if (switchesToAllowed) {
+        const selected = args.hits[selectedIndex];
+        return {
+          hits: [selected, ...args.hits.filter((_, index) => index !== selectedIndex)],
+          debug: {
+            ...debug,
+            llmVerifierCalled: true,
+            llmVerifierDecision: decision,
+            llmVerifierSelectedHsCode: selectedHsCode,
+            llmVerifierReason: parsed?.reason ?? null,
+            llmVerifierAccepted: true,
+            llmVerifierProvider: provider,
+            llmVerifierCandidateCount: candidatePayload.length,
+            llmVerifierRetryCount: retryCount
+          },
+          shouldClarify: false
+        };
+      }
+
+      if (acceptsTop) {
+        return {
+          hits: args.hits,
+          debug: {
+            ...debug,
+            llmVerifierCalled: true,
+            llmVerifierDecision: decision,
+            llmVerifierSelectedHsCode: selectedHsCode,
+            llmVerifierReason: parsed?.reason ?? null,
+            llmVerifierAccepted: true,
+            llmVerifierProvider: provider,
+            llmVerifierCandidateCount: candidatePayload.length,
+            llmVerifierRetryCount: retryCount
+          },
+          shouldClarify: false
+        };
+      }
+
+      const shouldClarify = decision === "clarify" && !hasStrongTopValidation(args.hits, args.candidates);
+      return {
+        hits: args.hits,
+        debug: {
+          ...debug,
+          llmVerifierCalled: true,
+          llmVerifierDecision: decision,
+          llmVerifierSelectedHsCode: selectedHsCode,
+          llmVerifierReason: parsed?.reason ?? "verifier_response_not_accepted",
+          llmVerifierProvider: provider,
+          llmVerifierCandidateCount: candidatePayload.length,
+          llmVerifierRetryCount: retryCount
+        },
+        shouldClarify
+      };
+    } catch (error) {
+      lastErrorType = classifyLlmErrorType(error);
+      if (attempt === 0) {
+        retryCount += 1;
+        continue;
+      }
+    }
+  }
+
+  const strongTop = hasStrongTopValidation(args.hits, args.candidates);
+  serverTrace("qna", "llm verifier failed", {
+    provider,
+    errorType: lastErrorType,
+    fallback: strongTop ? "deterministic_top" : "clarify"
+  });
+  return {
+    hits: args.hits,
+    debug: {
+      ...debug,
+      llmVerifierCalled: true,
+      llmVerifierProvider: provider,
+      llmVerifierErrorType: lastErrorType,
+      llmVerifierReason: lastErrorType && lastErrorType !== "unknown" ? `llm_verifier_${lastErrorType}` : "llm_verifier_failed",
+      llmVerifierCandidateCount: candidatePayload.length,
+      llmVerifierRetryCount: retryCount
+    },
+    shouldClarify: !strongTop
+  };
+}
+
+function defaultLlmCandidateVerifierDebug(riskReasons: string[] = []): LlmCandidateVerifierDebug {
+  return {
+    llmVerifierCalled: false,
+    llmVerifierDecision: null,
+    llmVerifierSelectedHsCode: null,
+    llmVerifierReason: null,
+    llmVerifierAccepted: false,
+    llmVerifierProvider: null,
+    llmVerifierErrorType: null,
+    llmVerifierCandidateCount: 0,
+    llmVerifierRetryCount: 0,
+    llmVerifierRiskReasons: riskReasons
+  };
+}
+
+function detectCandidateVerificationRisks(args: {
+  hits: EnrichedRetrievedSection[];
+  candidates: CandidateRelevance[];
+  rerankDebug: LlmCandidateRerankDebug;
+}): string[] {
+  const topHit = args.hits[0];
+  if (!topHit) {
+    return ["missing_top_candidate"];
+  }
+  const topCandidate = topHit ? matchingCandidateForSection(topHit, args.candidates) : undefined;
+  const risks: string[] = [];
+  const validation = topCandidate?.validation;
+  if (!validation) {
+    risks.push("missing_validation");
+  } else {
+    if (validation.confidence !== "high") risks.push("validation_not_high");
+    if (validation.weakSignals.length > 0) risks.push("weak_validation_signals");
+    if (validation.missingEvidence.length > 0) risks.push("missing_evidence");
+  }
+
+  const topScore = topCandidate?.finalScore ?? topHit?.score ?? 0;
+  const secondHit = args.hits[1];
+  const secondCandidate = secondHit ? matchingCandidateForSection(secondHit, args.candidates) : undefined;
+  const secondScore = secondCandidate?.finalScore ?? secondHit?.score ?? 0;
+  if (Number.isFinite(topScore) && Number.isFinite(secondScore) && topScore - secondScore < 15) {
+    risks.push("low_top_margin");
+  }
+  if (args.rerankDebug.llmRerankAccepted && args.rerankDebug.llmRerankChangedTop) {
+    risks.push("rerank_changed_top");
+  }
+  if (topCandidate?.numericMatches.length && validation?.confidence !== "high") {
+    risks.push("numeric_evidence_weak");
+  }
+  if (args.candidates.some((candidate) => /numeric/i.test(candidate.rejectedReason ?? ""))) {
+    risks.push("numeric_evidence_rejected_candidate");
+  }
+  const topChapterPrefixes = new Set(hsCodesForSection(topHit).map((code) => code.slice(0, 4)).filter(Boolean));
+  const sameChapterCount = args.hits.slice(0, 5).filter((hit) =>
+    hsCodesForSection(hit).some((code) => topChapterPrefixes.has(code.slice(0, 4)))
+  ).length;
+  if (sameChapterCount >= 3) {
+    risks.push("multiple_nearby_hs_candidates");
+  }
+  return uniqueStrings(risks);
+}
+
+function hasStrongTopValidation(hits: EnrichedRetrievedSection[], candidates: CandidateRelevance[]): boolean {
+  const top = hits[0] ? matchingCandidateForSection(hits[0], candidates) : undefined;
+  const validation = top?.validation;
+  return Boolean(
+    validation?.accepted &&
+    validation.confidence === "high" &&
+    validation.missingEvidence.length === 0 &&
+    validation.strongSignals.length > 0
+  );
 }
 
 function parseLlmRerankResponse(value: string): { selectedHsCode: string | null; confidence: "high" | "medium" | "low"; reason: string | null } | null {
@@ -2316,6 +2684,39 @@ function parseLlmRerankResponse(value: string): { selectedHsCode: string | null;
       : "low";
     const reason = typeof parsed.reason === "string" ? parsed.reason.slice(0, 240) : null;
     return { selectedHsCode, confidence, reason };
+  } catch {
+    return null;
+  }
+}
+
+function parseLlmVerifierResponse(value: string): {
+  decision: "accept" | "switch" | "clarify";
+  selectedHsCode: string | null;
+  confidence: "high" | "medium" | "low";
+  reason: string | null;
+} | null {
+  const json = extractJsonObjectText(value);
+  if (!json) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(json) as Record<string, unknown>;
+    const decision = parsed.decision === "accept" || parsed.decision === "switch" || parsed.decision === "clarify"
+      ? parsed.decision
+      : null;
+    if (!decision) {
+      return null;
+    }
+    const selectedHsCode = typeof parsed.selectedHsCode === "string"
+      ? parsed.selectedHsCode.match(HS_CODE_PATTERN)?.[0] ?? null
+      : typeof parsed.hsCode === "string"
+        ? parsed.hsCode.match(HS_CODE_PATTERN)?.[0] ?? null
+        : null;
+    const confidence = parsed.confidence === "high" || parsed.confidence === "medium" || parsed.confidence === "low"
+      ? parsed.confidence
+      : "low";
+    const reason = typeof parsed.reason === "string" ? parsed.reason.slice(0, 240) : null;
+    return { decision, selectedHsCode, confidence, reason };
   } catch {
     return null;
   }
@@ -2483,6 +2884,18 @@ function classifyLlmErrorType(error: unknown): "quota" | "rate_limit" | "permiss
   return "unknown";
 }
 
+function withOperationTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<T>((_resolve, reject) => {
+    timeout = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms.`)), timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  });
+}
+
 function errorStatus(error: unknown): number | undefined {
   const candidate = error as { status?: unknown; response?: { status?: unknown }; code?: unknown };
   if (typeof candidate.status === "number") return candidate.status;
@@ -2559,6 +2972,7 @@ function finalizeRoutedAnswer(
     docIds: [],
     documents: options.sourceDocuments,
     mode: options.mode,
+    qaMode: routed.debug.qaMode ?? "fast",
     indexSource: cacheInfo.indexSource,
     indexSourceDetails: indexSource,
     cachedDocumentCount: cacheInfo.cachedDocumentCount,
@@ -3157,7 +3571,9 @@ function defaultQueryExpansionDebug(question: string): QueryExpansionDebug {
     expansionSource: "none",
     confidence: "low",
     error: null,
-    cacheHit: false
+    cacheHit: false,
+    retryCount: 0,
+    timedOut: false
   };
 }
 
@@ -3388,6 +3804,7 @@ function tokenizeForSearch(text: string): string[] {
 
 function normalizeSearchText(text: string): string {
   return text
+    .replace(/[\u0111\u0110]/g, "d")
     .replace(/[đĐ]/g, "d")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
@@ -3591,6 +4008,29 @@ function hasOwn(value: unknown, key: string): boolean {
 
 function parseAnswerStyle(value: unknown): AnswerStyleOption {
   return value === "verbose" ? "verbose" : "class-eval";
+}
+
+function resolveQaQueryExpansionConfig(
+  qaMode: QaMode,
+  envConfig: ReturnType<typeof loadEnvConfig>,
+  override: Partial<QueryExpansionRuntimeConfig> | undefined
+): Partial<QueryExpansionRuntimeConfig> | undefined {
+  if (qaMode !== "accuracy") {
+    return override;
+  }
+  const provider = override?.provider && override.provider !== "none"
+    ? override.provider
+    : envConfig.queryExpansionProvider !== "none"
+      ? envConfig.queryExpansionProvider
+      : "openai";
+  return {
+    ...override,
+    enabled: true,
+    provider,
+    timeoutMs: override?.timeoutMs ?? ACCURACY_QUERY_EXPANSION_TIMEOUT_MS,
+    cacheEnabled: override?.cacheEnabled ?? true,
+    retryCount: override?.retryCount ?? 1
+  };
 }
 
 function relativePath(filePath: string | undefined): string | undefined {

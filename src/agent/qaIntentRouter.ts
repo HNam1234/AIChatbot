@@ -274,7 +274,9 @@ export function handleExactHsCodeLookup(
     ? prefersVietnameseAnswer(query)
       ? answer
       : `HS Code ${exactCode} is ${normalizeProductTitle(title)}.`
-    : answer;
+    : prefersVietnameseAnswer(query)
+      ? answer
+      : `HS Code ${exactCode} was not found in the current metadata.`;
 
   return {
     intent: "exact_hscode_lookup",
@@ -422,7 +424,7 @@ export function handleDefinition(
   localAnswer?: string
 ): RoutedQaAnswer {
   if (detection.queryPlan?.confidence === "low") {
-    return emptyIntentAnswer("definition", clarificationAnswer(), detection, candidates, baseDebug, {
+    return emptyIntentAnswer("definition", clarificationAnswer(query), detection, candidates, baseDebug, {
       answerMode: "clarification",
       answerConfidence: "low",
       confidenceReason: "query plan confidence is low",
@@ -433,7 +435,7 @@ export function handleDefinition(
     });
   }
   if (!selectedSection) {
-    return emptyIntentAnswer("definition", clarificationAnswer(), detection, candidates, baseDebug, {
+    return emptyIntentAnswer("definition", clarificationAnswer(query), detection, candidates, baseDebug, {
       answerMode: "clarification",
       answerConfidence: "low",
       confidenceReason: "no relevant section found for definition",
@@ -445,7 +447,7 @@ export function handleDefinition(
   }
   const gate = definitionGate(query, selectedSection, candidates);
   if (gate.shouldAskClarification) {
-    return emptyIntentAnswer("definition", clarificationAnswer(), detection, candidates, baseDebug, gate);
+    return emptyIntentAnswer("definition", clarificationAnswer(query), detection, candidates, baseDebug, gate);
   }
   const cleanedLocalAnswer = cleanDefinitionLocalAnswer(localAnswer);
   if (cleanedLocalAnswer) {
@@ -489,7 +491,7 @@ export function handleProductClassification(
 ): RoutedQaAnswer {
   if (!selectedSection) {
     const gate = productGate(query, undefined, candidates);
-    return emptyIntentAnswer("product_classification", gate.answerMode === "numeric_lookup" ? numericOnlyClarificationAnswer(query) : clarificationAnswer(), detection, candidates, baseDebug, gate);
+    return emptyIntentAnswer("product_classification", gate.answerMode === "numeric_lookup" ? numericOnlyClarificationAnswer(query) : clarificationAnswer(query), detection, candidates, baseDebug, gate);
   }
   let broadDecision = detectBroadQuery({
     originalQuery: query,
@@ -526,10 +528,10 @@ export function handleProductClassification(
     if (lookupCandidates.length > 0) {
       return multiResultLookupIntentAnswer("product_classification", query, lookupCandidates, selectedSection, detection, baseDebug, gate);
     }
-    return emptyIntentAnswer("product_classification", clarificationAnswer(), detection, candidates, baseDebug, gate);
+    return emptyIntentAnswer("product_classification", clarificationAnswer(query), detection, candidates, baseDebug, gate);
   }
   if (gate.shouldAskClarification) {
-    return emptyIntentAnswer("product_classification", clarificationAnswer(), detection, candidates, baseDebug, gate);
+    return emptyIntentAnswer("product_classification", clarificationAnswer(query), detection, candidates, baseDebug, gate);
   }
   const rendered = renderHsCodeAnswer(llmAnswer, selectedSection, alternatives, { question: query, answerStyle: "class-eval" });
   return renderedIntentAnswer("product_classification", rendered, selectedSection, candidates, detection, baseDebug, gate);
@@ -609,7 +611,7 @@ export function handleSelectedSectionQa(
   }
 
   if (!selectedSection) {
-    return emptyIntentAnswer("selected_section_qa", clarificationAnswer(), detection, candidates, baseDebug, {
+    return emptyIntentAnswer("selected_section_qa", clarificationAnswer(query), detection, candidates, baseDebug, {
       answerMode: "clarification",
       answerConfidence: "low",
       confidenceReason: "no sufficiently relevant section found",
@@ -630,12 +632,12 @@ export function handleSelectedSectionQa(
       return broadLookupIntentAnswer("selected_section_qa", query, lookupCandidates, selectedSection, detection, baseDebug, broadDecision);
     }
     const gate = deterministicGate("clarification", "low", topCandidate(candidates)?.finalScore ?? 0, [], broadDecision.reason);
-    return emptyIntentAnswer("selected_section_qa", isNumericOnlyQuery(query) ? numericOnlyClarificationAnswer(query, selectedSection) : clarificationAnswer(), detection, candidates, baseDebug, gate, broadDecision);
+    return emptyIntentAnswer("selected_section_qa", isNumericOnlyQuery(query) ? numericOnlyClarificationAnswer(query, selectedSection) : clarificationAnswer(query), detection, candidates, baseDebug, gate, broadDecision);
   }
 
   const gate = selectedSectionGate(selectedSection, candidates);
   if (gate.shouldAskClarification) {
-    return emptyIntentAnswer("selected_section_qa", clarificationAnswer(), detection, candidates, baseDebug, gate);
+    return emptyIntentAnswer("selected_section_qa", clarificationAnswer(query), detection, candidates, baseDebug, gate);
   }
 
   const selectedPrimary = publicSection(selectedSection);
@@ -658,7 +660,7 @@ export function handleSelectedSectionQa(
   effectiveAnswerGeneration = effectiveAnswerGeneration ?? (cleanedAnswer ? "llm-selected-section" : "safe-fallback");
   const usedGeneratedAnswer = Boolean(cleanedAnswer) && !effectiveFallbackReason && effectiveAnswerGeneration !== "safe-fallback";
   const answer = maybeAppendRelatedHsCode(
-    cleanedAnswer || safeSelectedSectionFallbackAnswer(selectedSection),
+    cleanedAnswer || safeSelectedSectionFallbackAnswer(selectedSection, query),
     query,
     selectedSection,
     gate,
@@ -706,7 +708,7 @@ export function handleClarificationNeeded(
     intent: detection.intent,
     answerMode: gate.answerMode,
     answerConfidence: gate.answerConfidence,
-    answer: sanitizeFinalAnswer(clarificationAnswer()),
+    answer: sanitizeFinalAnswer(clarificationAnswer(query)),
     selectedPrimary: null,
     documentSummary: null,
     citations: [],
@@ -1253,6 +1255,11 @@ function candidateMatchesOnlyWeakExpansion(candidate: CandidateRelevance | undef
 
 function numericOnlyClarificationAnswer(query: string, section?: EnrichedRetrievedSection): string {
   const value = query.trim();
+  if (!prefersVietnameseAnswer(query)) {
+    return section
+      ? `Found '${value}' in section ${normalizedTitle(section)}, but a numeric value alone is not enough for confident classification. Please provide more product details.`
+      : `The value '${value}' is not enough to identify the product or HS code. Please provide more product details.`;
+  }
   return section
     ? `Tim thay '${value}' trong section ${normalizedTitle(section)}, nhung chi gia tri so thi chua du de phan loai chac chan. Vui long cung cap them mo ta san pham.`
     : `Gia tri '${value}' chua du de xac dinh san pham hoac ma HS. Vui long cung cap them mo ta san pham.`;
@@ -1307,7 +1314,9 @@ function maybeAppendRelatedHsCode(
   ) {
     return answer;
   }
-  return `${ensureSentence(answer)} Mã liên quan: ${formatCodes(codes)}.`;
+  return prefersVietnameseAnswer(query)
+    ? `${ensureSentence(answer)} Mã liên quan: ${formatCodes(codes, true)}.`
+    : `${ensureSentence(answer)} Related HS Code: ${formatCodes(codes, false)}.`;
 }
 
 function answerMentionsHsCode(answer: string): boolean {
@@ -1325,8 +1334,13 @@ function isSelectedSectionAnswerCluttered(answer: string): boolean {
   return answer.length > 420 || sentenceTotal > 3;
 }
 
-function safeSelectedSectionFallbackAnswer(section: EnrichedRetrievedSection): string {
+function safeSelectedSectionFallbackAnswer(section: EnrichedRetrievedSection, query?: string): string {
   const chars = `${section.text ?? ""} ${(section.captions ?? []).join(" ")}`.trim().length;
+  if (!prefersVietnameseAnswer(query)) {
+    return chars === 0
+      ? "I found a relevant section, but it does not contain enough detailed text to answer."
+      : "I found a relevant section, but I could not extract the answer from its text. Please try again or enable an API key.";
+  }
   if (chars === 0) {
     return "Tìm thấy section liên quan nhưng thiếu nội dung chi tiết để trả lời.";
   }
@@ -1347,14 +1361,24 @@ function broadLookupAnswer(query: string, candidates: CandidateRelevance[]): str
 }
 
 
-function clarificationAnswer(): string {
+function clarificationAnswer(query?: string): string {
+  if (!prefersVietnameseAnswer(query)) {
+    return "There is not enough information to determine a confident HS Code. Please provide more product description, composition, use, product state, or technical specifications.";
+  }
   return "Chưa đủ thông tin để xác định HS Code chắc chắn. Vui lòng cung cấp thêm mô tả sản phẩm, thành phần, công dụng, trạng thái hàng hóa hoặc thông số kỹ thuật.";
 }
 
 function broadLookupUserAnswer(query: string, candidates: CandidateRelevance[]): string {
+  if (!prefersVietnameseAnswer(query)) {
+    return [
+      `Found multiple items related to '${query.trim()}':`,
+      ...candidates.map((candidate) => `- ${candidateTitle(candidate)} — HS Code: ${formatCodes(hsCodesForCandidate(candidate), false)}`),
+      "Please specify which item you want to classify."
+    ].join("\n");
+  }
   return [
     `Tìm thấy nhiều mục liên quan đến '${query.trim()}':`,
-    ...candidates.map((candidate) => `- ${candidateTitle(candidate)} — HS Code: ${formatCodes(hsCodesForCandidate(candidate))}`),
+    ...candidates.map((candidate) => `- ${candidateTitle(candidate)} — HS Code: ${formatCodes(hsCodesForCandidate(candidate), true)}`),
     "Vui lòng nói rõ bạn muốn tra mục nào."
   ].join("\n");
 }
@@ -1741,11 +1765,12 @@ function normalizedTitle(section: EnrichedRetrievedSection): string {
   return normalizeProductTitle(section.title || titleFromSection(section.section) || section.section || "section phu hop");
 }
 
-function formatCodes(codes: string[]): string {
-  if (codes.length === 0) return "chưa có trong metadata";
+function formatCodes(codes: string[], vietnamese = true): string {
+  if (codes.length === 0) return vietnamese ? "chưa có trong metadata" : "not available in metadata";
   if (codes.length === 1) return codes[0];
-  if (codes.length === 2) return `${codes[0]} hoặc ${codes[1]}`;
-  return `${codes.slice(0, -1).join(", ")} hoặc ${codes[codes.length - 1]}`;
+  const joiner = vietnamese ? "hoặc" : "or";
+  if (codes.length === 2) return `${codes[0]} ${joiner} ${codes[1]}`;
+  return `${codes.slice(0, -1).join(", ")} ${joiner} ${codes[codes.length - 1]}`;
 }
 
 function cleanSummaryText(value: string): string {
@@ -1775,6 +1800,7 @@ function normalizeForIntent(value: string): string {
   return value
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[\u0111\u0110]/g, "d")
     .replace(/[Ä‘Ä]/g, "d")
     .toLowerCase()
     .replace(/\s+/g, " ")

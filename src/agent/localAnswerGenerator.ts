@@ -2,6 +2,7 @@ import {
   HS_CODE_PATTERN,
   hsCodesForSection,
   normalizeProductTitle,
+  prefersVietnameseAnswer,
   type QuerySignals,
   type ValidatedCandidate
 } from "./qaAnswerFormatter";
@@ -83,7 +84,7 @@ export function generateLocalAnswer(args: {
   const maxChars = answerPolicy.maxAnswerChars ?? DEFAULT_MAX_ANSWER_CHARS;
 
   if (answerPolicy.classificationRequested || asksForHsCodeOrClassification(originalQuery)) {
-    return classificationAnswer(selectedCandidate);
+    return classificationAnswer(selectedCandidate, originalQuery);
   }
 
   if (answerPolicy.definitionRequested || isDefinitionQuery(originalQuery) || answerPolicy.requestedField === "definition") {
@@ -155,16 +156,23 @@ export function generateLocalAnswer(args: {
   };
 }
 
-function classificationAnswer(candidate: ValidatedCandidate): LocalAnswerResult {
+function classificationAnswer(candidate: ValidatedCandidate, query: string): LocalAnswerResult {
   const codes = hsCodesForSection(candidate);
+  const vietnamese = prefersVietnameseAnswer(query);
   if (codes.length === 0) {
     return nullAnswer("template-classification", "selected candidate has no HS code metadata");
   }
-  const title = normalizeProductTitle(candidate.title || titleFromSection(candidate.section) || candidate.section || "sản phẩm phù hợp");
-  const codeText = formatHsCodes(codes);
-  const suffix = codes.length > 1 ? ", tùy trạng thái hàng hóa trong biểu mã." : ".";
+  const title = normalizeProductTitle(candidate.title || titleFromSection(candidate.section) || candidate.section || (vietnamese ? "sản phẩm phù hợp" : "the matching product"));
+  const codeText = formatHsCodes(codes, vietnamese);
+  const suffix = codes.length > 1
+    ? vietnamese
+      ? ", tùy trạng thái hàng hóa trong biểu mã."
+      : ", depending on the product state in the tariff."
+    : ".";
   return {
-    answer: `Sản phẩm là ${title}, HS Code: ${codeText}${suffix}`,
+    answer: vietnamese
+      ? `Sản phẩm là ${title}, HS Code: ${codeText}${suffix}`
+      : `The product is ${title}, HS Code: ${codeText}${suffix}`,
     answerGeneration: "template-classification",
     confidence: candidate.validation.confidence === "low" ? "medium" : "high",
     reason: "classification answered from selected candidate metadata"
@@ -324,17 +332,25 @@ function tryTableComparisonAnswer(
   }
   if (Math.abs(selected.value - baseline.value) < 0.000001) {
     const metric = formatMetricLabel(row.label);
+    const vietnamese = prefersVietnameseAnswer(query);
     return {
-    answer: `${formatColumnLabel(selected.column, true)} và ${formatColumnLabel(baseline.column)} có ${metric} bằng nhau: ${formatTableValue(selected.rawValue, row.label)}.`,
+      answer: vietnamese
+        ? `${formatColumnLabel(selected.column, true)} và ${formatColumnLabel(baseline.column)} có ${metric} bằng nhau: ${formatTableValue(selected.rawValue, row.label)}.`
+        : `${formatColumnLabel(selected.column, true)} and ${formatColumnLabel(baseline.column)} have the same ${metric}: ${formatTableValue(selected.rawValue, row.label)}.`,
       confidence: "medium",
       reason: `matched table row '${row.label}'`
     };
   }
 
   const metric = formatMetricLabel(row.label);
-  const relation = direction === "higher" ? "cao hơn" : "thấp hơn";
+  const vietnamese = prefersVietnameseAnswer(query);
+  const relation = direction === "higher"
+    ? vietnamese ? "cao hơn" : "higher"
+    : vietnamese ? "thấp hơn" : "lower";
   return {
-    answer: `${formatColumnLabel(selected.column, true)} có ${metric} ${relation}: ${formatTableValue(selected.rawValue, row.label)} so với ${formatColumnLabel(baseline.column)} ${formatTableValue(baseline.rawValue, row.label)}.`,
+    answer: vietnamese
+      ? `${formatColumnLabel(selected.column, true)} có ${metric} ${relation}: ${formatTableValue(selected.rawValue, row.label)} so với ${formatColumnLabel(baseline.column)} ${formatTableValue(baseline.rawValue, row.label)}.`
+      : `${formatColumnLabel(selected.column, true)} has ${relation} ${metric}: ${formatTableValue(selected.rawValue, row.label)} compared with ${formatColumnLabel(baseline.column)} ${formatTableValue(baseline.rawValue, row.label)}.`,
     confidence: "high",
     reason: `matched table row '${row.label}'`
   };
@@ -670,11 +686,12 @@ function maybeAppendRelatedCode(
   return codes.length > 0 ? `${ensureSentence(answer)} Mã liên quan: ${formatHsCodes(codes)}.` : ensureSentence(answer);
 }
 
-function formatHsCodes(codes: string[]): string {
+function formatHsCodes(codes: string[], vietnamese = true): string {
   const uniqueCodes = uniqueStrings(codes);
   if (uniqueCodes.length <= 1) return uniqueCodes[0] ?? "";
-  if (uniqueCodes.length === 2) return `${uniqueCodes[0]} hoặc ${uniqueCodes[1]}`;
-  return `${uniqueCodes.slice(0, -1).join(", ")} hoặc ${uniqueCodes[uniqueCodes.length - 1]}`;
+  const joiner = vietnamese ? "hoặc" : "or";
+  if (uniqueCodes.length === 2) return `${uniqueCodes[0]} ${joiner} ${uniqueCodes[1]}`;
+  return `${uniqueCodes.slice(0, -1).join(", ")} ${joiner} ${uniqueCodes[uniqueCodes.length - 1]}`;
 }
 
 function cleanDefinitionText(value: string, maxChars: number): string {

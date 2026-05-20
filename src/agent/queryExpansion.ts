@@ -17,6 +17,8 @@ export type QueryExpansionResult = {
 export type QueryExpansionDebug = Omit<QueryExpansionResult, "error"> & {
   error: string | null;
   cacheHit: boolean;
+  retryCount: number;
+  timedOut: boolean;
 };
 
 export interface QueryExpansionProviderOutput {
@@ -39,6 +41,7 @@ export interface QueryExpansionRuntimeConfig {
   maxTerms: number;
   timeoutMs: number;
   cacheEnabled: boolean;
+  retryCount: number;
 }
 
 export interface QueryExpansionOptions {
@@ -60,13 +63,13 @@ export async function expandQueryForRetrievalWithDebug(
   const runtimeConfig = resolveRuntimeConfig(options.config);
   if (!runtimeConfig.enabled || runtimeConfig.provider === "none") {
     const result = originalOnlyResult(query, "none");
-    return { result, debug: queryExpansionDebug(result, false) };
+    return { result, debug: queryExpansionDebug(result, false, 0) };
   }
 
   const provider = options.provider ?? createDefaultProvider(runtimeConfig.provider);
   if (!provider) {
     const result = originalOnlyResult(query, "fallback", `Query expansion provider '${runtimeConfig.provider}' is not configured.`);
-    return { result, debug: queryExpansionDebug(result, false) };
+    return { result, debug: queryExpansionDebug(result, false, 0) };
   }
 
   const cacheKey = buildCacheKey(query, provider.name, provider.model);
@@ -74,25 +77,40 @@ export async function expandQueryForRetrievalWithDebug(
     const cached = expansionCache.get(cacheKey);
     if (cached) {
       const result = resultForOriginalQuery(query, cached);
-      return { result, debug: queryExpansionDebug(result, true) };
+      return { result, debug: queryExpansionDebug(result, true, 0) };
     }
   }
 
+  let retryCount = 0;
+  let lastError: unknown;
   try {
-    const prompt = buildQueryExpansionPrompt(query);
-    const output = await withTimeout(
-      provider.expand(query, prompt, { timeoutMs: runtimeConfig.timeoutMs }),
-      runtimeConfig.timeoutMs
-    );
+    const output = await callExpansionProvider(provider, query, buildQueryExpansionPrompt(query), runtimeConfig.timeoutMs);
     const result = expansionResultFromProviderOutput(query, output, provider.source, runtimeConfig.maxTerms);
     if (runtimeConfig.cacheEnabled) {
       expansionCache.set(cacheKey, result);
     }
-    return { result, debug: queryExpansionDebug(result, false) };
+    return { result, debug: queryExpansionDebug(result, false, retryCount) };
   } catch (error) {
-    const result = originalOnlyResult(query, "fallback", error instanceof Error ? error.message : String(error));
-    return { result, debug: queryExpansionDebug(result, false) };
+    lastError = error;
   }
+
+  while (retryCount < runtimeConfig.retryCount) {
+    retryCount += 1;
+    try {
+      const output = await callExpansionProvider(provider, query, buildCompactQueryExpansionPrompt(query), runtimeConfig.timeoutMs);
+      const result = expansionResultFromProviderOutput(query, output, provider.source, runtimeConfig.maxTerms);
+      if (runtimeConfig.cacheEnabled) {
+        expansionCache.set(cacheKey, result);
+      }
+      return { result, debug: queryExpansionDebug(result, false, retryCount) };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  const errorMessage = lastError instanceof Error ? lastError.message : String(lastError);
+  const result = originalOnlyResult(query, "fallback", errorMessage);
+  return { result, debug: queryExpansionDebug(result, false, retryCount) };
 }
 
 export function buildQueryExpansionPrompt(query: string): string {
@@ -127,6 +145,15 @@ export function buildQueryExpansionPrompt(query: string): string {
   ].join("\n");
 }
 
+export function buildCompactQueryExpansionPrompt(query: string): string {
+  return [
+    "Expand this HS code search query into English retrieval terms only.",
+    "Return strict JSON: {\"englishQuery\":\"...\",\"keywords\":[\"...\"],\"phrases\":[\"...\"],\"confidence\":\"high|medium|low\"}.",
+    "Do not answer and do not invent HS codes.",
+    `Query: ${query}`
+  ].join("\n");
+}
+
 export function parseQueryExpansionJson(rawJson: string): QueryExpansionProviderOutput {
   const parsed = JSON.parse(stripJsonFence(rawJson)) as Record<string, unknown>;
   return {
@@ -148,7 +175,8 @@ function resolveRuntimeConfig(overrides: Partial<QueryExpansionRuntimeConfig> | 
     provider: overrides?.provider ?? env.queryExpansionProvider,
     maxTerms: positiveInteger(overrides?.maxTerms, env.queryExpansionMaxTerms),
     timeoutMs: positiveInteger(overrides?.timeoutMs, env.queryExpansionTimeoutMs),
-    cacheEnabled: overrides?.cacheEnabled ?? env.queryExpansionCacheEnabled
+    cacheEnabled: overrides?.cacheEnabled ?? env.queryExpansionCacheEnabled,
+    retryCount: Math.max(0, positiveInteger(overrides?.retryCount, 0))
   };
 }
 
@@ -231,12 +259,33 @@ function originalOnlyResult(query: string, source: "none" | "fallback", error?: 
   };
 }
 
-function queryExpansionDebug(result: QueryExpansionResult, cacheHit: boolean): QueryExpansionDebug {
+function queryExpansionDebug(result: QueryExpansionResult, cacheHit: boolean, retryCount: number): QueryExpansionDebug {
   return {
     ...result,
     error: result.error ?? null,
-    cacheHit
+    cacheHit,
+    retryCount,
+    timedOut: Boolean(result.error && classifyExpansionError(result.error) === "timeout")
   };
+}
+
+async function callExpansionProvider(
+  provider: QueryExpansionProvider,
+  query: string,
+  prompt: string,
+  timeoutMs: number
+): Promise<QueryExpansionProviderOutput> {
+  return await withTimeout(
+    provider.expand(query, prompt, { timeoutMs }),
+    timeoutMs
+  );
+}
+
+function classifyExpansionError(message: string): "timeout" | "other" {
+  const normalized = message.toLowerCase();
+  return normalized.includes("timeout") || normalized.includes("timed out") || normalized.includes("deadline")
+    ? "timeout"
+    : "other";
 }
 
 function resultForOriginalQuery(query: string, cached: QueryExpansionResult): QueryExpansionResult {
