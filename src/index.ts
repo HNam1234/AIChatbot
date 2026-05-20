@@ -1,23 +1,29 @@
 /**
- * Public library API for the local PDF parser and QA server.
+ * Package entrypoint.
  *
- * Keep exports here intentionally small. Internal modules can stay deeply
- * organized, while callers import stable entry points from `src/index`.
+ * Read `src/main.ts` first. It is the linear composition root that wires
+ * config, clients, pipeline, QA, mapping, source citation, and server APIs.
  */
 
 export {
   createAppApi,
+  createMainApi,
   createPageIndexChatSession,
   createPageIndexClientFromEnv,
+  createServerRouter,
+  getApplicationSettings,
+  listParsedDocuments,
+  loadApplicationConfig,
+  openMappingPayload,
+  runPdfParsingOnly,
+  runPdfPipeline,
   type AppApi,
   type CreateChatSessionOptions,
-  type CreatePageIndexClientOptions
-} from "./appApi";
-export {
-  executePipeline,
-  runParsingPipeline,
+  type CreatePageIndexClientOptions,
+  type MainApi,
   type ParsingPipelineResult
-} from "./mainFlow";
+} from "./main";
+
 export type {
   LayoutAnalysis,
   ParsedBlock,
@@ -36,10 +42,6 @@ export {
   type PageIndexChatOptions,
   type PageIndexChatResult
 } from "./api";
-export * as Api from "./api";
-export * as AgentApi from "./agent";
-export * as ConfigApi from "./config";
-export * as OrchestratorApi from "./orchestrator";
 
 export {
   answerFromCachedTrees,
@@ -51,6 +53,7 @@ export {
   renderSourceTextHtml,
   withPdfCitationLinks
 } from "./server";
+
 export type {
   MappingBlock,
   MappingDocumentSummary,
