@@ -1,6 +1,6 @@
 import path from "node:path";
 import express from "express";
-import { localhostExposureWarning, loadEnvConfig } from "../config/env";
+import { localhostExposureWarning, loadEnvConfig } from "../config";
 import { createApiRouter } from "./routes";
 import { cleanupTmpDirectory } from "../utils/tempCleanup";
 

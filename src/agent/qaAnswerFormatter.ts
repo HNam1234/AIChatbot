@@ -692,6 +692,14 @@ export function selectRelevantSections(
       if (confidenceOrder !== 0) {
         return confidenceOrder;
       }
+      const strongSignalOrder = (right.relevance.validation?.strongSignals.length ?? 0) - (left.relevance.validation?.strongSignals.length ?? 0);
+      if (strongSignalOrder !== 0) {
+        return strongSignalOrder;
+      }
+      const weakSignalOrder = (left.relevance.validation?.weakSignals.length ?? 0) - (right.relevance.validation?.weakSignals.length ?? 0);
+      if (weakSignalOrder !== 0) {
+        return weakSignalOrder;
+      }
       return right.relevance.relevanceScore - left.relevance.relevanceScore ||
         right.section.score - left.section.score ||
         left.section.document.localeCompare(right.section.document);
@@ -765,6 +773,9 @@ export function validateCandidateForQuery(args: {
   const distinctiveOriginalMatches = originalMatches.filter(isDistinctiveValidationToken);
   const distinctiveAllMatches = uniqueStrings([...originalMatches, ...expansionMatches, ...relevance.matchedTerms, ...aliasMatches].filter(isDistinctiveValidationToken));
   const titlePhraseMatches = phraseMatches.filter((phrase) => includesSignal(titleText, phrase));
+  const positiveTitlePhraseMatches = titlePhraseMatches.filter((phrase) =>
+    !querySignals.contrastTerms.some((term) => includesSignal(normalizeForSearch(phrase), term))
+  );
   const bodyOrCaptionPhraseMatches = phraseMatches.filter((phrase) => includesSignal(`${bodyText} ${captionText}`, phrase));
   const scientificMatches = querySignals.scientificNames.filter((term) => includesSignal(allText, term));
   const originalTokenCount = querySignals.queryTokens.length;
@@ -779,7 +790,7 @@ export function validateCandidateForQuery(args: {
   if (aliasMatches.length > 0) {
     strongSignals.add("country_product_alias_match");
   }
-  if (titlePhraseMatches.length > 0 || nearExactTitleMatch(originalQuery, candidate)) {
+  if (positiveTitlePhraseMatches.length > 0 || (nearExactTitleMatch(originalQuery, candidate) && !candidateTitleIsContrastBaseline(candidate, querySignals))) {
     strongSignals.add("exact_or_near_exact_title_phrase_match");
   }
   if (phraseMatches.some((phrase) => meaningfulTokens(phrase).filter(isDistinctiveValidationToken).length >= 2)) {
@@ -937,6 +948,11 @@ function nearExactTitleMatch(query: string, candidate: RetrievedCandidate): bool
   const queryTokens = new Set(meaningfulTokens(query).filter(isDistinctiveValidationToken));
   const overlap = titleTokens.filter((token) => queryTokens.has(token));
   return overlap.length >= 2 || (titleTokens.length === 1 && overlap.length === 1);
+}
+
+function candidateTitleIsContrastBaseline(candidate: RetrievedCandidate, querySignals: QuerySignals): boolean {
+  const titleText = normalizeForSearch(`${candidate.title ?? ""} ${candidate.section ?? ""}`);
+  return querySignals.contrastTerms.some((term) => includesSignal(titleText, term));
 }
 
 function isDistinctiveValidationToken(token: string): boolean {

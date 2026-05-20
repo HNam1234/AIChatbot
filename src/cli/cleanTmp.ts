@@ -1,5 +1,5 @@
 import { cleanupTmpDirectory } from "../utils/tempCleanup";
-import { loadEnvConfig } from "../config/env";
+import { loadEnvConfig } from "../config";
 
 async function main(): Promise<void> {
   const config = loadEnvConfig();

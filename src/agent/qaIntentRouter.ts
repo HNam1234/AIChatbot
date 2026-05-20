@@ -9,10 +9,8 @@ import {
   renderHsCodeAnswer,
   type CandidateRelevance,
   type EnrichedRetrievedSection,
-  type QuerySignals,
   type RenderedHsCodeAnswer,
-  type SectionMetadata,
-  type ValidatedCandidate
+  type SectionMetadata
 } from "./qaAnswerFormatter";
 import {
   planQueryWithRules,
@@ -24,6 +22,23 @@ import {
   extractRequestedField,
   type FieldExtractionConfidence
 } from "./fieldExtractor";
+import { sanitizeFinalAnswer } from "./qaAnswerSanitizer";
+import {
+  applyCandidateDocumentScope,
+  detectAmbiguousLookup,
+  detectBroadQuery,
+  groupDistinctBroadLookupCandidates,
+  validatedCandidatesFromRelevance,
+  type BroadQueryDecision
+} from "./qaBroadLookup";
+
+export { sanitizeFinalAnswer } from "./qaAnswerSanitizer";
+export {
+  applyCandidateDocumentScope,
+  detectAmbiguousLookup,
+  detectBroadQuery,
+  groupDistinctBroadLookupCandidates
+} from "./qaBroadLookup";
 
 export type QaIntent =
   | "exact_hscode_lookup"
@@ -70,18 +85,6 @@ export interface GateResult {
   contradictions: string[];
   shouldAskClarification: boolean;
 }
-
-export interface AmbiguousLookupDetection {
-  token: string;
-  reason: string;
-  candidates: CandidateRelevance[];
-}
-
-export type BroadQueryDecision = {
-  isBroad: boolean;
-  reason: string;
-  suggestedMode: "broad_lookup" | "clarification" | "normal";
-};
 
 export interface IntentDetection {
   intent: QaIntent;
@@ -184,7 +187,7 @@ export function detectIntent(query: string): IntentDetection {
     };
   }
   const explicitHsQuestion = asksForHsCodeOrClassification(query);
-  if (!explicitHsQuestion && isDefinitionStyleQuestion(query) && !isAmbiguousDefinitionQuery(query)) {
+  if (!explicitHsQuestion && isDefinitionStyleQuestion(query) && !isUsageStyleQuestion(query) && !isAmbiguousDefinitionQuery(query)) {
     return {
       intent: "definition",
       confidence: 0.75,
@@ -488,14 +491,25 @@ export function handleProductClassification(
     const gate = productGate(query, undefined, candidates);
     return emptyIntentAnswer("product_classification", gate.answerMode === "numeric_lookup" ? numericOnlyClarificationAnswer(query) : clarificationAnswer(), detection, candidates, baseDebug, gate);
   }
-  const broadDecision = detectBroadQuery({
+  let broadDecision = detectBroadQuery({
     originalQuery: query,
-    querySignals: querySignalsFromCandidates(query, candidates),
     validatedCandidates: validatedCandidatesFromRelevance(candidates)
   });
+  if (broadDecision.isBroad && selectedCandidateHasDecisiveEvidence(candidates, selectedSection)) {
+    broadDecision = {
+      isBroad: false,
+      reason: "selected candidate has decisive validation evidence",
+      suggestedMode: "normal"
+    };
+  }
   const hasTemplateAnswer = Boolean(llmAnswer?.trim()) && baseDebug.answerGeneration === "template-classification";
   if (broadDecision.isBroad && !hasTemplateAnswer) {
     const lookupCandidates = lookupCandidatesForAnswer(selectedSection, alternatives, candidates);
+    if (broadDecision.suggestedMode === "broad_lookup" && groupDistinctBroadLookupCandidates(lookupCandidates).length === 1) {
+      const gate = productGate(query, selectedSection, candidates);
+      const rendered = renderHsCodeAnswer(llmAnswer, selectedSection, alternatives, { question: query, answerStyle: "class-eval" });
+      return renderedIntentAnswer("product_classification", rendered, selectedSection, candidates, detection, baseDebug, gate);
+    }
     if (broadDecision.suggestedMode === "broad_lookup" && lookupCandidates.length > 0) {
       return broadLookupIntentAnswer("product_classification", query, lookupCandidates, selectedSection, detection, baseDebug, broadDecision);
     }
@@ -608,7 +622,6 @@ export function handleSelectedSectionQa(
 
   const broadDecision = meaningfulIntentTokens(query).length <= 1 ? detectBroadQuery({
     originalQuery: query,
-    querySignals: querySignalsFromCandidates(query, candidates),
     validatedCandidates: validatedCandidatesFromRelevance(candidates)
   }) : { isBroad: false, reason: "multi-token selected-section question uses normal QA", suggestedMode: "normal" } satisfies BroadQueryDecision;
   if (broadDecision.isBroad) {
@@ -1166,113 +1179,11 @@ function selectedSectionGate(
   };
 }
 
-export function detectAmbiguousLookup(
-  query: string,
-  candidates: CandidateRelevance[] = []
-): AmbiguousLookupDetection | null {
-  if (query.match(HS_CODE_PATTERN)) {
-    return null;
-  }
-  const tokens = meaningfulIntentTokens(query);
-  if (tokens.length !== 1) {
-    return null;
-  }
-
-  const token = tokens[0];
-  const matches = distinctCandidateSections(candidates
-    .filter((candidate) => !candidate.rejected)
-    .filter((candidate) => hsCodesForCandidate(candidate).length > 0)
-    .filter((candidate) => candidateSharesOnlyBroadToken(candidate, token))
-    .sort((left, right) => right.finalScore - left.finalScore));
-
-  if (matches.length < 2) {
-    return null;
-  }
-
-  return {
-    token,
-    reason: "single broad token matched multiple sections",
-    candidates: matches
-  };
-}
-
-export function detectBroadQuery(args: {
-  originalQuery: string;
-  querySignals: QuerySignals;
-  validatedCandidates: ValidatedCandidate[];
-}): BroadQueryDecision {
-  const query = args.originalQuery.trim();
-  const tokens = meaningfulIntentTokens(query);
-  const accepted = groupDistinctValidatedCandidates(args.validatedCandidates
-    .filter((candidate) => candidate.validation.accepted)
-    .filter((candidate) => hsCodesForSection(candidate).length > 0));
-  const top = accepted[0];
-  const second = accepted[1];
-  const topRelevance = top?.relevance;
-  const exactCodeMatch = Boolean(query.match(HS_CODE_PATTERN) && accepted.some((candidate) => hsCodesForSection(candidate).some((code) => query.includes(code))));
-  const strongTitlePhrase = accepted.some((candidate) =>
-    candidate.validation.strongSignals.includes("exact_or_near_exact_title_phrase_match") ||
-    candidate.validation.strongSignals.includes("distinctive_multi_token_phrase_overlap") ||
-    candidate.validation.strongSignals.includes("caption_or_body_distinctive_phrase_match") ||
-    candidate.validation.strongSignals.includes("numeric_unit_match_plus_product_or_attribute_evidence") ||
-    candidate.validation.strongSignals.includes("scientific_or_latin_like_term_match")
-  );
-  if (exactCodeMatch) {
-    return { isBroad: false, reason: "exact HS code match exists", suggestedMode: "normal" };
-  }
-  if (accepted.length === 1 && (strongTitlePhrase || top?.validation.confidence !== "low")) {
-    return { isBroad: false, reason: "single accepted candidate after validation", suggestedMode: "normal" };
-  }
-  if (strongTitlePhrase && !multipleSimilarCandidates(accepted)) {
-    return { isBroad: false, reason: "strong distinctive phrase/title/numeric evidence exists", suggestedMode: "normal" };
-  }
-  if (isNumericOnlyQuery(query)) {
-    return {
-      isBroad: true,
-      reason: accepted.length > 0 ? "numeric-only query has related evidence but no product context" : "numeric-only query lacks product context",
-      suggestedMode: "clarification"
-    };
-  }
-  if (tokens.length <= 1 && accepted.length >= 2) {
-    return {
-      isBroad: true,
-      reason: "single broad token matched multiple distinct candidates",
-      suggestedMode: "broad_lookup"
-    };
-  }
-  if (tokens.length <= 1 && accepted.length <= 1 && !strongTitlePhrase) {
-    return {
-      isBroad: true,
-      reason: "query has fewer than two meaningful distinctive tokens",
-      suggestedMode: accepted.length > 0 ? "broad_lookup" : "clarification"
-    };
-  }
-  if (accepted.length >= 2 && topRelevance && second?.relevance) {
-    const margin = topRelevance.finalScore - second.relevance.finalScore;
-    const lowConfidenceAccepted = accepted.filter((candidate) => candidate.validation.confidence === "low").length;
-    const onlyBroadEvidence = accepted.slice(0, 5).every((candidate) => candidateEvidenceIsBroadOnly(candidate.relevance, tokens));
-    if (margin >= 15 && !onlyBroadEvidence && lowConfidenceAccepted < 2) {
-      return { isBroad: false, reason: "top candidate dominates with sufficient margin", suggestedMode: "normal" };
-    }
-    if (margin < 10 || lowConfidenceAccepted >= 2 || onlyBroadEvidence) {
-      return {
-        isBroad: true,
-        reason: margin < 10
-          ? "top candidate does not clearly dominate similar candidates"
-          : onlyBroadEvidence
-            ? "evidence is broad/common token only"
-            : "multiple accepted candidates have similar low-confidence evidence",
-        suggestedMode: "broad_lookup"
-      };
-    }
-  }
-  return { isBroad: false, reason: "query has enough distinctive support for normal routing", suggestedMode: "normal" };
-}
-
 export function asksForHsCodeOrClassification(query: string): boolean {
   const normalized = normalizeForIntent(query);
   return HS_CODE_PATTERN.test(query) ||
-    /\b(hs\s*code|hscode|ma\s+hs|ma\s+hscode|tariff\s+code|customs\s+code|classification|classified|classify|phan\s+loai|thuoc\s+ma|ma\s+nao|code\s+nao|which\s+code|belong\s+to\s+which\s+hs\s+code)\b/.test(normalized);
+    /\b(hs\s*code|hscode|ma\s+hs|ma\s+hscode|tariff\s+code|customs\s+code|classification|classified|classify|phan\s+loai|thuoc\s+ma|ma\s+nao|code\s+nao|which\s+code|belong\s+to\s+which\s+hs\s+code)\b/.test(normalized) ||
+    /\bcode\s*\??$/.test(normalized);
 }
 
 function strongSignalsForCandidate(
@@ -1612,6 +1523,14 @@ function summarizeSectionList(sections: SectionMetadata[]): Array<{ title: strin
 }
 
 function publicSection(section: SectionMetadata | EnrichedRetrievedSection): Record<string, unknown> {
+  const sourceText = [
+    section.section,
+    section.title,
+    "text" in section ? section.text : undefined,
+    "textPreview" in section ? section.textPreview : undefined,
+    "captions" in section ? section.captions?.join(" ") : undefined
+  ].filter(Boolean).join("\n\n");
+
   return {
     document: section.document,
     chapter: section.chapter,
@@ -1624,7 +1543,8 @@ function publicSection(section: SectionMetadata | EnrichedRetrievedSection): Rec
     source: section.source ?? null,
     captions: "captions" in section ? section.captions ?? [] : [],
     score: "score" in section ? section.score : undefined,
-    metadataWarnings: "metadataWarnings" in section ? section.metadataWarnings : []
+    metadataWarnings: "metadataWarnings" in section ? section.metadataWarnings : [],
+    sourceText
   };
 }
 
@@ -1671,29 +1591,6 @@ function distinctCandidateSections(candidates: CandidateRelevance[]): CandidateR
   return distinct;
 }
 
-export function groupDistinctBroadLookupCandidates(candidates: CandidateRelevance[]): CandidateRelevance[] {
-  const byKey = new Map<string, CandidateRelevance>();
-  for (const candidate of candidates.filter((item) => !item.rejected && hsCodesForCandidate(item).length > 0)) {
-    const key = distinctCandidateGroupKey(candidate);
-    const existing = byKey.get(key);
-    if (!existing || candidate.finalScore > existing.finalScore) {
-      byKey.set(key, candidate);
-    }
-  }
-  return [...byKey.values()];
-}
-
-export function applyCandidateDocumentScope<T extends { document: string }>(
-  candidates: T[],
-  allowedDocuments: string[] | undefined
-): T[] {
-  const allowed = new Set(allowedDocuments ?? []);
-  if (allowed.size === 0) {
-    return candidates;
-  }
-  return candidates.filter((candidate) => allowed.has(candidate.document));
-}
-
 function lookupCandidatesForAnswer(
   selectedSection: EnrichedRetrievedSection | undefined,
   alternatives: EnrichedRetrievedSection[],
@@ -1738,31 +1635,6 @@ function candidateFromSectionForLookup(section: EnrichedRetrievedSection, fallba
   };
 }
 
-function candidateSharesOnlyBroadToken(candidate: CandidateRelevance, token: string): boolean {
-  const evidenceTokens = uniqueStrings([
-    ...candidate.matchedTerms,
-    ...candidate.candidateMatchedTokens
-  ].map(normalizeForIntent).filter(Boolean));
-  const phraseTokens = uniqueStrings(candidate.candidateMatchedPhrases.flatMap(meaningfulIntentTokens));
-  const nonCodeEvidence = uniqueStrings([...evidenceTokens, ...phraseTokens].filter((term) => !HS_CODE_PATTERN.test(term)));
-  return nonCodeEvidence.includes(token) &&
-    nonCodeEvidence.every((term) => term === token) &&
-    candidate.numericMatches.length === 0 &&
-    candidate.matchedNumericRanges.length === 0;
-}
-
-function distinctCandidateGroupKey(candidate: CandidateRelevance): string {
-  const codes = hsCodesForCandidate(candidate).sort().join("|");
-  const title = normalizeForIntent(candidate.title ?? titleFromSection(candidate.section) ?? "");
-  const section = normalizeForIntent(candidate.section ?? "");
-  return [
-    candidate.document,
-    codes,
-    title,
-    section || `${candidate.pageStart ?? ""}-${candidate.pageEnd ?? ""}`
-  ].join("|");
-}
-
 function hsCodesForCandidate(candidate: CandidateRelevance): string[] {
   return uniqueStrings([
     ...candidate.groupedHsCodes,
@@ -1800,6 +1672,28 @@ function selectedCandidate(candidates: CandidateRelevance[], section: EnrichedRe
   );
 }
 
+function selectedCandidateHasDecisiveEvidence(
+  candidates: CandidateRelevance[],
+  section: EnrichedRetrievedSection
+): boolean {
+  const candidate = selectedCandidate(candidates, section);
+  if (!candidate || candidate.rejected || candidate.validation?.accepted === false) {
+    return false;
+  }
+  const strongSignals = candidate.validation?.strongSignals ?? [];
+  const weakSignals = candidate.validation?.weakSignals ?? [];
+  if (strongSignals.some((signal) =>
+    signal === "exact_or_near_exact_title_phrase_match" ||
+    signal === "distinctive_multi_token_phrase_overlap" ||
+    signal === "caption_or_body_distinctive_phrase_match" ||
+    signal === "numeric_unit_match_plus_product_or_attribute_evidence" ||
+    signal === "scientific_or_latin_like_term_match"
+  )) {
+    return strongSignals.length >= 2 || weakSignals.length <= 1;
+  }
+  return strongSignals.length >= 2 && weakSignals.length === 0 && candidate.finalScore >= 45;
+}
+
 function topCandidate(candidates: CandidateRelevance[]): CandidateRelevance | undefined {
   return [...candidates].sort((left, right) => right.finalScore - left.finalScore)[0];
 }
@@ -1822,6 +1716,11 @@ function isComparisonIntentQuestion(query: string): boolean {
   const normalized = normalizeForIntent(query);
   return /\b(vs|versus|compare|comparison|difference|different|distinguish|more|less|higher|lower|longer|shorter)\b/.test(normalized) ||
     /\b(?:so\s+sanh|khac|phan\s+biet|hon|it\s+hon|nhieu\s+hon)\b/.test(normalized);
+}
+
+function isUsageStyleQuestion(query: string): boolean {
+  const normalized = normalizeForIntent(query);
+  return /\b(used?\s+for|usage|purpose|function|cong\s+dung|muc\s+dich|su\s+dung)\b/.test(normalized);
 }
 
 function meaningfulIntentTokens(value: string): string[] {
@@ -1890,160 +1789,3 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
 }
 
-function querySignalsFromCandidates(query: string, candidates: CandidateRelevance[]): QuerySignals {
-  const candidate = candidates[0];
-  if (candidate) {
-    return {
-      domainTerms: candidate.queryTokens,
-      productTerms: candidate.queryTokens,
-      originTerms: [],
-      domainAliasTerms: candidate.candidateAliasSignals ?? [],
-      physicalAttributes: [],
-      numericRanges: candidate.queryPhrases.filter((phrase) => /^\d/.test(phrase)),
-      usageTerms: [],
-      scientificNames: [],
-      tradeForms: [],
-      contrastTerms: candidate.contrastTerms,
-      queryTokens: candidate.queryTokens.length > 0 ? candidate.queryTokens : meaningfulIntentTokens(query),
-      queryPhrases: candidate.queryPhrases,
-      quotedTerms: [],
-      capitalizedTerms: []
-    };
-  }
-  const tokens = meaningfulIntentTokens(query);
-  return {
-    domainTerms: tokens,
-    productTerms: tokens,
-    originTerms: [],
-    domainAliasTerms: [],
-    physicalAttributes: [],
-    numericRanges: [],
-    usageTerms: [],
-    scientificNames: [],
-    tradeForms: [],
-    contrastTerms: [],
-    queryTokens: tokens,
-    queryPhrases: [],
-    quotedTerms: [],
-    capitalizedTerms: []
-  };
-}
-
-function validatedCandidatesFromRelevance(candidates: CandidateRelevance[]): ValidatedCandidate[] {
-  return candidates.map((candidate) => ({
-    document: candidate.document,
-    hsCode: candidate.hsCode,
-    groupedHsCodes: candidate.groupedHsCodes,
-    title: candidate.title,
-    section: candidate.section,
-    pageStart: candidate.pageStart ?? undefined,
-    pageEnd: candidate.pageEnd ?? undefined,
-    source: candidate.source,
-    text: "",
-    captions: [],
-    score: candidate.finalScore,
-    metadataWarnings: [],
-    relevance: candidate,
-    validation: candidate.validation ?? {
-      accepted: !candidate.rejected,
-      confidence: candidate.rejected ? "low" : "medium",
-      reason: candidate.rejectedReason ?? "candidate accepted by relevance",
-      strongSignals: [],
-      weakSignals: [],
-      missingEvidence: []
-    }
-  }));
-}
-
-function groupDistinctValidatedCandidates(candidates: ValidatedCandidate[]): ValidatedCandidate[] {
-  const byKey = new Map<string, ValidatedCandidate>();
-  for (const candidate of candidates) {
-    const key = [
-      candidate.document,
-      hsCodesForSection(candidate).sort().join("|"),
-      normalizeForIntent(candidate.title ?? titleFromSection(candidate.section) ?? ""),
-      normalizeForIntent(candidate.section ?? "") || `${candidate.pageStart ?? ""}-${candidate.pageEnd ?? ""}`
-    ].join("|");
-    const existing = byKey.get(key);
-    if (!existing || (candidate.relevance?.finalScore ?? candidate.score) > (existing.relevance?.finalScore ?? existing.score)) {
-      byKey.set(key, candidate);
-    }
-  }
-  return [...byKey.values()].sort((left, right) => (right.relevance?.finalScore ?? right.score) - (left.relevance?.finalScore ?? left.score));
-}
-
-function multipleSimilarCandidates(candidates: ValidatedCandidate[]): boolean {
-  if (candidates.length < 2) {
-    return false;
-  }
-  const [top, second] = candidates;
-  return ((top.relevance?.finalScore ?? top.score) - (second.relevance?.finalScore ?? second.score)) < 10;
-}
-
-function candidateEvidenceIsBroadOnly(candidate: CandidateRelevance | undefined, queryTokens: string[]): boolean {
-  if (!candidate) {
-    return true;
-  }
-  if (candidate.numericMatches.length > 0 || candidate.matchedNumericRanges.length > 0) {
-    return false;
-  }
-  if (candidate.candidateMatchedPhrases.some((phrase) => meaningfulIntentTokens(phrase).length >= 2)) {
-    return false;
-  }
-  const evidence = uniqueStrings([...candidate.matchedTerms, ...candidate.candidateMatchedTokens]
-    .flatMap(meaningfulIntentTokens));
-  return evidence.length <= 1 && evidence.every((token) => queryTokens.includes(token));
-}
-
-export function sanitizeFinalAnswer(answer: string, options: { stripHsCode?: boolean; maxWords?: number } = {}): string {
-  const stripHsCode = options.stripHsCode ?? false;
-  const lines = answer
-    .replace(/<doc=[^>]+>/gi, " ")
-    .replace(/```(?:json)?[\s\S]*?```/gi, " ")
-    .split(/\r?\n/g)
-    .filter((line) => !/^\s*(?:Index source|PageIndex(?: tree result)?|cache freshness|cache status|final score|candidate debug|raw JSON|backend logs?|Primary citation|Related citation|Citation card|Retrieval|Marker\s+\d+)\b/i.test(line))
-    .join("\n");
-  let cleaned = lines
-    .replace(/\b(Index source|PageIndex(?: tree result)?|cache freshness|cache status|final score|candidate debug|raw JSON|backend logs?|Primary citation|Related citation|Citation card labels?|Retrieval):[\s\S]*$/gi, " ")
-    .replace(/\{[\s\S]*"[^"]+"\s*:[\s\S]*\}/g, " ")
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  if (stripHsCode) {
-    cleaned = cleaned.replace(/(?:^|\s)HS Code:\s*\d{4}\.\d{2}\.\d{2}\.?/gi, " ");
-  }
-  cleaned = removeDuplicateHsCodeSentences(cleaned)
-    .replace(/[ \t]+/g, " ")
-    .replace(/ *\n */g, "\n")
-    .trim();
-  if (options.maxWords && cleaned.split(/\s+/).filter(Boolean).length > options.maxWords) {
-    cleaned = cleaned.split(/\s+/).slice(0, options.maxWords).join(" ").replace(/[,\s]+$/g, "");
-    cleaned = ensureSentence(cleaned);
-  }
-  return cleaned;
-}
-
-function removeDuplicateHsCodeSentences(answer: string): string {
-  let collapsed = answer;
-  const duplicateCodePattern = /\bHS Code:\s*(\d{4}\.\d{2}\.\d{2})\.\s+HS Code:\s*\1\./gi;
-  while (duplicateCodePattern.test(collapsed)) {
-    collapsed = collapsed.replace(duplicateCodePattern, "HS Code: $1.");
-    duplicateCodePattern.lastIndex = 0;
-  }
-  answer = collapsed;
-  const sentences = answer.match(/[^.!?\n]+[.!?]?|\n+/g) ?? [answer];
-  const seenHsCodeSentences = new Set<string>();
-  const kept: string[] = [];
-  for (const sentence of sentences) {
-    const codes = sentence.match(new RegExp(HS_CODE_PATTERN.source, "g")) ?? [];
-    if (codes.length > 0 && /\bHS Code:/i.test(sentence)) {
-      const key = uniqueStrings(codes).join("|");
-      if (seenHsCodeSentences.has(key)) {
-        continue;
-      }
-      seenHsCodeSentences.add(key);
-    }
-    kept.push(sentence);
-  }
-  return kept.join("").trim();
-}

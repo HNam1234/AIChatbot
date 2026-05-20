@@ -1,6 +1,5 @@
 import readline from "node:readline";
-import { ChatSession } from "../api/chatSession";
-import { PageIndexClient } from "../api/pageindexClient";
+import { ChatSession, PageIndexClient } from "../api";
 import { QAValidator } from "../validators/qaValidator";
 
 export interface ChatCliOptions {

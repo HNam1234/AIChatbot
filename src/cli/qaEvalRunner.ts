@@ -12,6 +12,7 @@ interface QaEvalItem {
   mustNotContain?: string[];
   scopeDocuments?: string[];
   shouldNotCallLlm?: boolean;
+  fallbackForbidden?: boolean;
   expectedHsCodes?: string[];
   expectedDocument?: string | null;
   expectedTitleContains?: string | null;
@@ -26,7 +27,7 @@ interface EvalResult {
 
 async function main(): Promise<void> {
   process.env.QA_EVAL_QUIET = "1";
-  const fixturePath = path.resolve(process.cwd(), "tests", "fixtures", "qa-eval.json");
+  const fixturePath = resolveFixturePath(process.argv.slice(2));
   const items = JSON.parse(await readFile(fixturePath, "utf8")) as QaEvalItem[];
   const results: EvalResult[] = [];
 
@@ -93,8 +94,19 @@ function evaluateItem(item: QaEvalItem, response: Record<string, unknown>): Eval
   if (item.shouldNotCallLlm && response.llmCalled === true) {
     reasons.push("expected no LLM call");
   }
+  if (item.fallbackForbidden && isFallbackAnswer(answer, response)) {
+    reasons.push("answer must not be a generic fallback");
+  }
 
   return { item, passed: reasons.length === 0, reasons, response };
+}
+
+function resolveFixturePath(args: string[]): string {
+  const fixtureFlagIndex = args.findIndex((arg) => arg === "--fixture" || arg === "-f");
+  const fixtureValue = fixtureFlagIndex >= 0 ? args[fixtureFlagIndex + 1] : undefined;
+  const inlineFixture = args.find((arg) => arg.startsWith("--fixture="))?.slice("--fixture=".length);
+  const requested = fixtureValue || inlineFixture || path.join("tests", "fixtures", "qa-eval.json");
+  return path.resolve(process.cwd(), requested);
 }
 
 function printResult(result: EvalResult): void {
@@ -149,6 +161,12 @@ function retrievalCodes(response: Record<string, unknown>): unknown[] {
 
 function answerIncludes(value: string, expected: string): boolean {
   return value.toLowerCase().includes(expected.toLowerCase());
+}
+
+function isFallbackAnswer(answer: string, response: Record<string, unknown>): boolean {
+  const fallbackReason = response.fallbackReason;
+  return /chưa thể trích xuất|vui lòng thử lại|bật api key|thiếu nội dung chi tiết|not enough context/i.test(answer) ||
+    (typeof fallbackReason === "string" && fallbackReason.trim().length > 0);
 }
 
 main().catch((error) => {

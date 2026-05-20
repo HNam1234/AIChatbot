@@ -376,13 +376,15 @@ function extractDefinitionTerm(query: string, normalized: string): string | null
 }
 
 function hasHsCodeQuestion(normalized: string): boolean {
-  return /\b(hs\s*code|hscode|ma\s+hs|ma\s+hscode|tariff\s+code|customs\s+code|classified?|classification|phan\s+loai|thuoc\s+ma)\b/.test(normalized);
+  return /\b(hs\s*code|hscode|ma\s+hs|ma\s+hscode|tariff\s+code|customs\s+code|classified?|classification|phan\s+loai|thuoc\s+ma)\b/.test(normalized) ||
+    /\bcode\s*\??$/.test(normalized);
 }
 
 function extractHsCodeQuestionTarget(query: string): string {
   return cleanTarget(query
     .replace(/\b(?:HS\s*Code|HSCode|tariff\s+code|customs\s+code|classification|classified|classify)\b/gi, " ")
     .replace(/\b(?:mã\s*HS|ma\s*HS|phân\s+loại|phan\s+loai|thuộc\s+mã|thuoc\s+ma)\b/gi, " ")
+    .replace(/\bcode\s*[?!.]*\s*$/gi, " ")
     .replace(/\b(?:what|which|is|are|for|of|the|là|la|gì|gi|nào|nao|là\s+gì|la\s+gi)\b/gi, " "));
 }
 

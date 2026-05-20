@@ -790,7 +790,8 @@ function splitSentences(text: string): string[] {
 function asksForHsCodeOrClassification(query: string): boolean {
   const normalized = normalizeForLocal(query);
   return HS_CODE_PATTERN.test(query) ||
-    /\b(hs\s*code|hscode|ma\s+hs|ma\s+hscode|tariff\s+code|customs\s+code|classification|classified|classify|phan\s+loai|thuoc\s+ma|ma\s+nao|code\s+nao|which\s+code|belong\s+to\s+which\s+hs\s+code)\b/.test(normalized);
+    /\b(hs\s*code|hscode|ma\s+hs|ma\s+hscode|tariff\s+code|customs\s+code|classification|classified|classify|phan\s+loai|thuoc\s+ma|ma\s+nao|code\s+nao|which\s+code|belong\s+to\s+which\s+hs\s+code)\b/.test(normalized) ||
+    /\bcode\s*\??$/.test(normalized);
 }
 
 function isDefinitionQuery(query: string): boolean {

@@ -1,4 +1,4 @@
-import { loadEnvConfig, type LlmProviderName } from "../config/env";
+import { loadEnvConfig, type LlmProviderName } from "../config";
 import { BifrostClient } from "./bifrostClient";
 import { GeminiRoundRobinClient, type SelectedSectionAnswerContext } from "./geminiClient";
 

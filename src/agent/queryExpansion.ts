@@ -1,4 +1,4 @@
-import { loadEnvConfig, type QueryExpansionProviderName } from "../config/env";
+import { loadEnvConfig, type QueryExpansionProviderName } from "../config";
 import { BifrostClient } from "./bifrostClient";
 import { GeminiRoundRobinClient } from "./geminiClient";
 

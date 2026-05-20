@@ -1,6 +1,6 @@
 import { readFile, readdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { runAgenticQuery } from "./agent/hsCodeAgent";
+import { runAgenticQuery } from "./agent";
 import {
   inspectDocumentCache,
   type PageIndexCacheAction,
@@ -10,15 +10,17 @@ import {
   writeCacheManifestRecord
 } from "./cache/cacheManifest";
 import { askChatQuestion, startChatSession } from "./cli/repl";
-import { resolvePageIndexSettings } from "./config/env";
-import { ArtifactFilter } from "./orchestrator/artifactFilter";
-import { HSCodeReconstructor } from "./orchestrator/hsCodeReconstructor";
-import { ImageAssetExporter } from "./orchestrator/imageAssetExporter";
-import { LayoutAnalyzer } from "./orchestrator/layoutAnalyzer";
-import { SmartRouter } from "./orchestrator/router";
-import { SectionMapBuilder } from "./orchestrator/sectionMapBuilder";
-import { SemanticFusion } from "./orchestrator/semanticFusion";
-import { TreeBuilder } from "./orchestrator/treeBuilder";
+import { resolvePageIndexSettings } from "./config";
+import {
+  ArtifactFilter,
+  HSCodeReconstructor,
+  ImageAssetExporter,
+  LayoutAnalyzer,
+  SectionMapBuilder,
+  SemanticFusion,
+  SmartRouter,
+  TreeBuilder
+} from "./orchestrator";
 import type { LayoutAnalysis, ParsedBlock, PipelineOptions, PipelineResult, RoutingPlan } from "./types";
 import {
   defaultBlocksPath,

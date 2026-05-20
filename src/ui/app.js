@@ -31,6 +31,7 @@ const pageNumberInput = document.querySelector("#page-number");
 const prevPageButton = document.querySelector("#prev-page");
 const nextPageButton = document.querySelector("#next-page");
 const openPageLink = document.querySelector("#open-page");
+const pdfSourceDetailEl = document.querySelector("#pdf-source-detail");
 const askButton = document.querySelector("#ask");
 const questionInput = document.querySelector("#question");
 const questionAllDocsInput = document.querySelector("#question-all-docs");
@@ -202,7 +203,7 @@ showPdfPanelButton?.addEventListener("click", () => {
   setSidePanelMode("pdf");
 });
 answerEl?.addEventListener("click", (event) => {
-  const target = event.target instanceof Element ? event.target.closest("[data-citation-jump]") : null;
+  const target = event.target instanceof Element ? event.target.closest("[data-citation-jump], [data-source-citation-jump]") : null;
   if (!target) return;
   event.preventDefault();
   openCitationInPdfPanel(target);
@@ -898,25 +899,49 @@ function renderCitationCards(citations) {
 
   const citationIndex = `
     <div class="citation-index" aria-label="Citation links">
-      <span>PDF citations</span>
-      ${citations.map((citation, index) => renderCitationJumpLink(citation, index + 1)).join("")}
+      <span>Source text</span>
+      ${citations.map((citation, index) => renderCitationSourceLink(citation, index + 1)).join("")}
     </div>
   `;
 
   return `<div class="citation-cards">${citationIndex}${citations.map((citation, index) => `
     <div class="citation-card">
-      <strong>${renderCitationJumpLink(citation, index + 1)} <span>${index === 0 ? "Product citation" : "Scoped related match"}</span></strong>
+      <strong>${renderCitationSourceLink(citation, index + 1)} <span>${index === 0 ? "Primary source text" : "Related source text"}</span></strong>
       <dl>
         <dt>HS Code</dt><dd>${escapeHtml(citation.hsCode || "n/a")}</dd>
         <dt>Grouped</dt><dd>${escapeHtml(Array.isArray(citation.groupedHsCodes) && citation.groupedHsCodes.length > 0 ? citation.groupedHsCodes.join(", ") : "n/a")}</dd>
         <dt>Title</dt><dd>${escapeHtml(citation.title || "n/a")}</dd>
-        <dt>Document</dt><dd>${escapeHtml(citation.document || "n/a")}</dd>
-        <dt>Page</dt><dd>${renderCitationPageJumpLink(citation, index + 1)}</dd>
+        <dt>Document</dt><dd>${renderCitationDocumentLink(citation)}</dd>
+        <dt>Text</dt><dd>${renderCitationSourceTextLink(citation, index + 1)}</dd>
+        <dt>PDF</dt><dd>${renderCitationPageJumpLink(citation, index + 1)}</dd>
         <dt>Section</dt><dd>${escapeHtml(citation.section || "n/a")}</dd>
         <dt>Source</dt><dd>${escapeHtml(citation.source || "n/a")}</dd>
+        ${citation.sourceExcerpt ? `<dt>Excerpt</dt><dd class="citation-excerpt">${escapeHtml(citation.sourceExcerpt)}</dd>` : ""}
       </dl>
     </div>
   `).join("")}</div>`;
+}
+
+function renderCitationSourceLink(citation, number) {
+  const sourceUrl = citationSourceUrl(citation);
+  if (!sourceUrl) {
+    return renderCitationJumpLink(citation, number);
+  }
+  const pdfUrl = citationPdfUrl(citation);
+  const page = citationPageNumber(citation);
+  const pdfPageUrl = citationPdfPageUrl(citation);
+  return `<a class="citation-number source-citation-number" href="${escapeHtml(sourceUrl)}" data-source-citation-jump="true" data-pdf-url="${escapeHtml(pdfUrl)}" data-pdf-page-url="${escapeHtml(pdfPageUrl)}" data-pdf-page="${page ? escapeHtml(String(page)) : ""}" data-source-url="${escapeHtml(sourceUrl)}" data-source-excerpt="${escapeHtml(citation.sourceExcerpt || "")}" data-citation-document="${escapeHtml(citation.document || "")}" data-citation-title="${escapeHtml(citation.title || "")}" data-citation-section="${escapeHtml(citation.section || "")}" data-citation-hscode="${escapeHtml(citation.hsCode || "")}" title="Show exact source text ${number} in the side PDF panel">[${number}]</a>`;
+}
+
+function renderCitationSourceTextLink(citation, number) {
+  const sourceUrl = citationSourceUrl(citation);
+  if (!sourceUrl) {
+    return renderCitationPageJumpLink(citation, number);
+  }
+  const pdfUrl = citationPdfUrl(citation);
+  const page = citationPageNumber(citation);
+  const pdfPageUrl = citationPdfPageUrl(citation);
+  return `<a href="${escapeHtml(sourceUrl)}" data-source-citation-jump="true" data-pdf-url="${escapeHtml(pdfUrl)}" data-pdf-page-url="${escapeHtml(pdfPageUrl)}" data-pdf-page="${page ? escapeHtml(String(page)) : ""}" data-source-url="${escapeHtml(sourceUrl)}" data-source-excerpt="${escapeHtml(citation.sourceExcerpt || "")}" data-citation-document="${escapeHtml(citation.document || "")}" data-citation-title="${escapeHtml(citation.title || "")}" data-citation-section="${escapeHtml(citation.section || "")}" data-citation-hscode="${escapeHtml(citation.hsCode || "")}">Show in side PDF panel</a>`;
 }
 
 function renderCitationJumpLink(citation, number) {
@@ -982,6 +1007,25 @@ function citationPdfPageUrl(citation) {
       ? pageEnd
       : null;
   return page ? `${pdfUrl}#page=${page}` : "";
+}
+
+function citationSourceUrl(citation) {
+  const explicitUrl = typeof citation?.sourceUrl === "string" ? citation.sourceUrl : "";
+  if (explicitUrl) {
+    return explicitUrl;
+  }
+  const document = typeof citation?.document === "string" ? citation.document : "";
+  if (!/^[^\\/]+\.pdf$/i.test(document)) {
+    return "";
+  }
+  const params = new URLSearchParams();
+  const page = citationPageNumber(citation);
+  if (page) params.set("page", String(page));
+  if (citation?.hsCode) params.set("hsCode", String(citation.hsCode));
+  if (citation?.section) params.set("section", String(citation.section).slice(0, 180));
+  if (citation?.sourceExcerpt) params.set("q", String(citation.sourceExcerpt).slice(0, 360));
+  const query = params.toString();
+  return `/api/source/${encodeURIComponent(document)}${query ? `?${query}` : ""}#source-hit`;
 }
 
 function citationPageNumber(citation) {
@@ -1134,7 +1178,7 @@ function renderAssistantMessage(message) {
   const retrievalStatus = renderRetrievalStatus(payload.retrieval, indexSource, payload);
   const answerScope = payload.answerScope || message.scopeLabel || "";
   return `
-    <div class="answer-text">${escapeHtml(message.text || payload.answer || "")}</div>
+    <div class="answer-text">${renderAnswerTextWithInlineCitations(message.text || payload.answer || "", payload.citations || [])}</div>
     <div class="answer-metadata">
       ${retrievalStatus}
       ${documentSummaryCard}
@@ -1142,6 +1186,53 @@ function renderAssistantMessage(message) {
       ${answerScope ? `<p>${escapeHtml(answerScope)}</p>` : ""}
     </div>
   `;
+}
+
+function renderAnswerTextWithInlineCitations(text, citations) {
+  const sourceCitations = Array.isArray(citations) ? citations.filter((citation) => citationSourceUrl(citation) || citationPdfPageUrl(citation)) : [];
+  if (sourceCitations.length === 0) {
+    return escapeHtml(text);
+  }
+
+  const lines = String(text || "").split(/\r?\n/g);
+  const used = new Set();
+  const renderedLines = lines.map((line) => {
+    const matched = sourceCitations
+      .map((citation, index) => ({ citation, number: index + 1 }))
+      .filter(({ citation, number }) => !used.has(number) && answerLineMatchesCitation(line, citation));
+    matched.forEach(({ number }) => used.add(number));
+    return `${escapeHtml(line)}${matched.length > 0 ? ` ${matched.map(({ citation, number }) => renderCitationSourceLink(citation, number)).join(" ")}` : ""}`;
+  });
+
+  const remaining = sourceCitations
+    .map((citation, index) => ({ citation, number: index + 1 }))
+    .filter(({ number }) => !used.has(number));
+  if (remaining.length > 0) {
+    const targetIndex = Math.max(0, renderedLines.findLastIndex((line) => line.trim()));
+    renderedLines[targetIndex] = `${renderedLines[targetIndex]} ${remaining.map(({ citation, number }) => renderCitationSourceLink(citation, number)).join(" ")}`;
+  }
+
+  return renderedLines.join("\n");
+}
+
+function answerLineMatchesCitation(line, citation) {
+  const text = String(line || "").toLowerCase();
+  if (!text.trim()) {
+    return false;
+  }
+  const codes = [
+    citation?.hsCode,
+    ...(Array.isArray(citation?.groupedHsCodes) ? citation.groupedHsCodes : [])
+  ].filter(Boolean).map((value) => String(value).toLowerCase());
+  if (codes.some((code) => text.includes(code))) {
+    return true;
+  }
+  const title = String(citation?.title || "").toLowerCase();
+  if (title && title.length >= 4 && text.includes(title)) {
+    return true;
+  }
+  const section = String(citation?.section || "").replace(/\b\d{4}\.\d{2}\.\d{2}\b/g, "").trim().toLowerCase();
+  return Boolean(section && section.length >= 8 && text.includes(section));
 }
 
 function compactChatPayload(payload, indexSource, answerScope) {
@@ -1326,6 +1417,32 @@ function setPdfPage(page) {
   openPageLink.href = url;
 }
 
+function renderPdfSourceDetail(source = null) {
+  if (!pdfSourceDetailEl) return;
+  if (!source?.excerpt) {
+    pdfSourceDetailEl.className = "pdf-source-detail muted";
+    pdfSourceDetailEl.textContent = "PDF page opened. This citation has no source text excerpt attached.";
+    return;
+  }
+
+  const heading = source.title || source.section || source.hsCode || "Source excerpt";
+  const meta = [
+    source.document,
+    source.page ? `page ${source.page}` : "",
+    source.hsCode,
+    source.section
+  ].filter(Boolean).join(" | ");
+  pdfSourceDetailEl.className = "pdf-source-detail";
+  pdfSourceDetailEl.innerHTML = `
+    <div class="pdf-source-heading">
+      <strong>${escapeHtml(heading)}</strong>
+      ${meta ? `<span>${escapeHtml(meta)}</span>` : ""}
+    </div>
+    <blockquote>${escapeHtml(source.excerpt)}</blockquote>
+    ${source.sourceUrl ? `<a href="${escapeHtml(source.sourceUrl)}" target="_blank" rel="noreferrer">Open highlighted source text</a>` : ""}
+  `;
+}
+
 function activateTab(tabName) {
   document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === tabName));
   document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.add("hidden"));
@@ -1355,6 +1472,7 @@ function resetResult() {
   batchTableEl.textContent = "No documents yet.";
   batchTableEl.className = "table-wrap muted";
   pdfFrame.removeAttribute("src");
+  renderPdfSourceDetail();
   currentPdfUrl = "";
   selectedDocument = null;
   selectedBundle = null;
@@ -1646,7 +1764,22 @@ function setSidePanelMode(mode) {
 function openCitationInPdfPanel(target) {
   const pdfPageUrl = target.dataset.pdfPageUrl || "";
   const pdfUrl = target.dataset.pdfUrl || pdfPageUrl.split("#")[0] || "";
+  const sourceUrl = target.dataset.sourceUrl || "";
+  const sourceExcerpt = target.dataset.sourceExcerpt || "";
   if (!pdfUrl) {
+    if (sourceExcerpt) {
+      renderPdfSourceDetail({
+        excerpt: sourceExcerpt,
+        sourceUrl,
+        document: target.dataset.citationDocument || "",
+        title: target.dataset.citationTitle || "",
+        section: target.dataset.citationSection || "",
+        hsCode: target.dataset.citationHscode || "",
+        page: Number(target.dataset.pdfPage) || null
+      });
+      setDebugPanelCollapsed(false);
+      setSidePanelMode("pdf");
+    }
     return;
   }
   const pageFromDataset = Number(target.dataset.pdfPage);
@@ -1660,6 +1793,15 @@ function openCitationInPdfPanel(target) {
   const targetUrl = page ? `${currentPdfUrl}#page=${page}` : (pdfPageUrl || currentPdfUrl);
   pdfFrame.src = targetUrl;
   openPageLink.href = targetUrl;
+  renderPdfSourceDetail(sourceExcerpt ? {
+    excerpt: sourceExcerpt,
+    sourceUrl,
+    document: target.dataset.citationDocument || "",
+    title: target.dataset.citationTitle || "",
+    section: target.dataset.citationSection || "",
+    hsCode: target.dataset.citationHscode || "",
+    page: currentPage
+  } : null);
   setDebugPanelCollapsed(false);
   setSidePanelMode("pdf");
   pdfPanelEl?.scrollIntoView({ block: "nearest" });
@@ -1915,6 +2057,9 @@ async function renderMappingPage(pageNumber) {
   await loadMappingPageTextSpans(page, viewport);
   if (token !== mappingRenderToken) return;
   renderMappingOverlays();
+  if (mappingModeSelect?.value === "parsed-text") {
+    renderMappingTextViewer();
+  }
   if (mappingPdfMessageEl) {
     const count = currentMappingPageBlocks().length;
     const spanCount = currentMappingPageTextSpans().length;
@@ -2394,26 +2539,157 @@ function renderMappingParsedTextUnits() {
     }
     return true;
   });
-  mappingTextViewerEl.innerHTML = visibleUnits.map((unit) => `
-    <article class="mapping-unit ${unit.id === mappingSelectedUnitId ? "selected" : ""}" data-unit-id="${escapeHtml(unit.id)}">
-      <div class="mapping-block-head">
-        <strong>${escapeHtml(unit.hsCode || unit.title || unit.blockType || unit.source)}</strong>
-        <span>p${escapeHtml(unit.pageNumber || "?")} &middot; ${escapeHtml(unit.source)}${unit.blockType ? ` &middot; ${escapeHtml(unit.blockType)}` : ""}</span>
+
+  const unitByBlockId = new Map();
+  for (const unit of visibleUnits) {
+    if (unit.blockId && !unitByBlockId.has(unit.blockId)) {
+      unitByBlockId.set(unit.blockId, unit);
+    }
+  }
+  const visibleBlockIds = new Set(visibleUnits.map((unit) => unit.blockId).filter(Boolean));
+  const pageBlocks = currentMappingPageBlocks().filter((block) => {
+    if (!mappingBlockVisible(block)) return false;
+    if (visibleBlockIds.size > 0 && !visibleBlockIds.has(block.id) && block.type !== "image") return false;
+    return blockHasRenderableLayout(block);
+  });
+
+  if (pageBlocks.length === 0) {
+    mappingTextViewerEl.classList.remove("layout-mode");
+    mappingTextViewerEl.innerHTML = "<div class=\"muted\">No parsed text units match the current filters.</div>";
+    return;
+  }
+
+  const pageSize = mappingLayoutPageSize(pageBlocks);
+  const scale = mappingLayoutScale(pageSize);
+  mappingTextViewerEl.classList.add("layout-mode");
+  mappingTextViewerEl.innerHTML = `
+    <div class="mapping-layout-shell">
+      <div class="mapping-layout-page" style="width:${round(pageSize.width * scale)}px;height:${round(pageSize.height * scale)}px">
+        ${pageBlocks.map((block) => renderMappingLayoutBlock(block, unitByBlockId.get(block.id), scale, pageSize)).join("")}
       </div>
-      <p>${escapeHtml(unit.text)}</p>
-      ${unit.section ? `<small>${escapeHtml(unit.section)}</small>` : ""}
-    </article>
-  `).join("") || "<div class=\"muted\">No parsed text units match the current filters.</div>";
-  mappingTextViewerEl.querySelectorAll("[data-unit-id]").forEach((element) => {
+    </div>
+  `;
+
+  mappingTextViewerEl.querySelectorAll("[data-unit-id], [data-mapping-block-id]").forEach((element) => {
     element.addEventListener("mouseenter", () => {
       const unit = mappingAlignmentIndex?.parsedTextUnits.find((candidate) => candidate.id === element.dataset.unitId);
       if (unit) previewPdfSpanForUnit(unit);
     });
     element.addEventListener("mouseleave", clearMappingPreview);
     element.addEventListener("click", () => {
-      void selectParsedTextUnit(element.dataset.unitId, { scrollPdf: true, preserveMode: true });
+      if (element.dataset.unitId) {
+        void selectParsedTextUnit(element.dataset.unitId, { scrollPdf: true, preserveMode: true });
+        return;
+      }
+      void selectMappingBlock(element.dataset.mappingBlockId, { scrollPdf: true, preserveMode: true });
     });
   });
+  scrollSelectedMappingLayoutIntoView();
+}
+
+function renderMappingLayoutBlock(block, unit, scale, pageSize) {
+  const rect = layoutBlockRect(block, scale);
+  const selected = block.id === mappingSelectedBlockId || unit?.id === mappingSelectedUnitId;
+  const sectionSelected = block.section && sectionKey(block) === mappingSelectedSectionKey;
+  const className = [
+    "mapping-layout-block",
+    block.type,
+    selected ? "selected" : "",
+    sectionSelected ? "section-selected" : "",
+    isDecorativeFullPageImage(block, pageSize) ? "decorative-page-image" : ""
+  ].filter(Boolean).join(" ");
+  const label = block.hsCode || block.title || block.type;
+  const unitAttr = unit?.id ? ` data-unit-id="${escapeHtml(unit.id)}"` : "";
+  return `
+    <article class="${escapeHtml(className)}" data-mapping-block-id="${escapeHtml(block.id)}"${unitAttr} title="${escapeHtml(`${label}: ${textPreview(block.text || block.captionText || "", 160)}`)}" style="left:${rect.left}px;top:${rect.top}px;width:${rect.width}px;height:${rect.height}px">
+      ${renderMappingLayoutBlockContent(block, scale, pageSize)}
+    </article>
+  `;
+}
+
+function renderMappingLayoutBlockContent(block, scale, pageSize) {
+  if (block.type === "image" && block.assetUrl && !isDecorativeFullPageImage(block, pageSize)) {
+    return `<img src="${escapeHtml(block.assetUrl)}" alt="${escapeHtml(block.captionText || block.id)}" loading="lazy" />`;
+  }
+  if (Array.isArray(block.lines) && block.lines.length > 0) {
+    return block.lines.map((line) => renderMappingLayoutLine(block, line, scale)).join("");
+  }
+  const text = block.text || block.markdownText || block.captionText || "";
+  return text ? `<p>${escapeHtml(text)}</p>` : "";
+}
+
+function renderMappingLayoutLine(block, line, scale) {
+  const left = Math.max(0, (line.bbox.x0 - block.bbox.x0) * scale);
+  const top = Math.max(0, (line.bbox.y0 - block.bbox.y0) * scale);
+  const width = Math.max(8, (line.bbox.x1 - line.bbox.x0) * scale);
+  const height = Math.max(8, (line.bbox.y1 - line.bbox.y0) * scale);
+  const fontSize = Math.max(7, Math.min(22, (Number(line.fontSize) || 11) * scale));
+  const font = String(line.font || "");
+  const weight = /bold/i.test(font) || (Number(line.flags) & 16) ? 800 : 500;
+  const style = `left:${round(left)}px;top:${round(top)}px;width:${round(width)}px;min-height:${round(height)}px;font-size:${round(fontSize)}px;font-weight:${weight};${/italic/i.test(font) ? "font-style:italic;" : ""}`;
+  return `<span class="mapping-layout-line" style="${style}">${escapeHtml(line.text)}</span>`;
+}
+
+function mappingLayoutPageSize(blocks) {
+  const canvasWidth = Number.parseFloat(mappingCanvas?.style?.width || "");
+  const canvasHeight = Number.parseFloat(mappingCanvas?.style?.height || "");
+  if (canvasWidth > 0 && canvasHeight > 0 && mappingViewportScale > 0) {
+    return {
+      width: canvasWidth / mappingViewportScale,
+      height: canvasHeight / mappingViewportScale
+    };
+  }
+  const metadataWidth = blocks.map((block) => Number(block.pageWidth)).find((value) => Number.isFinite(value) && value > 0);
+  const metadataHeight = blocks.map((block) => Number(block.pageHeight)).find((value) => Number.isFinite(value) && value > 0);
+  return {
+    width: metadataWidth || Math.max(320, ...blocks.map((block) => Number(block.bbox?.x1) || 0)) + 24,
+    height: metadataHeight || Math.max(420, ...blocks.map((block) => Number(block.bbox?.y1) || 0)) + 24
+  };
+}
+
+function mappingLayoutScale(pageSize) {
+  const availableWidth = Math.max(280, (mappingTextViewerEl?.clientWidth || 640) - 36);
+  return Math.max(0.45, Math.min(1.8, availableWidth / Math.max(1, pageSize.width)));
+}
+
+function layoutBlockRect(block, scale) {
+  return {
+    left: round(block.bbox.x0 * scale),
+    top: round(block.bbox.y0 * scale),
+    width: round(Math.max(4, (block.bbox.x1 - block.bbox.x0) * scale)),
+    height: round(Math.max(4, (block.bbox.y1 - block.bbox.y0) * scale))
+  };
+}
+
+function blockHasRenderableLayout(block) {
+  if (isSyntheticFusionCaption(block)) {
+    return false;
+  }
+  return Boolean(
+    block?.bbox &&
+    ((block.type === "image" && block.assetUrl && !isDecorativeFullPageImage(block, mappingLayoutPageSize(currentMappingPageBlocks()))) ||
+      String(block.text || block.markdownText || block.captionText || "").trim() ||
+      (Array.isArray(block.lines) && block.lines.length > 0))
+  );
+}
+
+function isSyntheticFusionCaption(block) {
+  return String(block?.id || "").startsWith("fusion-caption-");
+}
+
+function isDecorativeFullPageImage(block, pageSize) {
+  if (block?.type !== "image" || !pageSize?.width || !pageSize?.height) return false;
+  return blockArea(block) / Math.max(1, pageSize.width * pageSize.height) > 0.72;
+}
+
+function scrollSelectedMappingLayoutIntoView() {
+  const selector = mappingSelectedUnitId
+    ? `[data-unit-id="${cssEscape(mappingSelectedUnitId)}"]`
+    : mappingSelectedBlockId
+      ? `[data-mapping-block-id="${cssEscape(mappingSelectedBlockId)}"]`
+      : "";
+  if (!selector) return;
+  mappingTextViewerEl?.querySelector(selector)?.scrollIntoView({ block: "center", inline: "center" });
 }
 
 function renderMappingMarkdown() {

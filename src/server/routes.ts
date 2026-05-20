@@ -3,16 +3,14 @@ import path from "node:path";
 import express from "express";
 import multer from "multer";
 import {
-  readCacheManifest,
   getCacheManifestRecord,
   inspectDocumentCache,
   sha256File,
-  type CacheManifestRecord,
   type PageIndexCacheStatus
 } from "../cache/cacheManifest";
 import {
-  getApiSettingsStatus,
   canWriteSecretsFromUi,
+  getApiSettingsStatus,
   isGeminiKeySlotName,
   loadEnvConfig,
   maskSecret,
@@ -22,8 +20,8 @@ import {
   saveGeminiKeySlotEnabledToEnv,
   saveGeminiKeySlotToEnv,
   savePageIndexApiKeyToEnv
-} from "../config/env";
-import { PageIndexClient } from "../api/pageindexClient";
+} from "../config";
+import { PageIndexClient } from "../api";
 import {
   defaultBlocksPath,
   defaultOutputPath,
@@ -34,7 +32,21 @@ import {
   ensureDirectory
 } from "../utils/paths";
 import { JobStore } from "./jobStore";
+import { buildMappingPayload, listMappingDocuments } from "./mapping";
 import { runPipelineProcess } from "./pipelineProcessRunner";
+import {
+  normalizeSourceWhitespace,
+  pdfUrlForDocument,
+  publicSectionCitation,
+  renderSourceErrorHtml,
+  renderSourceTextHtml,
+  sourceScoringTokens,
+  sourceTextFromSection,
+  sourceTextIncludesQuery,
+  withPdfCitationLinks,
+  withPdfCitationLinksList,
+  type SourceTextView
+} from "./source";
 import { QAValidator } from "../validators/qaValidator";
 import { createLlmClient, getLlmAvailability, type LlmClient } from "../agent/llmFactory";
 import {
@@ -177,39 +189,6 @@ interface CachedTreeDocument {
   pageIndexCacheStatus: PageIndexCacheStatus;
   treeSourceMarkdownHash?: string | null;
   markdownHash?: string | null;
-}
-
-type MappedBlockType = "heading" | "hs-code" | "title" | "paragraph" | "image" | "caption" | "source" | "table" | "unknown";
-
-interface MappedBlock {
-  id: string;
-  document: string;
-  pageNumber: number;
-  bbox: {
-    x0: number;
-    y0: number;
-    x1: number;
-    y1: number;
-  };
-  type: MappedBlockType;
-  text: string;
-  markdownText?: string;
-  section?: string;
-  hsCode?: string;
-  title?: string;
-  confidence?: number;
-}
-
-interface MappingSection {
-  document?: string;
-  section?: string;
-  hsCode?: string;
-  title?: string;
-  pageStart?: number | null;
-  pageEnd?: number | null;
-  source?: string | null;
-  markdownHeading?: string;
-  textPreview?: string;
 }
 
 const upload = multer({
@@ -595,6 +574,20 @@ export function createApiRouter(): express.Router {
       });
     } catch (error) {
       res.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  router.get("/source/:documentName", async (req, res) => {
+    try {
+      const sourceView = await buildSourceTextView(req.params.documentName, {
+        query: stringValue(req.query.q),
+        hsCode: stringValue(req.query.hsCode),
+        section: stringValue(req.query.section),
+        page: numberFromUnknown(req.query.page)
+      });
+      res.type("html").send(renderSourceTextHtml(sourceView));
+    } catch (error) {
+      res.status(400).type("html").send(renderSourceErrorHtml(error instanceof Error ? error.message : String(error)));
     }
   });
 
@@ -1167,269 +1160,6 @@ async function listPngAssets(assetDir: string): Promise<Array<{ name: string; pa
 function documentSummaries(outputs: Record<string, unknown> | undefined): Array<{ document?: unknown }> {
   const documents = outputs?.documents;
   return Array.isArray(documents) ? documents as Array<{ document?: unknown }> : [];
-}
-
-async function listMappingDocuments(): Promise<Array<Record<string, unknown>>> {
-  const manifest = await readCacheManifest();
-  const byDocument = new Map<string, CacheManifestRecord>();
-  for (const record of manifest.documents) {
-    byDocument.set(record.document, record);
-  }
-
-  const uploadEntries = await readdir(uploadsDir, { withFileTypes: true }).catch(() => []);
-  for (const entry of uploadEntries) {
-    if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== ".pdf" || byDocument.has(entry.name)) {
-      continue;
-    }
-
-    const inputPath = path.join(uploadsDir, entry.name);
-    const inspection = await inspectDocumentCache(inputPath);
-    byDocument.set(entry.name, {
-      document: inspection.document,
-      inputPath: relativePath(inspection.inputPath) ?? inspection.inputPath,
-      inputHash: inspection.inputHash,
-      inputSize: inspection.inputSize,
-      inputModifiedAt: inspection.inputModifiedAt,
-      markdownPath: inspection.markdownPath,
-      markdownHash: inspection.markdownHash,
-      blocksPath: inspection.blocksPath,
-      validationPath: inspection.validationPath,
-      assetsDir: inspection.assetsDir,
-      sectionsPath: inspection.sectionsPath,
-      sectionsHash: inspection.sectionsHash,
-      treePath: inspection.treePath,
-      treeValidationPath: inspection.treeValidationPath,
-      treeSourceMarkdownHash: inspection.treeSourceMarkdownHash,
-      lastParsedAt: null,
-      lastPageIndexUploadedAt: null,
-      parseStatus: inspection.parseStatus,
-      pageIndexStatus: inspection.pageIndexCacheStatus,
-      documentType: inspection.documentType,
-      hsSectionCount: inspection.hsSectionCount,
-      imageCount: inspection.imageCount,
-      error: null
-    });
-  }
-
-  const rows: Array<Record<string, unknown> | undefined> = await Promise.all([...byDocument.values()].map(async (record): Promise<Record<string, unknown> | undefined> => {
-    const document = safeRequestedPdfName(record.document);
-    if (!document) return undefined;
-
-    const inputPath = path.resolve(uploadsDir, document);
-    const markdownPath = resolveWorkspacePath(record.markdownPath || defaultOutputPath(inputPath));
-    const blocksPath = resolveWorkspacePath(record.blocksPath || defaultBlocksPath(inputPath));
-    const sectionsPath = resolveWorkspacePath(record.sectionsPath || defaultSectionMapPath(inputPath));
-    const [hasPdf, hasMarkdown, hasBlocks, hasSections] = await Promise.all([
-      fileExists(inputPath),
-      fileExists(markdownPath),
-      fileExists(blocksPath),
-      fileExists(sectionsPath)
-    ]);
-    if (!hasPdf || !hasMarkdown || !hasBlocks) return undefined;
-
-    return {
-      document,
-      pdfUrl: `/api/uploads/${encodeURIComponent(document)}`,
-      markdownPath: relativePath(markdownPath),
-      blocksPath: relativePath(blocksPath),
-      sectionsPath: relativePath(sectionsPath),
-      parseStatus: record.parseStatus,
-      pageIndexStatus: record.pageIndexStatus,
-      mappingStatus: "available",
-      hasPdf,
-      hasMarkdown,
-      hasBlocks,
-      hasSections,
-      hsSectionCount: record.hsSectionCount,
-      imageCount: record.imageCount
-    };
-  }));
-
-  const availableRows = rows.filter((row): row is Record<string, unknown> => Boolean(row));
-  return availableRows
-    .sort((left, right) => String(left.document).localeCompare(String(right.document)));
-}
-
-async function buildMappingPayload(documentName: string, pageNumber?: number): Promise<Record<string, unknown> & { document: string; blocks: MappedBlock[] }> {
-  const document = safeRequestedPdfName(documentName);
-  if (!document) {
-    throw new Error("Invalid PDF filename.");
-  }
-
-  const inputPath = path.resolve(uploadsDir, document);
-  if (!inputPath.startsWith(`${uploadsDir}${path.sep}`)) {
-    throw new Error("Invalid PDF filename.");
-  }
-
-  const record = await getCacheManifestRecord(document);
-  const markdownPath = resolveWorkspacePath(record?.markdownPath || defaultOutputPath(inputPath));
-  const blocksPath = resolveWorkspacePath(record?.blocksPath || defaultBlocksPath(inputPath));
-  const sectionsPath = resolveWorkspacePath(record?.sectionsPath || defaultSectionMapPath(inputPath));
-  const [hasPdf, hasMarkdown, hasBlocks, hasSections] = await Promise.all([
-    fileExists(inputPath),
-    fileExists(markdownPath),
-    fileExists(blocksPath),
-    fileExists(sectionsPath)
-  ]);
-
-  if (!hasPdf) {
-    throw new Error("Mapping unavailable: original PDF is missing.");
-  }
-  if (!hasBlocks) {
-    throw new Error("Mapping unavailable: blocks.json is missing. Re-run local parse.");
-  }
-  if (!hasMarkdown) {
-    throw new Error("Mapping unavailable: Markdown is missing. Re-run local parse.");
-  }
-
-  const rawBlocks = await readOptionalJson<unknown>(blocksPath);
-  const sectionMap = hasSections ? await readOptionalJson<{ sections?: unknown[] } | unknown[]>(sectionsPath) : undefined;
-  const sections = normalizeMappingSections(sectionMap, document);
-  const allBlocks = normalizeMappingBlocks(rawBlocks, document, sections);
-  const blocks = pageNumber ? allBlocks.filter((block) => block.pageNumber === pageNumber) : allBlocks;
-  const markdown = await readOptionalText(markdownPath);
-  const pageCount = Math.max(
-    1,
-    ...allBlocks.map((block) => block.pageNumber),
-    ...sections.flatMap((section) => [Number(section.pageStart || 0), Number(section.pageEnd || 0)])
-  );
-  const inspection = await inspectDocumentCache(inputPath).catch(() => undefined);
-
-  return {
-    document,
-    pdfUrl: `/api/uploads/${encodeURIComponent(document)}`,
-    markdownPath: relativePath(markdownPath),
-    blocksPath: relativePath(blocksPath),
-    sectionsPath: relativePath(sectionsPath),
-    pageCount,
-    blocks,
-    sections,
-    markdown,
-    cacheStatus: {
-      parse: inspection?.parseStatus ?? record?.parseStatus ?? "missing",
-      pageIndex: inspection?.pageIndexCacheStatus ?? record?.pageIndexStatus ?? "missing",
-      mapping: hasPdf && hasBlocks && hasMarkdown ? "available" : "missing"
-    }
-  };
-}
-
-function normalizeMappingBlocks(rawBlocks: unknown, document: string, sections: MappingSection[]): MappedBlock[] {
-  const blocks = Array.isArray(rawBlocks)
-    ? rawBlocks
-    : typeof rawBlocks === "object" && rawBlocks !== null && Array.isArray((rawBlocks as { blocks?: unknown[] }).blocks)
-      ? (rawBlocks as { blocks: unknown[] }).blocks
-      : [];
-  const sortedBlocks = blocks
-    .map((block, index) => normalizeMappingBlock(block, index, document))
-    .filter((block): block is MappedBlock => Boolean(block))
-    .sort((left, right) => left.pageNumber - right.pageNumber || left.bbox.y0 - right.bbox.y0 || left.bbox.x0 - right.bbox.x0);
-  assignSectionsToBlocks(sortedBlocks, sections);
-  return sortedBlocks;
-}
-
-function normalizeMappingBlock(rawBlock: unknown, index: number, document: string): MappedBlock | undefined {
-  if (typeof rawBlock !== "object" || rawBlock === null) return undefined;
-  const block = rawBlock as Record<string, unknown>;
-  const bbox = normalizeBbox(block.bbox);
-  const pageNumber = numberFromUnknown(block.pageNumber) ?? numberFromUnknown((block.bbox as { page?: unknown } | undefined)?.page);
-  if (!bbox || !pageNumber) return undefined;
-
-  const rawType = typeof block.type === "string" ? block.type : undefined;
-  const text = firstStringValue(block.text, block.markdown, block.html) ?? "";
-  return {
-    id: firstStringValue(block.id) ?? `${document}-p${pageNumber}-b${index}`,
-    document,
-    pageNumber,
-    bbox,
-    type: mapBlockType(rawType, text),
-    text,
-    markdownText: firstStringValue(block.markdown),
-    confidence: numberFromUnknown(block.confidence)
-  };
-}
-
-function normalizeMappingSections(rawSections: unknown, document: string): MappingSection[] {
-  const sections = Array.isArray(rawSections)
-    ? rawSections
-    : typeof rawSections === "object" && rawSections !== null && Array.isArray((rawSections as { sections?: unknown[] }).sections)
-      ? (rawSections as { sections: unknown[] }).sections
-      : [];
-  return sections
-    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
-    .map((section) => ({
-      document: firstStringValue(section.document) ?? document,
-      section: firstStringValue(section.section),
-      hsCode: firstStringValue(section.hsCode),
-      title: firstStringValue(section.title),
-      pageStart: numberFromUnknown(section.pageStart) ?? null,
-      pageEnd: numberFromUnknown(section.pageEnd) ?? numberFromUnknown(section.pageStart) ?? null,
-      source: firstStringValue(section.source) ?? null,
-      markdownHeading: firstStringValue(section.markdownHeading),
-      textPreview: firstStringValue(section.textPreview)
-    }));
-}
-
-function assignSectionsToBlocks(blocks: MappedBlock[], sections: MappingSection[]): void {
-  let activeSection: MappingSection | undefined;
-  for (const block of blocks) {
-    const candidates = sections.filter((section) => {
-      const pageStart = Number(section.pageStart || 0);
-      const pageEnd = Number(section.pageEnd || pageStart);
-      return pageStart > 0 && block.pageNumber >= pageStart && block.pageNumber <= pageEnd;
-    });
-    const matchedByText = candidates.find((section) => {
-      const text = block.text.toLowerCase();
-      return Boolean(
-        (section.hsCode && text.includes(section.hsCode.toLowerCase())) ||
-        (section.title && text.includes(section.title.toLowerCase()))
-      );
-    });
-    if (matchedByText) {
-      activeSection = matchedByText;
-    } else if (!activeSection || !candidates.includes(activeSection)) {
-      activeSection = candidates[0];
-    }
-
-    if (activeSection && candidates.includes(activeSection)) {
-      block.section = activeSection.section;
-      block.hsCode = activeSection.hsCode;
-      block.title = activeSection.title;
-      if (block.type === "paragraph" && activeSection.hsCode && block.text.includes(activeSection.hsCode)) {
-        block.type = "hs-code";
-      }
-    }
-  }
-}
-
-function normalizeBbox(value: unknown): MappedBlock["bbox"] | undefined {
-  if (Array.isArray(value) && value.length >= 4) {
-    const [x0, y0, x1, y1] = value.map(Number);
-    if ([x0, y0, x1, y1].every(Number.isFinite)) {
-      return { x0: Math.min(x0, x1), y0: Math.min(y0, y1), x1: Math.max(x0, x1), y1: Math.max(y0, y1) };
-    }
-  }
-  if (typeof value !== "object" || value === null) return undefined;
-  const bbox = value as Record<string, unknown>;
-  const x0 = Number(bbox.x0);
-  const y0 = Number(bbox.y0);
-  const x1 = Number(bbox.x1);
-  const y1 = Number(bbox.y1);
-  if (![x0, y0, x1, y1].every(Number.isFinite)) return undefined;
-  return { x0: Math.min(x0, x1), y0: Math.min(y0, y1), x1: Math.max(x0, x1), y1: Math.max(y0, y1) };
-}
-
-function mapBlockType(rawType: string | undefined, text: string): MappedBlockType {
-  const normalized = String(rawType || "").toLowerCase();
-  const trimmed = text.trim();
-  if (normalized === "image") return "image";
-  if (normalized === "table") return "table";
-  if (normalized === "caption") return "caption";
-  if (/^source\b/i.test(trimmed)) return "source";
-  if (HS_CODE_PATTERN.test(trimmed)) return "hs-code";
-  if (/^chapter\s+\d+/i.test(trimmed) || /^#+\s+/.test(trimmed)) return "heading";
-  if (trimmed.length > 0 && trimmed.length < 150 && trimmed === trimmed.toUpperCase() && /[A-Z]/.test(trimmed)) return "title";
-  if (normalized === "text") return "paragraph";
-  return "unknown";
 }
 
 async function listCachedTreeDocuments(): Promise<CachedTreeDocument[]> {
@@ -2246,7 +1976,7 @@ export async function answerFromCachedTrees(
     strongSignals: routed.debug.strongSignals ?? [],
     contradictions: routed.debug.contradictions ?? [],
     answer,
-    selectedPrimary: withPdfCitationLinks(routed.selectedPrimary),
+    selectedPrimary: withPdfCitationLinks(routed.selectedPrimary, answer),
     documentSummary: routed.documentSummary,
     scope: scopeSnapshot(scope, documents.map((document) => document.document)),
     docIds: [],
@@ -2262,11 +1992,11 @@ export async function answerFromCachedTrees(
       bm25FallbackUsed: retrieval.bm25FallbackUsed,
       pageIndexResultCount: retrieval.pageIndexResultCount,
       contrastTerms: retrieval.contrastTerms,
-      selectedSection: withPdfCitationLinks(routed.selectedPrimary),
+      selectedSection: withPdfCitationLinks(routed.selectedPrimary, answer),
       finalHsCodes,
       answerRepairApplied
     },
-    citations: withPdfCitationLinksList(routed.citations),
+    citations: withPdfCitationLinksList(routed.citations, answer),
     retrievedSections: topHits.slice(0, 5).map(publicSectionCitation),
     metadataWarnings: hits[0].metadataWarnings,
     answerGeneration: finalAnswerGeneration,
@@ -2823,7 +2553,7 @@ function finalizeRoutedAnswer(
     strongSignals: routed.debug.strongSignals ?? [],
     contradictions: routed.debug.contradictions ?? [],
     answer: sanitizeFinalAnswer(routed.answer),
-    selectedPrimary: withPdfCitationLinks(routed.selectedPrimary),
+    selectedPrimary: withPdfCitationLinks(routed.selectedPrimary, routed.answer),
     documentSummary: routed.documentSummary,
     scope: responseScope,
     docIds: [],
@@ -2839,11 +2569,11 @@ function finalizeRoutedAnswer(
       bm25FallbackUsed: options.retrieval?.bm25FallbackUsed ?? false,
       pageIndexResultCount: options.retrieval?.pageIndexResultCount ?? 0,
       contrastTerms: options.retrieval?.contrastTerms ?? [],
-      selectedSection: withPdfCitationLinks(routed.selectedPrimary),
+      selectedSection: withPdfCitationLinks(routed.selectedPrimary, routed.answer),
       finalHsCodes,
       answerRepairApplied: false
     },
-    citations: withPdfCitationLinksList(routed.citations),
+    citations: withPdfCitationLinksList(routed.citations, routed.answer),
     retrievedSections: [],
     metadataWarnings: [],
     answerGeneration,
@@ -3304,66 +3034,82 @@ async function loadDocumentMetadata(documentNames: string[]): Promise<QaDocument
   return [...byDocument.values()].sort((left, right) => left.document.localeCompare(right.document));
 }
 
-function publicSectionCitation(section: EnrichedRetrievedSection): Record<string, unknown> {
-  return {
-    document: section.document,
-    chapter: section.chapter,
-    hsCode: section.hsCode ?? null,
-    groupedHsCodes: section.groupedHsCodes ?? [],
-    title: section.title ?? null,
-    section: section.section ?? null,
-    pageStart: section.pageStart ?? null,
-    pageEnd: section.pageEnd ?? null,
-    source: section.source ?? null,
-    captions: section.captions,
-    score: section.score,
-    metadataWarnings: section.metadataWarnings,
-    ...pdfLinksForCitation(section.document, section.pageStart, section.pageEnd)
-  };
-}
-
-function withPdfCitationLinks<T extends Record<string, unknown> | null>(citation: T): T {
-  if (!citation) {
-    return citation;
-  }
-  return {
-    ...citation,
-    ...pdfLinksForCitation(citation.document, citation.pageStart, citation.pageEnd)
-  } as T;
-}
-
-function withPdfCitationLinksList(citations: Record<string, unknown>[]): Record<string, unknown>[] {
-  return citations.map((citation) => withPdfCitationLinks(citation));
-}
-
-function pdfLinksForCitation(documentValue: unknown, pageStartValue?: unknown, pageEndValue?: unknown): Record<string, unknown> {
-  const pdfUrl = pdfUrlForDocument(documentValue);
-  if (!pdfUrl) {
-    return {};
-  }
-  const page = citationPageNumber(pageStartValue, pageEndValue);
-  return {
-    pdfUrl,
-    ...(page ? { pdfPageUrl: `${pdfUrl}#page=${page}` } : {})
-  };
-}
-
-function pdfUrlForDocument(documentValue: unknown): string | undefined {
-  const document = stringValue(documentValue);
+async function buildSourceTextView(
+  documentName: string,
+  options: { query?: string; hsCode?: string; section?: string; page?: number }
+): Promise<SourceTextView> {
+  const document = safeRequestedPdfName(documentName);
   if (!document) {
+    throw new Error("Invalid PDF filename.");
+  }
+
+  const inputPath = path.resolve(uploadsDir, document);
+  if (!inputPath.startsWith(`${uploadsDir}${path.sep}`) || !(await fileExists(inputPath))) {
+    throw new Error("Source PDF is not available.");
+  }
+
+  const query = normalizeSourceWhitespace(options.query ?? "").replace(/\.\.\.$/, "").trim();
+  const sections = await loadSectionMetadata([document], createQaScope([document]));
+  const selected = selectSourceSection(sections, {
+    query,
+    hsCode: options.hsCode,
+    section: options.section,
+    page: options.page
+  });
+  const documentMetadata = await loadDocumentMetadata([document]);
+  const fallbackText = documentMetadata.map((item) => item.markdownText || item.rootText || "").find((text) => text.trim()) ?? "";
+  const sourceText = normalizeSourceWhitespace(selected ? sourceTextFromSection(selected) : fallbackText);
+  if (!sourceText) {
+    throw new Error("No source text is available for this document.");
+  }
+
+  return {
+    document,
+    pdfUrl: `/api/uploads/${encodeURIComponent(document)}`,
+    page: selected?.pageStart ?? options.page,
+    hsCode: selected?.hsCode ?? options.hsCode,
+    section: selected?.section ?? options.section,
+    title: selected?.title,
+    sourceText,
+    query,
+    matchFound: Boolean(query && sourceTextIncludesQuery(sourceText, query))
+  };
+}
+
+function selectSourceSection(
+  sections: SectionMetadata[],
+  options: { query?: string; hsCode?: string; section?: string; page?: number }
+): SectionMetadata | undefined {
+  if (sections.length === 0) {
     return undefined;
   }
-  const fileName = safeRequestedPdfName(path.basename(document));
-  return fileName ? `/api/uploads/${encodeURIComponent(fileName)}` : undefined;
-}
-
-function citationPageNumber(pageStartValue: unknown, pageEndValue?: unknown): number | undefined {
-  const pageStart = Number(pageStartValue);
-  if (Number.isFinite(pageStart) && pageStart > 0) {
-    return pageStart;
-  }
-  const pageEnd = Number(pageEndValue);
-  return Number.isFinite(pageEnd) && pageEnd > 0 ? pageEnd : undefined;
+  const queryTokens = sourceScoringTokens(options.query ?? "");
+  const requestedSection = normalizeSearchText(options.section ?? "");
+  const scored = sections.map((section, index) => {
+    const sourceText = sourceTextFromSection(section);
+    const normalizedSource = normalizeSearchText(sourceText);
+    const pageStart = Number(section.pageStart || 0);
+    const pageEnd = Number(section.pageEnd || pageStart);
+    let score = 0;
+    if (options.hsCode && (section.hsCode === options.hsCode || (section.groupedHsCodes ?? []).includes(options.hsCode))) {
+      score += 20;
+    }
+    if (options.section && requestedSection && normalizeSearchText(section.section ?? "").includes(requestedSection)) {
+      score += 12;
+    }
+    if (options.page && pageStart > 0 && options.page >= pageStart && options.page <= (pageEnd || pageStart)) {
+      score += 8;
+    }
+    if (options.query && normalizedSource.includes(normalizeSearchText(options.query))) {
+      score += 30;
+    }
+    if (queryTokens.length > 0) {
+      const sourceTokens = new Set(sourceScoringTokens(sourceText));
+      score += queryTokens.filter((token) => sourceTokens.has(token)).length;
+    }
+    return { section, score, index };
+  });
+  return scored.sort((left, right) => right.score - left.score || left.index - right.index)[0]?.section;
 }
 
 function createQaDebugReport(question: string, retrieval: CachedTreeRetrievalResult): Record<string, unknown> {
